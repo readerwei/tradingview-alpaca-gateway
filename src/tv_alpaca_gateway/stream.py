@@ -19,6 +19,25 @@ between them is why neither could connect:
 Note the trading replies carry no ``T`` field at all, so a check for
 ``T == "success"`` rejects even a successful authorization.
 
+VERIFIED AGAINST LIVE ALPACA (paper keys, read-only, no orders placed)
+----------------------------------------------------------------------
+Running the previous implementation against the real endpoints produced exactly
+these frames, so none of this is theoretical:
+
+    market   unexpected response during authenticated:
+             [{'T': 'success', 'msg': 'connected'}]
+    trading  unexpected response during authenticated:
+             [{'stream': 'authorization',
+               'data': {'action': 'authenticate', 'status': 'authorized'}}]
+
+The trading line rewards a second read: the status is **authorized**. Alpaca
+accepted the old payload, and the client then rejected its own success because
+it was hunting for a ``T`` field this protocol never sends. That bug was in
+reading the reply, not in sending the request. The request is sent in the
+documented form here regardless, and that is verified working too.
+
+Reproduce with ``scripts/smoke_stream.py``.
+
 THE GREETING FRAME
 ------------------
 Alpaca sends ``[{"T":"success","msg":"connected"}]`` the moment the market-data
