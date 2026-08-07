@@ -99,6 +99,12 @@ def create_app(
                 await stream.stop()
 
     app = FastAPI(title="TradingView Alpaca Gateway", version="0.1.0", lifespan=lifespan)
+    # Exposed so the streams can be inspected and exercised from outside —
+    # an end-to-end test needs to trigger a resync without reaching into a
+    # closure, and an operator needs a way to see whether a socket is up.
+    app.state.stream = stream
+    app.state.store = store
+    app.state.broker = broker
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

@@ -77,6 +77,9 @@ Callback = Callable[[Any], Any | Awaitable[Any]]
 # that streams unrelated messages from stalling the handshake indefinitely.
 _HANDSHAKE_FRAME_LIMIT = 10
 _HANDSHAKE_TIMEOUT_S = 15.0
+# The greeting is waited for, not required: an endpoint that goes straight to
+# the auth reply must not pay the full handshake timeout before we send auth.
+_GREETING_TIMEOUT_S = 5.0
 
 # Reconnect backoff is only reset once a connection has proved itself. A socket
 # that dies immediately must not reset the delay, or a server closing on every
@@ -200,6 +203,11 @@ class _AlpacaSocket:
     def __init__(self, settings: Settings, url: str):
         self.settings = settings
         self.url = url
+        # Frames read while looking for a different one. A handshake step must
+        # not destroy a frame a later step needs: waiting for the greeting and
+        # discarding non-matches ate the auth reply on endpoints that send no
+        # greeting.
+        self._buffer: list[dict[str, Any]] = []
 
     def connect(self):
         return websockets.connect(
@@ -211,25 +219,40 @@ class _AlpacaSocket:
             max_size=1_000_000,
         )
 
+    def _check(self, message: dict[str, Any], describe: str, is_error) -> None:
+        if is_error is not None and is_error(message):
+            raise RuntimeError(f"Alpaca refused {describe}: {message}")
+        if message.get("T") == "error":
+            raise RuntimeError(f"Alpaca refused {describe}: {message}")
+
     async def _await_frame(self, websocket: Any, matches, describe: str,
-                           is_error=None) -> dict[str, Any]:
-        """Scan forward for the frame this handshake step expects.
+                           is_error=None,
+                           timeout: float = _HANDSHAKE_TIMEOUT_S) -> dict[str, Any]:
+        """Scan for the frame this handshake step expects, keeping the rest.
 
         Alpaca interleaves greetings and unrelated frames with handshake
-        replies, so reading exactly one frame is not enough. Bounded by both a
-        frame count and a timeout so a stalled or noisy server surfaces as a
-        clean error rather than a hang.
+        replies, so reading exactly one frame is not enough. Frames that do not
+        match are BUFFERED rather than dropped, because the next step may need
+        one — waiting for the greeting and discarding non-matches consumed the
+        auth reply outright when no greeting was sent.
+
+        Bounded by frame count and timeout, so a stalled or noisy server
+        surfaces as a clean error instead of a hang.
         """
+        for index, message in enumerate(self._buffer):
+            self._check(message, describe, is_error)
+            if matches(message):
+                del self._buffer[index]
+                return message
+
         for _ in range(_HANDSHAKE_FRAME_LIMIT):
-            raw = await asyncio.wait_for(websocket.recv(), timeout=_HANDSHAKE_TIMEOUT_S)
+            raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
             for message in _frames(raw):
-                if is_error is not None and is_error(message):
-                    raise RuntimeError(f"Alpaca refused {describe}: {message}")
-                if message.get("T") == "error":
-                    raise RuntimeError(f"Alpaca refused {describe}: {message}")
+                self._check(message, describe, is_error)
                 if matches(message):
                     return message
-                logger.debug("skipping frame while awaiting %s: %s", describe, message)
+                logger.debug("buffering frame while awaiting %s: %s", describe, message)
+                self._buffer.append(message)
         raise RuntimeError(
             f"no {describe} response from Alpaca within "
             f"{_HANDSHAKE_FRAME_LIMIT} frames")
@@ -239,12 +262,30 @@ class _MarketDataSocket(_AlpacaSocket):
     """wss://stream.data.alpaca.markets/v2/<feed>"""
 
     async def authenticate(self, websocket: Any) -> None:
+        # Wait for the greeting BEFORE sending auth. Alpaca opens with
+        # {"T":"success","msg":"connected"} and an auth frame sent ahead of it
+        # is sometimes ignored — the socket then sits open, silent, until the
+        # handshake times out and reconnects, forever.
+        #
+        # This was intermittent, which is worse than broken: three runs
+        # connected and delivered ticks, the fourth hung. Sending first and
+        # skipping the greeting afterwards happens to work whenever the
+        # greeting arrives before the server processes the auth, and that is a
+        # race, not a design.
+        # Only a timeout is tolerated. An error frame here is a real refusal
+        # — connection limit, bad endpoint — and swallowing it turned an
+        # explicit rejection into a silent reconnect loop.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await self._await_frame(
+                websocket,
+                lambda m: m.get("T") == "success" and m.get("msg") == "connected",
+                "connection greeting", timeout=_GREETING_TIMEOUT_S)
+
         await websocket.send(json.dumps({
             "action": "auth",
             "key": self.settings.alpaca_key_id,
             "secret": self.settings.alpaca_secret_key,
         }))
-        # Skips the {"T":"success","msg":"connected"} greeting.
         await self._await_frame(
             websocket,
             lambda m: m.get("T") == "success" and m.get("msg") == "authenticated",
@@ -312,6 +353,7 @@ class AlpacaMarketStream(_MarketDataSocket):
         await _run_with_reconnect(self._run_once, stop_event, self.on_error, self.label)
 
     async def _run_once(self) -> None:
+        self._buffer.clear()          # frames never survive a reconnect
         async with self.connect() as websocket:
             await self.authenticate(websocket)
             await self.subscribe(websocket, self.symbols)
@@ -342,6 +384,7 @@ class AlpacaTradeUpdateStream(_TradingSocket):
                                   "trade_updates")
 
     async def _run_once(self) -> None:
+        self._buffer.clear()          # frames never survive a reconnect
         async with self.connect() as websocket:
             await self.authenticate(websocket)
             await self.listen(websocket, ["trade_updates"])
