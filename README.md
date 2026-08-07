@@ -78,11 +78,67 @@ Use a structured JSON message with `bar_time` generated from a **confirmed bar**
 
 TradingView should POST to `/webhooks/tradingview` with the shared secret in the `X-TV-Secret` header. Do not put broker credentials in the alert body.
 
+## Crypto
+
+Crypto is off by default. Enable it by declaring the pair in **slash form** —
+that is how an asset is marked as crypto; nothing is inferred from the shape of
+a ticker.
+
+```dotenv
+ALLOWED_SYMBOLS=QQQ,BTC/USD
+CRYPTO_MAX_QTY=0.001        # sized separately from MAX_QTY
+CRYPTO_SYMBOLS=BTC/USD      # streaming only
+```
+
+`CRYPTO_MAX_QTY` exists because one setting cannot serve both classes: `1` is a
+sane share count and an absurd amount of BTC, while `0.001` is sane BTC and an
+invalid share count for a stop order. Listing a pair without a size is refused
+at startup rather than at the first alert.
+
+Alerts may say `BTCUSD` or `BTC/USD`; both resolve to the allowlisted spelling.
+Crypto orders use `gtc`, because Alpaca rejects `day` on them.
+
+Two differences to know before trusting any position arithmetic:
+
+* **Fees are charged in kind.** A filled 0.001 BTC leaves a position of
+  0.0009975 — 0.25% smaller. Anything that assumes `filled_qty` equals the
+  resulting position drifts by the fee on every trade.
+* **The bars carry no volume.** Alpaca's crypto bars report `v: 0`, so any
+  volume filter is silently vacuous.
+
 ## Tests
 
 ```bash
 uv run --extra test pytest
 ```
+
+### Scripts that talk to real Alpaca
+
+Unit tests cannot prove the wire protocol is right — a mock speaks whatever the
+implementation speaks. These do, and each one found a bug the suite could not.
+
+```bash
+set -a && . ~/.config/alpaca/paper.env && set +a
+
+uv run python scripts/ticks.py                     # live quotes, tick by tick
+uv run python scripts/ticks.py --symbol QQQ        # equities; routes automatically
+uv run python scripts/smoke_stream.py              # equity + trading handshakes
+uv run python scripts/smoke_crypto.py              # crypto handshake and pricing
+```
+
+All of the above are read-only. The end-to-end test is not — it **places one
+real paper order** and refuses to run unless the account is paper and trading is
+explicitly enabled:
+
+```bash
+export TRADING_ENABLED=true ALPACA_STREAM_ENABLED=true
+export ALLOWED_SYMBOLS="BTC/USD" CRYPTO_SYMBOLS="BTC/USD" CRYPTO_MAX_QTY=0.001
+uv run python scripts/e2e_paper.py
+```
+
+It drives webhook → risk → broker → Alpaca → `trade_updates` stream → store,
+then the reconnect resync, then shutdown with live sockets. Crypto is used
+because it trades 24/7, so the whole path can be exercised outside market hours.
 
 ## Architecture
 

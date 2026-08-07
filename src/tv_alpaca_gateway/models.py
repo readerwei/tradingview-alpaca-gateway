@@ -29,7 +29,17 @@ class Signal:
         timeframe = str(payload["timeframe"]).strip()
         if not event_id or len(event_id) > 256:
             raise AlertError("event_id must be 1-256 characters")
-        if not symbol.isalnum() or len(symbol) > 12:
+        # Crypto pairs are written BTC/USD, and that is the canonical form the
+        # data API returns — `isalnum()` rejected it outright, so the only
+        # spelling that worked was the one Alpaca does not use itself.
+        #
+        # Both sides must be non-empty: "BTC/" and "/USD" name no asset, and
+        # checking only that the slash-stripped remainder is alphanumeric lets
+        # them through.
+        if len(symbol) > 12:
+            raise AlertError("invalid symbol")
+        parts = symbol.split("/")
+        if len(parts) > 2 or not all(p.isalnum() for p in parts):
             raise AlertError("invalid symbol")
         if action not in {"buy", "sell"}:
             raise AlertError("action must be buy or sell")

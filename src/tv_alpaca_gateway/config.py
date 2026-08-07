@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,6 +14,11 @@ class Settings:
     webhook_secret: str = ""
     allowed_symbols: frozenset[str] = frozenset({"QQQ"})
     max_qty: int = 1
+    # Crypto is sized separately because one MAX_QTY cannot serve both: 1 is a
+    # sane share count and an absurd amount of BTC, while 0.001 is sane BTC and
+    # an invalid share count for a stop order. Zero means crypto is not enabled
+    # for trading, which is the default.
+    crypto_max_qty: Decimal = Decimal("0")
     max_notional: float = 1000.0
     max_price_deviation: float = 0.05
     max_alert_age_seconds: int = 180
@@ -22,6 +28,7 @@ class Settings:
     alpaca_secret_key: str = ""
     market_data_feed: str = "iex"
     market_symbols: tuple[str, ...] = ("QQQ",)
+    crypto_symbols: tuple[str, ...] = ()
     stream_enabled: bool = False
     discord_webhook_url: str = ""
 
@@ -38,6 +45,7 @@ class Settings:
             webhook_secret=os.getenv("TV_WEBHOOK_SECRET", ""),
             allowed_symbols=symbols,
             max_qty=int(os.getenv("MAX_QTY", "1")),
+            crypto_max_qty=_decimal_env("CRYPTO_MAX_QTY", Decimal("0")),
             max_notional=float(os.getenv("MAX_NOTIONAL", "1000")),
             max_price_deviation=float(os.getenv("MAX_PRICE_DEVIATION", "0.05")),
             max_alert_age_seconds=int(os.getenv("MAX_ALERT_AGE_SECONDS", "180")),
@@ -52,6 +60,11 @@ class Settings:
                 s.strip().upper()
                 for s in os.getenv("MARKET_SYMBOLS", "QQQ").split(",")
                 if s.strip()
+            ),
+            crypto_symbols=tuple(
+                t.strip().upper()
+                for t in os.getenv("CRYPTO_SYMBOLS", "").split(",")
+                if t.strip()
             ),
             stream_enabled=_bool_env("ALPACA_STREAM_ENABLED", False),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
@@ -75,6 +88,17 @@ class Settings:
             raise ValueError("Only Alpaca's paper API URL is permitted")
         if self.max_qty < 1 or self.max_notional <= 0 or not 0 < self.max_price_deviation <= 1:
             raise ValueError("Risk limits must be positive")
+        if self.crypto_max_qty < 0:
+            raise ValueError("CRYPTO_MAX_QTY cannot be negative")
+        # A crypto symbol in the allowlist with no size is a trap: the alert
+        # passes the allowlist and is then rejected on quantity, which reads as
+        # a risk-limit problem rather than missing configuration.
+        crypto_allowed = [s for s in self.allowed_symbols if "/" in s]
+        if crypto_allowed and self.crypto_max_qty <= 0:
+            raise ValueError(
+                f"CRYPTO_MAX_QTY must be set to trade {', '.join(sorted(crypto_allowed))}")
+        if any("/" not in t for t in self.crypto_symbols):
+            raise ValueError("CRYPTO_SYMBOLS must use the slash form, e.g. BTC/USD")
         if not self.allowed_symbols:
             raise ValueError("ALLOWED_SYMBOLS cannot be empty")
         if self.market_data_feed not in {"iex", "sip", "delayed_sip"}:
@@ -83,6 +107,15 @@ class Settings:
     @property
     def market_stream_url(self) -> str:
         return f"wss://stream.data.alpaca.markets/v2/{self.market_data_feed}"
+
+    @property
+    def crypto_stream_url(self) -> str:
+        """Crypto is a different endpoint, not a different feed of the same one.
+
+        Same handshake dialect, so the market socket works unchanged — but the
+        equity URL carries no crypto and returns nothing for BTC/USD.
+        """
+        return "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
 
     @property
     def trade_stream_url(self) -> str:
@@ -94,3 +127,13 @@ def _bool_env(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _decimal_env(name: str, default: Decimal) -> Decimal:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return Decimal(raw.strip())
+    except InvalidOperation as exc:
+        raise ValueError(f"{name} must be a decimal number, got {raw!r}") from exc

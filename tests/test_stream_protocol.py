@@ -37,23 +37,36 @@ class FakeSocket:
     def __init__(self, frames: list):
         self._frames = [json.dumps(f) for f in frames]
         self.sent: list[dict] = []
+        self.reads = 0
+        self.reads_before_first_send: int | None = None
 
     async def send(self, payload: str) -> None:
+        if self.reads_before_first_send is None:
+            self.reads_before_first_send = self.reads
         self.sent.append(json.loads(payload))
 
     async def recv(self) -> str:
+        self.reads += 1
         if not self._frames:
-            raise AssertionError("handshake read more frames than the server sent")
+            # A real socket blocks here; the handshake must not depend on a
+            # frame the server never sends.
+            raise asyncio.TimeoutError("no more frames")
         return self._frames.pop(0)
 
 
 # ───────────────────────────────────────────────── market-data handshake
 
-def test_market_handshake_skips_the_connected_greeting():
+def test_market_handshake_waits_for_the_greeting_before_sending_auth():
     """Alpaca greets with {"T":"success","msg":"connected"} BEFORE auth.
 
-    Reading exactly one frame after sending auth reads the greeting, not the
-    auth reply — which is why the market stream could never connect.
+    Two bugs here, and the second is nastier than the first. Reading exactly
+    one frame after sending auth reads the greeting rather than the auth reply.
+    Skipping the greeting afterwards fixes that — but auth sent BEFORE the
+    greeting arrives is sometimes ignored, leaving the socket open and silent
+    until the handshake times out and reconnects, forever.
+
+    Observed live: three runs connected and streamed ticks, the fourth hung.
+    Anything that only works when the greeting happens to land first is a race.
     """
     sock = FakeSocket([
         [{"T": "success", "msg": "connected"}],     # the greeting
@@ -63,6 +76,17 @@ def test_market_handshake_skips_the_connected_greeting():
                 .authenticate(sock))
 
     assert sock.sent[0] == {"action": "auth", "key": "key", "secret": "secret"}
+    assert sock.reads_before_first_send == 1, (
+        "auth was sent before waiting for the greeting")
+
+
+def test_market_handshake_survives_a_missing_greeting():
+    """The greeting is waited for, not required — an endpoint that goes
+    straight to the auth reply must still connect."""
+    sock = FakeSocket([[{"T": "success", "msg": "authenticated"}]])
+    asyncio.run(_MarketDataSocket(SETTINGS, SETTINGS.market_stream_url)
+                .authenticate(sock))
+    assert sock.sent[0]["action"] == "auth"
 
 
 def test_market_subscribe_uses_the_market_protocol():
