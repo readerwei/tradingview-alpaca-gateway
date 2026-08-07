@@ -1,6 +1,44 @@
+"""Persistent Alpaca WebSockets: market data and order updates.
+
+TWO PROTOCOLS, NOT ONE
+----------------------
+Alpaca's market-data stream and its trading (``trade_updates``) stream are
+different protocols that happen to both be WebSockets. Sharing one handshake
+between them is why neither could connect:
+
+    market data   {"action":"auth","key":K,"secret":S}
+                  -> [{"T":"success","msg":"authenticated"}]
+                  {"action":"subscribe","quotes":[...],"trades":[...]}
+                  -> [{"T":"subscription",...}]
+
+    trading       {"action":"authenticate","data":{"key_id":K,"secret_key":S}}
+                  -> {"stream":"authorization","data":{"status":"authorized"}}
+                  {"action":"listen","data":{"streams":["trade_updates"]}}
+                  -> {"stream":"listening","data":{"streams":[...]}}
+
+Note the trading replies carry no ``T`` field at all, so a check for
+``T == "success"`` rejects even a successful authorization.
+
+THE GREETING FRAME
+------------------
+Alpaca sends ``[{"T":"success","msg":"connected"}]`` the moment the market-data
+socket opens, before any authentication. Reading exactly one frame after
+sending auth therefore reads the greeting, not the auth reply. Handshakes here
+scan forward for the frame they want — bounded, so a chatty or hostile server
+cannot hold the connection open forever.
+
+WHY THE FAILURE WAS INVISIBLE
+-----------------------------
+Every one of those bugs sat behind ``_run_with_reconnect``, which logs a
+warning and retries. Both streams would fail authentication forever while
+``/healthz`` reported ``ok`` and no order updates arrived. Getting this wrong
+does not look broken; it looks quiet.
+"""
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -15,6 +53,16 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 Callback = Callable[[Any], Any | Awaitable[Any]]
+
+# A handshake reply should arrive within a few frames. The cap stops a server
+# that streams unrelated messages from stalling the handshake indefinitely.
+_HANDSHAKE_FRAME_LIMIT = 10
+_HANDSHAKE_TIMEOUT_S = 15.0
+
+# Reconnect backoff is only reset once a connection has proved itself. A socket
+# that dies immediately must not reset the delay, or a server closing on every
+# accept produces a hot reconnect loop instead of backing off.
+_STABLE_CONNECTION_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -122,11 +170,17 @@ def parse_order_update(message: dict[str, Any]) -> OrderUpdate | None:
     )
 
 
+def _frames(raw: str | bytes) -> list[dict[str, Any]]:
+    messages = json.loads(raw)
+    return messages if isinstance(messages, list) else [messages]
+
+
 class _AlpacaSocket:
-    def __init__(self, settings: Settings, url: str, streams: list[str]):
+    """Shared transport. The handshake is NOT shared — see the module docstring."""
+
+    def __init__(self, settings: Settings, url: str):
         self.settings = settings
         self.url = url
-        self.streams = streams
 
     def connect(self):
         return websockets.connect(
@@ -138,40 +192,87 @@ class _AlpacaSocket:
             max_size=1_000_000,
         )
 
+    async def _await_frame(self, websocket: Any, matches, describe: str,
+                           is_error=None) -> dict[str, Any]:
+        """Scan forward for the frame this handshake step expects.
+
+        Alpaca interleaves greetings and unrelated frames with handshake
+        replies, so reading exactly one frame is not enough. Bounded by both a
+        frame count and a timeout so a stalled or noisy server surfaces as a
+        clean error rather than a hang.
+        """
+        for _ in range(_HANDSHAKE_FRAME_LIMIT):
+            raw = await asyncio.wait_for(websocket.recv(), timeout=_HANDSHAKE_TIMEOUT_S)
+            for message in _frames(raw):
+                if is_error is not None and is_error(message):
+                    raise RuntimeError(f"Alpaca refused {describe}: {message}")
+                if message.get("T") == "error":
+                    raise RuntimeError(f"Alpaca refused {describe}: {message}")
+                if matches(message):
+                    return message
+                logger.debug("skipping frame while awaiting %s: %s", describe, message)
+        raise RuntimeError(
+            f"no {describe} response from Alpaca within "
+            f"{_HANDSHAKE_FRAME_LIMIT} frames")
+
+
+class _MarketDataSocket(_AlpacaSocket):
+    """wss://stream.data.alpaca.markets/v2/<feed>"""
+
     async def authenticate(self, websocket: Any) -> None:
-        await websocket.send(
-            json.dumps(
-                {
-                    "action": "auth",
-                    "key": self.settings.alpaca_key_id,
-                    "secret": self.settings.alpaca_secret_key,
-                }
-            )
-        )
-        await self._expect_success(websocket, "authenticated")
-        await websocket.send(json.dumps({"action": "listen", "data": {"streams": self.streams}}))
-        await self._expect_success(websocket, "subscribed")
+        await websocket.send(json.dumps({
+            "action": "auth",
+            "key": self.settings.alpaca_key_id,
+            "secret": self.settings.alpaca_secret_key,
+        }))
+        # Skips the {"T":"success","msg":"connected"} greeting.
+        await self._await_frame(
+            websocket,
+            lambda m: m.get("T") == "success" and m.get("msg") == "authenticated",
+            "authentication")
+
+    async def subscribe(self, websocket: Any, symbols: list[str]) -> None:
+        if not symbols:
+            return
+        await websocket.send(json.dumps({
+            "action": "subscribe", "quotes": symbols, "trades": symbols,
+        }))
+        await self._await_frame(
+            websocket, lambda m: m.get("T") == "subscription", "subscription")
+
+
+class _TradingSocket(_AlpacaSocket):
+    """wss://paper-api.alpaca.markets/stream — a different protocol entirely."""
 
     @staticmethod
-    async def _expect_success(websocket: Any, operation: str) -> None:
-        raw = await websocket.recv()
-        messages = json.loads(raw)
-        if not isinstance(messages, list):
-            messages = [messages]
-        for message in messages:
-            if message.get("T") == "error":
-                raise RuntimeError(f"Alpaca stream {operation} failed: {message}")
-            if message.get("T") == "success" and message.get("msg") in {
-                "authenticated",
-                "listening",
-            }:
-                return
-        raise RuntimeError(f"unexpected Alpaca stream response during {operation}: {messages}")
+    def _unauthorized(message: dict[str, Any]) -> bool:
+        return (message.get("stream") == "authorization"
+                and (message.get("data") or {}).get("status") == "unauthorized")
+
+    async def authenticate(self, websocket: Any) -> None:
+        await websocket.send(json.dumps({
+            "action": "authenticate",
+            "data": {"key_id": self.settings.alpaca_key_id,
+                     "secret_key": self.settings.alpaca_secret_key},
+        }))
+        await self._await_frame(
+            websocket,
+            lambda m: (m.get("stream") == "authorization"
+                       and (m.get("data") or {}).get("status") == "authorized"),
+            "authorization", is_error=self._unauthorized)
+
+    async def listen(self, websocket: Any, streams: list[str]) -> None:
+        await websocket.send(json.dumps({
+            "action": "listen", "data": {"streams": streams},
+        }))
+        await self._await_frame(
+            websocket, lambda m: m.get("stream") == "listening", "listen")
 
 
-class AlpacaMarketStream(_AlpacaSocket):
-    def __init__(self, settings: Settings, on_quote: Callback | None = None, on_trade: Callback | None = None, on_error: Callback | None = None):
-        super().__init__(settings, settings.market_stream_url, ["quotes", "trades"])
+class AlpacaMarketStream(_MarketDataSocket):
+    def __init__(self, settings: Settings, on_quote: Callback | None = None,
+                 on_trade: Callback | None = None, on_error: Callback | None = None):
+        super().__init__(settings, settings.market_stream_url)
         self.on_quote = on_quote
         self.on_trade = on_trade
         self.on_error = on_error
@@ -182,21 +283,9 @@ class AlpacaMarketStream(_AlpacaSocket):
     async def _run_once(self) -> None:
         async with self.connect() as websocket:
             await self.authenticate(websocket)
-            if self.settings.market_symbols:
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "action": "subscribe",
-                            "quotes": list(self.settings.market_symbols),
-                            "trades": list(self.settings.market_symbols),
-                        }
-                    )
-                )
+            await self.subscribe(websocket, list(self.settings.market_symbols))
             async for raw in websocket:
-                messages = json.loads(raw)
-                if not isinstance(messages, list):
-                    messages = [messages]
-                for message in messages:
+                for message in _frames(raw):
                     event = parse_market_message(message)
                     if isinstance(event, MarketQuote):
                         await _invoke(self.on_quote, event)
@@ -204,59 +293,84 @@ class AlpacaMarketStream(_AlpacaSocket):
                         await _invoke(self.on_trade, event)
 
 
-class AlpacaTradeUpdateStream(_AlpacaSocket):
-    def __init__(self, settings: Settings, on_update: Callback | None = None, on_error: Callback | None = None):
-        super().__init__(settings, settings.trade_stream_url, ["trade_updates"])
+class AlpacaTradeUpdateStream(_TradingSocket):
+    def __init__(self, settings: Settings, on_update: Callback | None = None,
+                 on_error: Callback | None = None,
+                 on_connected: Callable[[], Awaitable[None]] | None = None):
+        super().__init__(settings, settings.trade_stream_url)
         self.on_update = on_update
         self.on_error = on_error
+        # Called after every successful (re)connection. Alpaca does not replay
+        # trade_updates missed while disconnected, so without this every
+        # reconnect is a hole where fills vanish permanently — the store would
+        # believe a position is flat when it is not.
+        self.on_connected = on_connected
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
-        await _run_with_reconnect(self._run_once, stop_event, self.on_error, "trade_updates")
+        await _run_with_reconnect(self._run_once, stop_event, self.on_error,
+                                  "trade_updates")
 
     async def _run_once(self) -> None:
         async with self.connect() as websocket:
             await self.authenticate(websocket)
+            await self.listen(websocket, ["trade_updates"])
+            if self.on_connected is not None:
+                # Resync BEFORE reading, so anything missed during the outage is
+                # recovered even if no new update ever arrives.
+                await self.on_connected()
             async for raw in websocket:
-                messages = json.loads(raw)
-                if not isinstance(messages, list):
-                    messages = [messages]
-                for message in messages:
+                for message in _frames(raw):
                     event = parse_order_update(message)
                     if event is not None:
                         await _invoke(self.on_update, event)
 
 
-async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]], stop_event: asyncio.Event, on_error: Callback | None, stream_name: str) -> None:
+async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]],
+                              stop_event: asyncio.Event,
+                              on_error: Callback | None, stream_name: str) -> None:
     delay = 1.0
+    loop = asyncio.get_running_loop()
     while not stop_event.is_set():
+        started = loop.time()
         try:
             await run_once()
-            delay = 1.0
+            # Returning normally means the server closed the socket cleanly.
+            # That is a disconnect, not a success.
+            logger.info("Alpaca %s stream closed by server", stream_name)
         except asyncio.CancelledError:
             raise
-        except (ConnectionClosed, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        except (ConnectionClosed, OSError, RuntimeError, ValueError,
+                asyncio.TimeoutError, json.JSONDecodeError) as exc:
             logger.warning("Alpaca %s stream disconnected: %s", stream_name, exc)
             await _invoke(on_error, exc)
-        except Exception as exc:  # keep the persistent stream alive, but surface the failure
+        except Exception as exc:  # keep the persistent stream alive, but surface it
             logger.exception("unexpected Alpaca %s stream failure", stream_name)
             await _invoke(on_error, exc)
+
+        # Only a connection that stayed up earns a reset. Resetting on every
+        # attempt turns a server that closes immediately into a 1s hot loop.
+        if loop.time() - started >= _STABLE_CONNECTION_S:
+            delay = 1.0
         if not stop_event.is_set():
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
             delay = min(delay * 2, 30.0)
 
 
 class AlpacaStreamManager:
     """Own both persistent Alpaca streams and stop them as one unit."""
 
-    def __init__(self, settings: Settings, on_quote: Callback | None = None, on_trade: Callback | None = None, on_order_update: Callback | None = None, on_error: Callback | None = None):
+    def __init__(self, settings: Settings, on_quote: Callback | None = None,
+                 on_trade: Callback | None = None,
+                 on_order_update: Callback | None = None,
+                 on_error: Callback | None = None,
+                 on_order_stream_connected: Callable[[], Awaitable[None]] | None = None):
         self.settings = settings
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         self.market = AlpacaMarketStream(settings, on_quote, on_trade, on_error)
-        self.trade_updates = AlpacaTradeUpdateStream(settings, on_order_update, on_error)
+        self.trade_updates = AlpacaTradeUpdateStream(
+            settings, on_order_update, on_error, on_order_stream_connected)
 
     async def start(self) -> None:
         if self.tasks:
@@ -265,12 +379,34 @@ class AlpacaStreamManager:
             raise RuntimeError("Alpaca credentials are required to start streaming")
         self.stop_event.clear()
         self.tasks = [
-            asyncio.create_task(self.market.run_forever(self.stop_event), name="alpaca-market-stream"),
-            asyncio.create_task(self.trade_updates.run_forever(self.stop_event), name="alpaca-trade-updates-stream"),
+            asyncio.create_task(self.market.run_forever(self.stop_event),
+                                name="alpaca-market-stream"),
+            asyncio.create_task(self.trade_updates.run_forever(self.stop_event),
+                                name="alpaca-trade-updates-stream"),
         ]
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = 5.0) -> None:
+        """Stop both streams, and do not hang if they will not stop politely.
+
+        The stop event is only observed between reconnect attempts. A task
+        parked in `async for raw in websocket` never looks at it, so a HEALTHY
+        stream — the normal case — ignored it completely and awaiting the tasks
+        blocked forever, hanging application shutdown. The event gives each task
+        a chance to exit cleanly; cancellation is what guarantees it does.
+        """
         self.stop_event.set()
         tasks, self.tasks = self.tasks, []
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            logger.warning("force-cancelling %s: did not stop within %.1fs",
+                           task.get_name(), timeout)
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            if task.cancelled():
+                continue
+            if (exc := task.exception()) is not None:
+                logger.warning("%s ended with %r", task.get_name(), exc)
