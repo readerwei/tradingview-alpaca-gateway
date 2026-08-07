@@ -48,6 +48,33 @@ class EventStore:
             )
             return cur.rowcount == 1
 
+    # Statuses that mean the broker is finished with the order. Anything else
+    # is still live as far as we know, and is what has to be re-checked after a
+    # stream outage.
+    TERMINAL = (
+        "broker_filled", "broker_canceled", "broker_rejected",
+        "broker_expired", "broker_done_for_day",
+    )
+
+    def unresolved_broker_orders(self) -> list[str]:
+        """Broker order ids whose last known status is not terminal.
+
+        Alpaca does not replay trade_updates missed while the socket was down,
+        so after a reconnect these are exactly the orders whose state we may be
+        wrong about. Being wrong here means believing a position is flat when it
+        filled — so the list is deliberately generous: an order re-checked
+        needlessly costs one REST call, one missed costs a position.
+        """
+        placeholders = ",".join("?" for _ in self.TERMINAL)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT broker_order_id FROM events "
+                f"WHERE broker_order_id IS NOT NULL AND broker_order_id != '' "
+                f"AND status NOT IN ({placeholders})",
+                self.TERMINAL,
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def status(self, event_id: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute("SELECT status FROM events WHERE event_id = ?", (event_id,)).fetchone()

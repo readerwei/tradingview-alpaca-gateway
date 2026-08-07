@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -53,8 +54,36 @@ def create_app(
     async def on_stream_error(error: Exception) -> None:
         logger.warning("Alpaca stream error: %s", error)
 
+    async def resync_orders_after_reconnect() -> None:
+        """Re-read every non-terminal order straight from the broker.
+
+        Alpaca does not replay trade_updates that occurred while the socket was
+        down, so a reconnect leaves a hole. Without this the store keeps an
+        order's last pre-outage status forever — reporting a position as working
+        when it actually filled, which is the expensive direction to be wrong in.
+
+        Runs before the socket is read, so the gap closes even if no further
+        update ever arrives.
+        """
+        order_ids = store.unresolved_broker_orders()
+        if not order_ids:
+            return
+        logger.info("resyncing %d unresolved order(s) after stream connect",
+                    len(order_ids))
+        for order_id in order_ids:
+            try:
+                # get_order is blocking urllib; keep it off the event loop.
+                result = await asyncio.to_thread(broker.get_order, order_id)
+            except Exception:
+                logger.exception("resync failed for order_id=%s", order_id)
+                continue
+            if store.update_by_order_id(order_id, f"broker_{result.status}",
+                                        "resynced after stream reconnect"):
+                logger.info("resynced order_id=%s status=%s", order_id, result.status)
+
     stream = stream or (
-        AlpacaStreamManager(settings, on_quote, on_trade, on_order_update, on_stream_error)
+        AlpacaStreamManager(settings, on_quote, on_trade, on_order_update,
+                            on_stream_error, resync_orders_after_reconnect)
         if settings.stream_enabled
         else None
     )
