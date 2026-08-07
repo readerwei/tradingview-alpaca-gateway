@@ -8,6 +8,7 @@ A small, deterministic webhook receiver for TradingView signals. It validates al
 - `TRADING_ENABLED=false` is the default kill switch.
 - Live Alpaca URLs are rejected.
 - Position quantity is determined server-side; TradingView cannot override it.
+- Alert prices must be within `MAX_PRICE_DEVIATION` of Alpaca's latest trade (default 5%).
 - Alerts must include a fresh timestamp and unique `event_id`.
 - Duplicate event IDs are rejected atomically in SQLite.
 - No broker credentials are committed; use environment variables.
@@ -40,6 +41,25 @@ curl -X POST http://127.0.0.1:8000/webhooks/tradingview \
 ```
 
 The service returns quickly after accepting/submitting the signal. The broker response and receipt are stored in SQLite at `GATEWAY_DB_PATH`.
+
+## Alpaca streaming
+
+The persistent stream is opt-in. Set `ALPACA_STREAM_ENABLED=true` only after paper credentials are configured:
+
+```dotenv
+ALPACA_STREAM_ENABLED=true
+ALPACA_MARKET_DATA_FEED=iex
+MARKET_SYMBOLS=QQQ,META
+```
+
+When enabled, the FastAPI lifespan starts two reconnecting WebSocket clients:
+
+- Alpaca market data: quotes and trades for `MARKET_SYMBOLS`
+- Alpaca paper trading updates: submitted, partial fills, fills, cancellations, rejections, and other order events
+
+The clients authenticate, subscribe, reconnect with bounded exponential backoff, and stop cleanly with the application. Order updates are matched to submitted orders by broker order ID and update the SQLite event record; partial-fill and terminal-status details are also sent to the optional Discord notifier. The default remains disabled, so normal tests and local webhook use do not open network connections.
+
+This stream is still paper-only and is not a live-trading safety certification. Before any unattended use, add a durable outbox/retry state machine, restart reconciliation, position-aware sell checks, and persisted managed-exit state.
 
 ## TradingView alert payload
 
@@ -89,7 +109,7 @@ set -a; . ./.env; set +a
 uv run python -c 'from tv_alpaca_gateway.relay import run_relay; run_relay()'
 ```
 
-For production, put the service behind a managed HTTPS reverse proxy, add a durable queue/worker, rotate secrets, monitor failures, and keep the kill switch accessible outside the request process.
+For production, put the service behind a managed HTTPS reverse proxy, add a durable queue/worker, rotate secrets, monitor failures, and keep the kill switch accessible outside the request process. Receipt-notification failures are deliberately isolated from broker submission state.
 
 ## Managed exits (paper-only core)
 

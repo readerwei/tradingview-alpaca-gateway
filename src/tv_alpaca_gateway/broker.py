@@ -68,6 +68,29 @@ class AlpacaPaperClient:
             raise RuntimeError(f"Alpaca order lookup failed: HTTP {exc.code}: {detail}") from exc
         return BrokerResult(order_id=raw.get("id", order_id), status=raw.get("status", "unknown"), raw=raw)
 
+    def latest_trade_price(self, symbol: str) -> float:
+        request = urllib.request.Request(
+            f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest?feed={self.settings.market_data_feed}",
+            headers={
+                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                raw = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"Alpaca market-data lookup failed: HTTP {exc.code}: {detail}") from exc
+        try:
+            price = float(raw["trade"]["p"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Alpaca market-data response did not contain a valid trade price") from exc
+        if price <= 0:
+            raise RuntimeError("Alpaca market-data response contained a non-positive trade price")
+        return price
+
 
 class FakeBroker:
     def __init__(self):
@@ -83,3 +106,6 @@ class FakeBroker:
             if raw["id"] == order_id:
                 return BrokerResult(order_id=order_id, status="accepted", raw=raw)
         raise RuntimeError("fake order not found")
+
+    def latest_trade_price(self, symbol: str) -> float:
+        return 700.0
