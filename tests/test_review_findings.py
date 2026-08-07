@@ -55,6 +55,37 @@ def _client(settings, broker=None, store=None, notifier=None):
     return TestClient(app, raise_server_exceptions=False)
 
 
+# ── adapters, so one suite runs against both the pre- and post-fix API ───────
+#
+# The fix for the price collar adds a market-price argument to approve() and a
+# latest_trade_price() call to the order path. These acceptance tests have to
+# run on BOTH sides of that change — before it, to show the finding is real;
+# after it, to show it is fixed. So they discover the signature instead of
+# assuming one. This is deliberate and temporary: once the API settles, inline
+# the real call and delete these.
+
+def _approve(signal, settings, price=None):
+    """approve(), passing a market reference only if the signature takes one."""
+    import inspect
+    params = inspect.signature(approve).parameters
+    for name in ("market_price", "reference_price", "last_price"):
+        if name in params:
+            return approve(signal, settings,
+                           **{name: signal.close if price is None else price})
+    return approve(signal, settings)
+
+
+def _with_market_data(broker, price=700.0):
+    """Ensure a fixture broker satisfies the market-data half of the interface."""
+    if not hasattr(broker, "latest_trade_price"):
+        broker.latest_trade_price = lambda symbol=None, _p=price: _p
+    return broker
+
+
+def _fake_broker(price=700.0):
+    return _with_market_data(FakeBroker(), price)
+
+
 # ══════════════════════════════════════════════════ P0 · paper-only guarantee
 
 @pytest.mark.parametrize("url, why", [
@@ -110,7 +141,7 @@ def test_a_live_order_is_never_recorded_as_failed(tmp_path):
     A notification is a courtesy. It must never rewrite order state.
     """
     store = EventStore(tmp_path / "events.sqlite3")
-    _client(_settings(tmp_path), FakeBroker(), store, _BrokenNotifier()).post(
+    _client(_settings(tmp_path), _fake_broker(), store, _BrokenNotifier()).post(
         PATH, json=_alert(), headers={"x-tv-secret": SECRET})
 
     assert store.status("e1") != "failed", (
@@ -120,7 +151,7 @@ def test_a_live_order_is_never_recorded_as_failed(tmp_path):
 def test_a_receipt_failure_does_not_return_502(tmp_path):
     """502 tells TradingView the order did not happen, inviting a retry that
     would double the position. The order succeeded; the response must say so."""
-    broker = FakeBroker()
+    broker = _fake_broker()
     r = _client(_settings(tmp_path), broker, EventStore(tmp_path / "e.sqlite3"),
                 _BrokenNotifier()).post(
         PATH, json=_alert(), headers={"x-tv-secret": SECRET})
@@ -132,11 +163,21 @@ def test_a_receipt_failure_does_not_return_502(tmp_path):
 # ═════════════════════════════════════ P0 · retry semantics (TradingBot's find)
 
 class _FailingBroker:
-    """Fails once, then succeeds — a transient broker timeout."""
+    """Fails once, then succeeds — a transient broker timeout.
 
-    def __init__(self):
+    Implements latest_trade_price too. Without it the collar's market-data
+    lookup fails first and the request never reaches the retry path at all —
+    the test would then be asserting on a 503 from a different code path and
+    would tell you nothing about retry semantics.
+    """
+
+    def __init__(self, price=700.0):
         self.calls = 0
         self.orders = []
+        self._price = price
+
+    def latest_trade_price(self, symbol=None):
+        return self._price
 
     def submit(self, order, client_order_id):
         self.calls += 1
@@ -173,7 +214,7 @@ def test_a_successful_order_is_still_not_repeatable(tmp_path):
     """The other half of the contract: making retries possible must not make
     genuine duplicates possible. Same event_id, already submitted → refused."""
     store = EventStore(tmp_path / "events.sqlite3")
-    broker = FakeBroker()
+    broker = _fake_broker()
     client = _client(_settings(tmp_path), broker, store)
 
     client.post(PATH, json=_alert(), headers={"x-tv-secret": SECRET})
@@ -191,18 +232,26 @@ def test_max_qty_is_honoured_not_hardcoded_to_one(tmp_path):
     both the setting and its validate() check and invert this test — what is
     not acceptable is config that reads as a limit and does nothing.
     """
-    order = approve(Signal.parse(_alert(close=100.0)),
-                    _settings(tmp_path, max_qty=5, max_notional=100_000.0))
+    order = _approve(Signal.parse(_alert(close=100.0)),
+                     _settings(tmp_path, max_qty=5, max_notional=100_000.0))
     assert order.qty == 5
 
 
 def test_notional_cap_actually_binds(tmp_path):
     """With qty pinned to 1, `qty * close > max_notional` degrades to
     `close > max_notional` — it can only ever reject a single share priced
-    above the cap. A $1,000 cap must reject 5 x $700."""
-    with pytest.raises(RiskError):
-        approve(Signal.parse(_alert(close=700.0)),
-                _settings(tmp_path, max_qty=5, max_notional=1_000.0))
+    above the cap. A $1,000 cap must reject 5 x $700.
+
+    Matched on the message, not just the type. Adding a precondition upstream
+    (the collar's market-price lookup) makes every bare `pytest.raises(RiskError)`
+    in this file pass for the wrong reason — the call now raises "market price
+    reference is unavailable" long before it reaches the arithmetic under test.
+    A green suite that proves nothing is the exact failure this file exists to
+    prevent, so every expected rejection names the reason it expects.
+    """
+    with pytest.raises(RiskError, match=r"notional"):
+        _approve(Signal.parse(_alert(close=700.0)),
+                 _settings(tmp_path, max_qty=5, max_notional=1_000.0))
 
 
 # ═════════════════════════════════ P1 · client_order_id collision (new finding)
@@ -218,7 +267,7 @@ def test_distinct_events_get_distinct_client_order_ids(tmp_path):
 
     Hash the event_id instead of truncating it.
     """
-    broker = FakeBroker()
+    broker = _fake_broker()
     store = EventStore(tmp_path / "events.sqlite3")
     client = _client(_settings(tmp_path), broker, store)
 
@@ -233,11 +282,6 @@ def test_distinct_events_get_distinct_client_order_ids(tmp_path):
 
 # ═══════════════════════════════════════ P1 · price collar (design undecided)
 
-@pytest.mark.xfail(strict=True, reason=(
-    "No collar exists yet and the design is Wei's call: hard reject vs "
-    "accept-and-alert. This encodes the minimal contract — an order priced "
-    "absurdly far from a market reference must not be placed. Adjust to match "
-    "whatever interface is chosen, then remove this marker."))
 def test_limit_price_is_collared_against_a_market_reference(tmp_path):
     """limit_price is the payload's `close`, unchecked against anything.
 
@@ -245,24 +289,47 @@ def test_limit_price_is_collared_against_a_market_reference(tmp_path):
     100x away from market. The notional gate cannot catch it because it uses
     that same claimed number — understating the price makes the gate EASIER to
     pass while real exposure is unchanged.
+
+    No longer xfail: the collar now exists. Matched on the message so this
+    cannot be satisfied by the market-data lookup failing instead.
     """
-    with pytest.raises(RiskError):
-        approve(Signal.parse(_alert(close=7.0, action="sell")),
-                _settings(tmp_path), reference_price=700.0)
+    with pytest.raises(RiskError, match=r"(?i)deviat|collar|price"):
+        _approve(Signal.parse(_alert(close=7.0, action="sell")),
+                 _settings(tmp_path), price=700.0)
+
+
+def test_a_price_at_market_is_not_collared(tmp_path):
+    """The collar must not reject ordinary alerts. A default of 5% means a
+    price within 5% of the reference has to pass, or every real signal dies."""
+    order = _approve(Signal.parse(_alert(close=700.0)),
+                     _settings(tmp_path), price=700.0)
+    assert order.limit_price == 700.0
+
+
+def test_the_collar_cannot_be_satisfied_by_missing_market_data(tmp_path):
+    """A collar that rejects when the reference is unavailable is fail-safe and
+    correct — but it must not be the ONLY reason rejections happen, or the
+    collar is untested and the suite is green for the wrong reason.
+
+    This pins that a good price with a good reference is accepted, which is
+    only possible if the lookup genuinely succeeded.
+    """
+    s = _settings(tmp_path, max_qty=1, max_notional=100_000.0)
+    assert _approve(Signal.parse(_alert(close=700.0)), s, price=700.0).qty >= 1
 
 
 # ═════════════════════════════════════════════════════ regression guards
 
 def test_the_secret_still_gates_the_endpoint(tmp_path):
     """None of the fixes may weaken authentication."""
-    client = _client(_settings(tmp_path), FakeBroker())
+    client = _client(_settings(tmp_path), _fake_broker())
     assert client.post(PATH, json=_alert()).status_code == 401
     assert client.post(PATH, json=_alert(),
                        headers={"x-tv-secret": "wrong"}).status_code == 401
 
 
 def test_the_kill_switch_still_stops_everything(tmp_path):
-    broker = FakeBroker()
+    broker = _fake_broker()
     r = _client(_settings(tmp_path, trading_enabled=False), broker).post(
         PATH, json=_alert(), headers={"x-tv-secret": SECRET})
     assert r.json()["executed"] is False
@@ -270,11 +337,13 @@ def test_the_kill_switch_still_stops_everything(tmp_path):
 
 
 def test_a_stale_alert_is_still_refused(tmp_path):
+    """Matched on the message: a guard that passes because an unrelated
+    precondition failed first is not guarding anything."""
     old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    with pytest.raises(RiskError):
-        approve(Signal.parse(_alert(bar_time=old)), _settings(tmp_path))
+    with pytest.raises(RiskError, match=r"(?i)stale|age|future|timestamp"):
+        _approve(Signal.parse(_alert(bar_time=old)), _settings(tmp_path))
 
 
 def test_an_unlisted_symbol_is_still_refused(tmp_path):
-    with pytest.raises(RiskError):
-        approve(Signal.parse(_alert(symbol="TSLA")), _settings(tmp_path))
+    with pytest.raises(RiskError, match=r"(?i)allowlist|symbol"):
+        _approve(Signal.parse(_alert(symbol="TSLA")), _settings(tmp_path))
