@@ -59,7 +59,18 @@ async def main():
     if trades:
         t = trades[-1]
         print(f"   last trade  {t.symbol} price={t.price} size={t.size}")
+
+    # Handshake and data flow are reported SEPARATELY. "No errors" alone called
+    # a connected-but-silent socket a success — and connected-but-silent is
+    # precisely how the greeting race failed, so the smoke test was blind to
+    # the bug it existed to catch.
+    #
+    # They cannot be collapsed into one check either: equities are legitimately
+    # silent outside regular hours, so demanding data would fail every night on
+    # a correct system. Use --require-data when the market is known to be open,
+    # or run the crypto smoke test, where silence is always suspicious.
     market_ok = not errors
+    market_data = bool(quotes or trades)
 
     # ---- 2. trade updates: authenticate + listen only. No orders.
     up_errors, connected = [], []
@@ -84,10 +95,17 @@ async def main():
         print(f"   error: {e!r}")
     trade_ok = bool(connected) and not up_errors
 
+    require_data = "--require-data" in sys.argv
     print()
-    print(f"market handshake : {'OK' if market_ok else 'FAILED'}")
-    print(f"trading handshake: {'OK' if trade_ok else 'FAILED'}")
-    return 0 if (market_ok and trade_ok) else 1
+    print(f"market handshake  : {'OK' if market_ok else 'FAILED'}")
+    print(f"market data flow  : "
+          + ("FLOWING" if market_data else
+             ("NONE — FAILED (--require-data)" if require_data else
+              "none (expected outside regular hours)")))
+    print(f"trading handshake : {'OK' if trade_ok else 'FAILED'}")
+
+    ok = market_ok and trade_ok and (market_data or not require_data)
+    return 0 if ok else 1
 
 
 sys.exit(asyncio.run(main()))

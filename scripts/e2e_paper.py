@@ -119,13 +119,29 @@ async def main() -> None:
           f"{OK if after != before else BAD}   {before!r} -> {after!r}")
 
     # ---- clean shutdown, the thing that used to hang -----------------------
+    # Suppressing the timeout and printing OK regardless would make this step
+    # blind to the exact failure it exists to catch — a shutdown that hangs
+    # would report success. That is the same mistake as swallowing an error
+    # frame during the handshake, in the script that verifies the handshake.
     loop = asyncio.get_running_loop()
     started = loop.time()
     server.should_exit = True
-    with contextlib.suppress(asyncio.TimeoutError):
+    try:
         await asyncio.wait_for(serving, timeout=20)
-    print(f"5. shutdown with live streams                    {OK}   "
-          f"{loop.time() - started:.1f}s")
+        shutdown_ok = True
+    except asyncio.TimeoutError:
+        shutdown_ok = False
+        serving.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await serving
+    print(f"5. shutdown with live streams                    "
+          f"{OK if shutdown_ok else BAD}   {loop.time() - started:.1f}s")
+
+    failures = [n for n, ok in (("2 order", bool(order_id)), ("3 stream->store", bool(filled)),
+                                ("4 resync", after != before),
+                                ("5 shutdown", shutdown_ok)) if not ok]
+    if failures:
+        raise SystemExit(f"FAILED: {', '.join(failures)}")
 
 
 asyncio.run(main())
