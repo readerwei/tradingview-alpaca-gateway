@@ -10,8 +10,11 @@ class EventStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')"
+                "CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', broker_order_id TEXT)"
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+            if "broker_order_id" not in columns:
+                conn.execute("ALTER TABLE events ADD COLUMN broker_order_id TEXT")
 
     def claim(self, event_id: str) -> bool:
         with self._connect() as conn:
@@ -21,12 +24,29 @@ class EventStore:
             )
             return cur.rowcount == 1
 
-    def update(self, event_id: str, status: str, detail: str = "") -> None:
+    def update(self, event_id: str, status: str, detail: str = "", broker_order_id: str | None = None) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE events SET status = ?, detail = ? WHERE event_id = ?",
-                (status, detail[:2000], event_id),
+                "UPDATE events SET status = ?, detail = ?, broker_order_id = COALESCE(?, broker_order_id) WHERE event_id = ?",
+                (status, detail[:2000], broker_order_id, event_id),
             )
+
+    def update_by_order_id(self, order_id: str, status: str, detail: str = "") -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE events SET status = ?, detail = ? WHERE broker_order_id = ?",
+                (status, detail[:2000], order_id),
+            )
+            return cur.rowcount == 1
+
+    def release(self, event_id: str) -> bool:
+        """Release an event after submission failure so the same alert can retry."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM events WHERE event_id = ? AND status IN ('claimed', 'failed', 'market_data_failed') AND broker_order_id IS NULL",
+                (event_id,),
+            )
+            return cur.rowcount == 1
 
     def status(self, event_id: str) -> str | None:
         with self._connect() as conn:

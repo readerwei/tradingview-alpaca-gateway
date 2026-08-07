@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
+import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -12,7 +14,10 @@ from .config import Settings
 from .models import AlertError, Signal
 from .notifier import DiscordNotifier, NullNotifier
 from .risk import RiskError, approve
+from .stream import AlpacaStreamManager, MarketQuote, MarketTrade, OrderUpdate
 from .store import EventStore
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -20,12 +25,51 @@ def create_app(
     broker: Any | None = None,
     store: EventStore | None = None,
     notifier: Any | None = None,
+    stream: AlpacaStreamManager | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     store = store or EventStore(settings.db_path)
     broker = broker or AlpacaPaperClient(settings)
     notifier = notifier or (DiscordNotifier(settings.discord_webhook_url) if settings.discord_webhook_url else NullNotifier())
-    app = FastAPI(title="TradingView Alpaca Gateway", version="0.1.0")
+
+    async def on_quote(event: MarketQuote) -> None:
+        logger.debug("market quote %s bid=%s ask=%s", event.symbol, event.bid_price, event.ask_price)
+
+    async def on_trade(event: MarketTrade) -> None:
+        logger.debug("market trade %s price=%s size=%s", event.symbol, event.price, event.size)
+
+    async def on_order_update(event: OrderUpdate) -> None:
+        status = f"broker_{event.status or event.event}"
+        detail = f"event={event.event}; filled_qty={event.filled_qty}"
+        updated = store.update_by_order_id(event.order_id, status, detail)
+        logger.info("Alpaca order update order_id=%s event=%s status=%s", event.order_id, event.event, event.status)
+        notifier.send(
+            f"Alpaca paper order update: {event.side.upper()} {event.qty} {event.symbol}; "
+            f"event={event.event}; status={event.status}; filled={event.filled_qty}"
+        )
+        if not updated:
+            logger.warning("received update for unknown order_id=%s", event.order_id)
+
+    async def on_stream_error(error: Exception) -> None:
+        logger.warning("Alpaca stream error: %s", error)
+
+    stream = stream or (
+        AlpacaStreamManager(settings, on_quote, on_trade, on_order_update, on_stream_error)
+        if settings.stream_enabled
+        else None
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        if stream is not None and settings.stream_enabled:
+            await stream.start()
+        try:
+            yield
+        finally:
+            if stream is not None and settings.stream_enabled:
+                await stream.stop()
+
+    app = FastAPI(title="TradingView Alpaca Gateway", version="0.1.0", lifespan=lifespan)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -44,26 +88,34 @@ def create_app(
         if not store.claim(signal.event_id):
             return {"accepted": False, "duplicate": True, "event_id": signal.event_id}
         try:
-            order = approve(signal, settings)
+            price_lookup = getattr(broker, "latest_trade_price", None)
+            market_price = price_lookup(signal.symbol) if price_lookup is not None else None
+            order = approve(signal, settings, reference_price=market_price)
         except RiskError as exc:
             store.update(signal.event_id, "rejected", str(exc))
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except Exception as exc:
+            store.update(signal.event_id, "market_data_failed", str(exc))
+            raise HTTPException(status_code=503, detail="market data unavailable") from exc
         if not settings.trading_enabled:
             store.update(signal.event_id, "kill_switch", "TRADING_ENABLED=false")
             return {"accepted": True, "executed": False, "reason": "kill_switch", "event_id": signal.event_id}
-        client_order_id = f"tv-{signal.event_id[:110]}"
+        client_order_id = "tv-" + hashlib.sha256(signal.event_id.encode("utf-8")).hexdigest()
         try:
             result = broker.submit(order, client_order_id)
-            store.update(signal.event_id, "submitted", result.order_id)
+            store.update(signal.event_id, "submitted", result.order_id, broker_order_id=result.order_id)
+        except Exception as exc:
+            store.update(signal.event_id, "failed", str(exc))
+            store.release(signal.event_id)
+            raise HTTPException(status_code=502, detail="broker submission failed") from exc
+        try:
             notifier.send(
                 f"TradingView paper order: {order.side.upper()} {order.qty} {order.symbol} "
                 f"limit ${order.limit_price:.2f}; status={result.status}; order_id={result.order_id}"
             )
-            return {"accepted": True, "executed": True, "event_id": signal.event_id, "order_id": result.order_id, "status": result.status}
-        except Exception as exc:
-            store.update(signal.event_id, "failed", str(exc))
-            notifier.send(f"TradingView paper order FAILED: {signal.symbol} {signal.action}: {exc}")
-            raise HTTPException(status_code=502, detail="broker submission failed") from exc
+        except Exception:
+            logger.exception("paper-order receipt notification failed for order_id=%s", result.order_id)
+        return {"accepted": True, "executed": True, "event_id": signal.event_id, "order_id": result.order_id, "status": result.status}
 
     return app
 
