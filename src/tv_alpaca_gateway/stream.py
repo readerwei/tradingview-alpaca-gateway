@@ -290,19 +290,31 @@ class _TradingSocket(_AlpacaSocket):
 
 class AlpacaMarketStream(_MarketDataSocket):
     def __init__(self, settings: Settings, on_quote: Callback | None = None,
-                 on_trade: Callback | None = None, on_error: Callback | None = None):
-        super().__init__(settings, settings.market_stream_url)
+                 on_trade: Callback | None = None, on_error: Callback | None = None,
+                 url: str | None = None, symbols: tuple[str, ...] | None = None,
+                 label: str = "market"):
+        super().__init__(settings, url or settings.market_stream_url)
         self.on_quote = on_quote
         self.on_trade = on_trade
         self.on_error = on_error
+        # Crypto is a separate endpoint with its own symbol list, not another
+        # feed of the equity socket — so the URL and symbols are injectable
+        # rather than read from one hardcoded pair of settings.
+        self._symbols = symbols
+        self.label = label
+
+    @property
+    def symbols(self) -> list[str]:
+        return list(self._symbols if self._symbols is not None
+                    else self.settings.market_symbols)
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
-        await _run_with_reconnect(self._run_once, stop_event, self.on_error, "market")
+        await _run_with_reconnect(self._run_once, stop_event, self.on_error, self.label)
 
     async def _run_once(self) -> None:
         async with self.connect() as websocket:
             await self.authenticate(websocket)
-            await self.subscribe(websocket, list(self.settings.market_symbols))
+            await self.subscribe(websocket, self.symbols)
             async for raw in websocket:
                 for message in _frames(raw):
                     event = parse_market_message(message)
@@ -388,6 +400,14 @@ class AlpacaStreamManager:
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         self.market = AlpacaMarketStream(settings, on_quote, on_trade, on_error)
+        # Crypto only when symbols are configured — an empty subscribe list
+        # would hold a socket open receiving nothing.
+        self.crypto = (
+            AlpacaMarketStream(settings, on_quote, on_trade, on_error,
+                               url=settings.crypto_stream_url,
+                               symbols=settings.crypto_symbols, label="crypto")
+            if settings.crypto_symbols else None
+        )
         self.trade_updates = AlpacaTradeUpdateStream(
             settings, on_order_update, on_error, on_order_stream_connected)
 
@@ -403,6 +423,10 @@ class AlpacaStreamManager:
             asyncio.create_task(self.trade_updates.run_forever(self.stop_event),
                                 name="alpaca-trade-updates-stream"),
         ]
+        if self.crypto is not None:
+            self.tasks.append(
+                asyncio.create_task(self.crypto.run_forever(self.stop_event),
+                                    name="alpaca-crypto-stream"))
 
     async def stop(self, timeout: float = 5.0) -> None:
         """Stop both streams, and do not hang if they will not stop politely.
