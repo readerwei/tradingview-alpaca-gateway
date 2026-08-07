@@ -72,4 +72,41 @@ TradingView → HTTPS endpoint → authentication → schema/freshness checks
              → optional Discord receipt
 ```
 
+For a deployment with no public broker webhook, use the optional Discord relay:
+
+```text
+TradingView → Discord incoming webhook → private channel
+             → outbound Python Discord bot → 127.0.0.1 gateway → Alpaca paper API
+```
+
+The relay admits only messages from one configured channel and source webhook ID. It requires Discord's Message Content intent, forwards structured JSON to the local gateway, and ignores human messages, other bots, other channels, malformed content, and unapproved webhooks. Keep the bot token, source webhook URL, and broker credentials out of Git and out of Discord messages.
+
+Run the relay separately:
+
+```bash
+uv sync --extra relay
+set -a; . ./.env; set +a
+uv run python -c 'from tv_alpaca_gateway.relay import run_relay; run_relay()'
+```
+
 For production, put the service behind a managed HTTPS reverse proxy, add a durable queue/worker, rotate secrets, monitor failures, and keep the kill switch accessible outside the request process.
+
+## Managed exits (paper-only core)
+
+`tv_alpaca_gateway.order_manager.ExitManager` coordinates multiple fixed take-profit limit orders with one trailing-stop order. It is intentionally broker-agnostic and deterministic:
+
+```python
+from decimal import Decimal
+from tv_alpaca_gateway.order_manager import ExitManager, ExitPlan
+from tv_alpaca_gateway.alpaca_exit_broker import AlpacaPaperExitBroker
+
+plan = ExitPlan(
+    symbol="QQQ",
+    take_profits=((Decimal("725"), 3), (Decimal("730"), 3)),
+    trail_percent=Decimal("2"),
+)
+manager = ExitManager(AlpacaPaperExitBroker(settings), plan)
+manager.start(position_qty=10)  # 3 + 3 at targets, 4 under trailing stop
+```
+
+When a take-profit fill arrives from Alpaca trade updates, call `on_fill(FillEvent(...))`; the manager reduces the trailing-stop quantity. If the trailing stop fills, it cancels the unfilled take-profit orders. This is not a native Alpaca OCO relationship, so the controller must persist state, reconcile after restarts, and fail closed before any live use. The current implementation remains paper-only and is not wired to the gateway kill switch or a live WebSocket worker.
