@@ -44,4 +44,4 @@ def test_the_contract_suite_is_present_and_non_trivial():
     assert contract.exists(), "the execution contract has gone missing"
     body = contract.read_text()
     assert body.count("def test_") >= 15, (
-        f"the contract has shrunk to {body.count('def test_')} cases")
+        f"the contract has shrunk to {body.count(chr(39)+chr(39))} cases")

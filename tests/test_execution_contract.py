@@ -352,6 +352,95 @@ def test_an_equity_entry_keeps_its_day_time_in_force(tmp_path):
     assert entry["time_in_force"] == "day"
 
 
+class _ProtectionFails(RecordingBroker):
+    """Refuses the first `fail_times` protective orders, then behaves."""
+
+    def __init__(self, fail_times: int = 99, **kw):
+        super().__init__(**kw)
+        self.fail_times = fail_times
+        self.protection_attempts = 0
+
+    def submit_order(self, **kwargs):
+        if kwargs.get("type") in {"stop_limit", "stop", "trailing_stop"}:
+            self.protection_attempts += 1
+            if self.protection_attempts <= self.fail_times:
+                raise RuntimeError("broker refused the protective order")
+        return super().submit_order(**kwargs)
+
+
+def test_a_failed_protective_order_is_retried_once(tmp_path):
+    """Wei's call: retry once, then flatten and shout.
+
+    A protective order can fail for reasons that clear immediately — a
+    momentary rejection, a position not yet settled on the broker's side. One
+    retry costs a round trip; not retrying costs an unprotected position for a
+    transient fault.
+    """
+    broker = _ProtectionFails(fail_times=1)
+    _run(CRYPTO_ALERT, _settings(tmp_path), broker)
+
+    assert broker.protection_attempts >= 2, "the protective order was not retried"
+    assert broker.orders_of("stop_limit"), "the retry did not place protection"
+
+
+def test_a_position_that_cannot_be_protected_is_flattened(tmp_path):
+    """When protection keeps failing, the position must not be left open.
+
+    An unprotected position is worse than no position: the strategy believes
+    its risk is bounded and it is not. Flattening converts an unbounded,
+    unattended exposure into a realised loss of known size, which is the
+    trade Wei chose.
+    """
+    broker = _ProtectionFails(fail_times=99)
+    _run(CRYPTO_ALERT, _settings(tmp_path), broker)
+
+    closing = [o for o in broker.submitted
+               if o.get("type") == "market" and o["side"] == "sell"]
+    assert closing, (
+        "protection failed repeatedly and the position was left open")
+    assert broker.position_qty("BTC/USD") <= 0, "the position was not flattened"
+
+
+def test_flattening_is_sized_from_the_position_too(tmp_path):
+    """The same in-kind fee problem: closing must sell what is held, not what
+    was filled, or the close is refused and the position survives."""
+    broker = _ProtectionFails(fail_times=99)
+    held_before = None
+    _run(CRYPTO_ALERT, _settings(tmp_path), broker)
+
+    closing = [o for o in broker.submitted
+               if o.get("type") == "market" and o["side"] == "sell"][0]
+    assert Decimal(str(closing["qty"])) <= Decimal("0.001"), (
+        "the close was sized from the fill and would be refused")
+
+
+def test_a_failed_flatten_is_reported_unambiguously(tmp_path):
+    """If the position cannot be protected AND cannot be closed, that is the
+    worst state the system can reach. It must be impossible to mistake for
+    success — silence here is how an operator finds out from a P&L statement.
+    """
+    class NothingWorks(RecordingBroker):
+        def submit_order(self, **kwargs):
+            if kwargs.get("type") == "market" and kwargs["side"] == "buy":
+                return super().submit_order(**kwargs)
+            raise RuntimeError("broker refuses everything else")
+
+    broker = NothingWorks()
+    settings = _settings(tmp_path)
+    store = EventStore(settings.db_path)
+
+    status = None
+    try:
+        result = _run(CRYPTO_ALERT, settings, broker, store)
+        status = getattr(result, "entry_status", None) or getattr(
+            result, "status", None)
+    except Exception as exc:
+        status = str(exc)
+
+    assert status, "an unprotected, unclosable position produced no signal"
+    assert broker.position_qty("BTC/USD") > 0, "fixture: the position is stuck open"
+
+
 def test_a_failed_protective_order_still_reports_the_open_position(tmp_path):
     """The most expensive state in the system: filled, exposed, no stop.
 
