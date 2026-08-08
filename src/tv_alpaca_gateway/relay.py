@@ -5,6 +5,12 @@ import os
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
+
+
+PINE_EXECUTION_PREFIX = "EXECUTE_ALPACA_ORDER"
+DISCORD_MESSAGE_MAX_CHARS = 2000
+PINE_DRY_RUN_PATH = "/webhooks/tradingview/pine/dry-run"
 
 
 @dataclass(frozen=True)
@@ -14,6 +20,20 @@ class RelaySettings:
     source_webhook_id: int
     internal_url: str = "http://127.0.0.1:8000/webhooks/tradingview"
     internal_secret: str = ""
+
+    def validate_target(self) -> None:
+        """Ensure this private relay can only reach the Pine dry-run route."""
+        parsed = urlsplit(self.internal_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.path != PINE_DRY_RUN_PATH
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("relay target must be a local Pine dry-run endpoint")
 
     @classmethod
     def from_env(cls) -> "RelaySettings":
@@ -31,32 +51,32 @@ class RelaySettings:
         )
 
 
-def admit_message(message: Any, settings: RelaySettings) -> dict:
-    """Return a strict JSON signal only for the configured channel/webhook."""
+def admit_message(message: Any, settings: RelaySettings) -> str:
+    """Return raw Pine text only from the configured channel and webhook."""
     if getattr(message.channel, "id", None) != settings.channel_id:
         raise ValueError("message is from an unapproved channel")
     if getattr(message, "webhook_id", None) != settings.source_webhook_id:
         raise ValueError("message is not from the approved source webhook")
-    if not isinstance(getattr(message, "content", None), str) or not message.content.strip():
-        raise ValueError("source message has no JSON content")
-    try:
-        payload = json.loads(message.content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("source message is not valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("source payload must be a JSON object")
-    return payload
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or not content:
+        raise ValueError("source message has no Pine order content")
+    if len(content) >= DISCORD_MESSAGE_MAX_CHARS:
+        raise ValueError("Pine order exceeds Discord's 2000-character message limit")
+    if not content.startswith(PINE_EXECUTION_PREFIX):
+        raise ValueError("source message is not an EXECUTE_ALPACA_ORDER command")
+    return content
 
 
 class GatewayRelay:
     def __init__(self, settings: RelaySettings):
+        settings.validate_target()
         self.settings = settings
 
-    def forward(self, payload: dict) -> None:
+    def forward(self, pine_alert: str) -> None:
         request = urllib.request.Request(
             self.settings.internal_url,
-            data=json.dumps(payload).encode(),
-            headers={"content-type": "application/json", "x-tv-secret": self.settings.internal_secret},
+            data=pine_alert.encode("utf-8"),
+            headers={"content-type": "text/plain; charset=utf-8", "x-tv-secret": self.settings.internal_secret},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=3):
