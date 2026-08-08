@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.request
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 PINE_EXECUTION_PREFIX = "EXECUTE_ALPACA_ORDER"
 DISCORD_MESSAGE_MAX_CHARS = 2000
 PINE_DRY_RUN_PATH = "/webhooks/tradingview/pine/dry-run"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,8 +106,8 @@ def run_relay() -> None:
         try:
             payload = admit_message(message, settings)
             relay.forward(payload)
-        except ValueError:
-            return
+        except ValueError as exc:
+            logger.info("relay ignored a message: %s", exc)
         except Exception as exc:
             print(f"relay forwarding failed: {exc}")
 
