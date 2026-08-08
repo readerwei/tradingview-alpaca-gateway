@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from .assets import is_crypto
+
 
 class AlertParseError(ValueError):
     """The alert is not an executable Pine/TradingView order command."""
@@ -48,6 +50,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError("alert must contain exactly one execution prefix")
     prefix_start = content.index(_PREFIX)
     prefix_end = prefix_start + len(_PREFIX)
+    if prefix_start > 0 and content[prefix_start - 1] not in " \t\r\n":
+        raise AlertParseError("missing EXECUTE_ALPACA_ORDER execution prefix")
     if prefix_end < len(content) and content[prefix_end] not in "| \t\r\n":
         raise AlertParseError("missing EXECUTE_ALPACA_ORDER execution prefix")
     parts = [part.strip() for part in content[prefix_start:].split("|")]
@@ -80,7 +84,7 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError(f"missing required fields: {', '.join(missing)}")
 
     symbol = _CANONICAL_CRYPTO.get(fields["SYMBOL"].upper(), fields["SYMBOL"].upper())
-    is_crypto = symbol in _CANONICAL_CRYPTO.values()
+    crypto_symbol = is_crypto(symbol)
     side = fields["SIDE"].lower()
     if side not in {"buy", "sell"}:
         raise AlertParseError("SIDE must be BUY or SELL")
@@ -89,7 +93,7 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     if order_type not in _ALLOWED_ORDER_TYPES:
         raise AlertParseError("ORDER_TYPE must be MARKET")
     time_in_force = fields["TIME_IN_FORCE"].lower()
-    allowed_time_in_force = {"gtc", "ioc"} if is_crypto else {"day", "gtc", "ioc", "fok", "opg", "cls"}
+    allowed_time_in_force = {"gtc", "ioc"} if crypto_symbol else {"day", "gtc", "ioc", "fok", "opg", "cls"}
     if time_in_force not in allowed_time_in_force:
         raise AlertParseError("TIME_IN_FORCE is not supported")
 
@@ -111,7 +115,7 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
 
     trail_raw = fields.get("TRAIL", "NONE")
     trail = None if trail_raw.upper() == "NONE" else _positive_decimal(trail_raw, "trail")
-    if is_crypto and trail is not None:
+    if crypto_symbol and trail is not None:
         raise AlertParseError("TRAIL is unsupported for crypto orders on Alpaca")
     cancel_raw = fields.get("CANCEL_UNFILLED_AT_DEADLINE", "NO").upper()
     if cancel_raw not in {"YES", "NO"}:

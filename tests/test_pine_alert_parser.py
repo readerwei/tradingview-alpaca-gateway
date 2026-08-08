@@ -74,6 +74,24 @@ def test_rejects_multiple_execution_prefixes():
         parse_pine_alert(ALERT + " | EXECUTE_ALPACA_ORDER")
 
 
+@pytest.mark.parametrize("prefix", ["DONT_EXECUTE_ALPACA_ORDER", "NEVER_EXECUTE_ALPACA_ORDER"])
+def test_rejects_prefix_embedded_in_non_execution_text(prefix):
+    alert = ALERT.replace("EXECUTE_ALPACA_ORDER", prefix, 1)
+
+    with pytest.raises(AlertParseError, match="execution prefix"):
+        parse_pine_alert(alert)
+
+
+def test_applies_crypto_rules_to_any_slash_form_pair():
+    alert = ALERT.replace("SYMBOL=BTCUSD", "SYMBOL=SOL/USD")
+
+    with pytest.raises(AlertParseError, match="TRAIL is unsupported for crypto"):
+        parse_pine_alert(alert.replace("TRAIL=NONE", "TRAIL=250"))
+
+    with pytest.raises(AlertParseError, match="TIME_IN_FORCE is not supported"):
+        parse_pine_alert(alert.replace("TIME_IN_FORCE=GTC", "TIME_IN_FORCE=DAY"))
+
+
 @pytest.mark.parametrize(
     ("alert", "message"),
     [
