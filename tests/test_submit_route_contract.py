@@ -33,8 +33,27 @@ import pytest
 from tv_alpaca_gateway.config import Settings
 from tv_alpaca_gateway.store import EventStore
 
-ALERT = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
-         "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+# Carries EVENT_ID and BAR_TIME because tests/test_alert_identity_contract.py
+# requires them: an alert that cannot be identified must be refused, and one
+# that cannot be dated cannot be checked for staleness.
+#
+# This fixture and that contract have to agree. They did not at first — this
+# file was written before the identity flaw was found, and its alert had
+# neither field, so every case here would have failed the moment identity
+# landed. That is the same "second definition free to drift" this file's own
+# docstring warns about, committed in the fixture instead of the assertions.
+#
+# BAR_TIME is generated fresh per run; a hardcoded timestamp would go stale and
+# start failing the freshness rule some hours after being written.
+def _fresh_alert(event_id="QQQ-1-route-test"):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | "
+            f"EVENT_ID={event_id} | BAR_TIME={now}")
+
+
+ALERT = _fresh_alert()
 SECRET = "s3cret"
 SUBMIT_PATH = "/webhooks/tradingview/pine/submit"
 
@@ -58,8 +77,9 @@ def _client(settings, broker=None, store=None, notifier=None):
                                  notifier), raise_server_exceptions=False)
 
 
-def _post(client, body=ALERT, secret=SECRET):
-    return client.post(SUBMIT_PATH, content=body, headers={"x-tv-secret": secret})
+def _post(client, body=None, secret=SECRET):
+    return client.post(SUBMIT_PATH, content=body if body is not None else _fresh_alert(),
+                       headers={"x-tv-secret": secret})
 
 
 class _RecordingBroker:
@@ -148,8 +168,11 @@ def test_the_same_alert_posted_twice_places_one_order(tmp_path):
     broker = _RecordingBroker()
     client = _client(settings, broker, store)
 
-    _post(client)
-    _post(client)
+    # The SAME alert twice — same EVENT_ID, so one order. A different EVENT_ID
+    # would be a different firing and must be allowed to trade.
+    repeated = _fresh_alert(event_id="QQQ-1-repeated")
+    _post(client, repeated)
+    _post(client, repeated)
 
     entries = [o for o in broker.submitted if o.get("type", "market") == "market"]
     assert len(entries) == 1, "the same alert entered twice"
