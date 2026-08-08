@@ -31,13 +31,19 @@ Health check:
 curl http://127.0.0.1:8000/healthz
 ```
 
-Send a test alert:
+Send a **fresh, non-executing** test alert (the default `TRADING_ENABLED=false` kill switch remains in force):
 
 ```bash
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EVENT_ID="manual-test-$(date +%s)"
+# Set CLOSE to a recent QQQ price. It must be within MAX_PRICE_DEVIATION
+# (5% by default) of Alpaca's current reference price.
+CLOSE=700
+
 curl -X POST http://127.0.0.1:8000/webhooks/tradingview \
   -H 'content-type: application/json' \
   -H "x-tv-secret: $TV_WEBHOOK_SECRET" \
-  -d '{"event_id":"demo-1","symbol":"QQQ","action":"buy","timeframe":"1m","bar_time":"2026-08-06T22:00:00Z","close":700}'
+  -d "{\"event_id\":\"$EVENT_ID\",\"symbol\":\"QQQ\",\"action\":\"buy\",\"timeframe\":\"1m\",\"bar_time\":\"$NOW\",\"close\":$CLOSE}"
 ```
 
 The service returns quickly after accepting/submitting the signal. The broker response and receipt are stored in SQLite at `GATEWAY_DB_PATH`.
@@ -61,9 +67,30 @@ The clients authenticate, subscribe, reconnect with bounded exponential backoff,
 
 This stream is still paper-only and is not a live-trading safety certification. Before any unattended use, add a durable outbox/retry state machine, restart reconciliation, position-aware sell checks, and persisted managed-exit state.
 
-## TradingView alert payload
+## Pine command parser (current TradingView alert format)
 
-Use a structured JSON message with `bar_time` generated from a **confirmed bar**. The receiver requires:
+The repository includes `parse_pine_alert()` for the current pipe-delimited Pine command format:
+
+```text
+EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | CANCEL_UNFILLED_AT_DEADLINE=YES | PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=65000 | STOP_LIMIT=64950 | TRAIL=NONE
+```
+
+It parses and validates `SYMBOL`, `SIDE`, `QTY`, `ORDER_TYPE`, `TIME_IN_FORCE`, `CANCEL_UNFILLED_AT_DEADLINE`, the protective-stop flag, `STOP_TRIGGER`, `STOP_LIMIT`, and `TRAIL`. The current parser accepts only `ORDER_TYPE=MARKET`; it will not represent a non-market entry until the contract gains explicit entry-price fields. `BTCUSD` is normalized to `BTC/USD`; `TRAIL=NONE` becomes no trail, while `TRAIL=250` means a $250 trail distance. The parser deliberately ignores non-executable instruction fields such as `REQUIRED_ACTIONS` and `DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL`.
+
+This parser is not wired into the FastAPI order route yet: it does not submit an order, schedule a 60-second cancellation, or create stop/trailing orders. Those lifecycle operations require a separately tested persistent worker.
+
+## JSON webhook payload (existing FastAPI route)
+
+Use a structured JSON message with `bar_time` generated from a **confirmed bar**. All six fields below are required; unknown extra fields are ignored.
+
+| Field | Required value | Validation / use |
+|---|---|---|
+| `event_id` | Unique string, 1–256 characters | SQLite idempotency key. Do not reuse it after a rejection, submission, or test. |
+| `symbol` | Uppercase equity ticker or crypto pair | Must be in `ALLOWED_SYMBOLS`; crypto may be `BTCUSD` or `BTC/USD`, but the allowlist uses slash form. |
+| `action` | `buy` or `sell` | Order direction. |
+| `timeframe` | Non-empty strategy timeframe, e.g. `1m` | Preserved with the signal; it is not an order interval. |
+| `bar_time` | ISO-8601 timestamp **with timezone**, e.g. `2026-08-07T20:00:00Z` | Must be no more than `MAX_ALERT_AGE_SECONDS` old (default 180 seconds) and no more than 30 seconds in the future. |
+| `close` | Positive JSON number | Must be within `MAX_PRICE_DEVIATION` of Alpaca's current reference price (default 5%). |
 
 ```json
 {
@@ -72,7 +99,20 @@ Use a structured JSON message with `bar_time` generated from a **confirmed bar**
   "action": "buy",
   "timeframe": "{{interval}}",
   "bar_time": "{{time}}",
-  "close": "{{close}}"
+  "close": {{close}}
+}
+```
+
+A minimal relay test therefore needs a **new event ID**, a current timestamp, and a plausible current price. For example (replace the timestamp and close before posting):
+
+```json
+{
+  "event_id": "qqq-test-20260807T200000Z",
+  "symbol": "QQQ",
+  "action": "buy",
+  "timeframe": "1m",
+  "bar_time": "2026-08-07T20:00:00Z",
+  "close": 720.00
 }
 ```
 
