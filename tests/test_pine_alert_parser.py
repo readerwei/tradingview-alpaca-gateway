@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -5,8 +6,20 @@ import pytest
 from tv_alpaca_gateway.pine_alert_parser import AlertParseError, parse_pine_alert
 
 
+def _now() -> str:
+    """BAR_TIME is generated per call, never hardcoded.
+
+    A fixed timestamp passes the freshness rule when written and starts failing
+    it a few minutes later — a decayed fixture that looks exactly like a parser
+    regression. Tests that pass in the morning and fail after lunch are worse
+    than tests that never passed.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 ALERT = (
     "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+    f"EVENT_ID=BTCUSD-1-fixture | BAR_TIME={_now()} | "
     "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | "
     "CANCEL_UNFILLED_AT_DEADLINE=YES | PLACE_PROTECTIVE_STOP_AFTER_FILL | "
     "STOP_TRIGGER=65000 | STOP_LIMIT=64950 | TRAIL=NONE | "
