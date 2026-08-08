@@ -140,3 +140,51 @@ def test_crypto_symbols_must_use_the_slash_form():
     with pytest.raises(ValueError, match="slash"):
         Settings(allowed_symbols=frozenset({BTC}), crypto_max_qty=Decimal("0.001"),
                  crypto_symbols=("BTCUSD",)).validate()
+
+
+# ────────────────────────────── mixed MARKET_SYMBOLS routing (found in review)
+
+def test_mixed_market_symbols_are_split_across_two_sockets():
+    """MARKET_SYMBOLS=BTC/USD,QQQ sent both to the equity endpoint.
+
+    Alpaca answers {"T":"error","code":400,"msg":"invalid syntax"} — and that
+    rejection kills the WHOLE subscription, so a single crypto symbol silently
+    took the equity feed down with it. Reproduced live before fixing.
+
+    The slash makes the routing unambiguous, so the symbols are partitioned
+    rather than refused.
+    """
+    s = _settings(market_symbols=("BTC/USD", "QQQ"), stream_enabled=True,
+                  alpaca_key_id="k", alpaca_secret_key="s")
+    manager = AlpacaStreamManager(s)
+
+    assert manager.market is not None and manager.market.symbols == ["QQQ"]
+    assert manager.crypto is not None and manager.crypto.symbols == ["BTC/USD"]
+    assert manager.market.url.endswith("/v2/iex")
+    assert manager.crypto.url.endswith("/v1beta3/crypto/us")
+
+
+def test_crypto_only_configuration_starts_no_equity_socket():
+    """An empty subscribe list would hold a socket open receiving nothing."""
+    s = _settings(market_symbols=("BTC/USD",), stream_enabled=True,
+                  alpaca_key_id="k", alpaca_secret_key="s")
+    manager = AlpacaStreamManager(s)
+    assert manager.market is None
+    assert manager.crypto.symbols == ["BTC/USD"]
+
+
+def test_both_symbol_variables_feed_the_crypto_socket():
+    """CRYPTO_SYMBOLS still works, and duplicates across the two lists collapse."""
+    s = _settings(market_symbols=("QQQ", "BTC/USD"), crypto_symbols=("BTC/USD", "ETH/USD"),
+                  stream_enabled=True, alpaca_key_id="k", alpaca_secret_key="s")
+    assert AlpacaStreamManager(s).crypto.symbols == ["BTC/USD", "ETH/USD"]
+
+
+def test_every_configured_symbol_reaches_exactly_one_socket():
+    """Nothing dropped, nothing duplicated — the property that actually matters."""
+    s = _settings(market_symbols=("QQQ", "BTC/USD", "AAPL", "ETH/USD"),
+                  stream_enabled=True, alpaca_key_id="k", alpaca_secret_key="s")
+    manager = AlpacaStreamManager(s)
+    routed = manager.market.symbols + manager.crypto.symbols
+    assert sorted(routed) == sorted(s.market_symbols)
+    assert len(routed) == len(set(routed))

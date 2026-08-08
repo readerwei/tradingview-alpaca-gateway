@@ -109,6 +109,25 @@ class Settings:
         return f"wss://stream.data.alpaca.markets/v2/{self.market_data_feed}"
 
     @property
+    def equity_stream_symbols(self) -> tuple[str, ...]:
+        """MARKET_SYMBOLS entries that belong on the equity socket."""
+        return tuple(t for t in self.market_symbols if "/" not in t)
+
+    @property
+    def crypto_stream_symbols(self) -> tuple[str, ...]:
+        """Crypto pairs to stream, from EITHER symbol list.
+
+        A crypto pair in MARKET_SYMBOLS used to be sent to the equity endpoint,
+        where Alpaca answers {"T":"error","code":400,"msg":"invalid syntax"} —
+        and that rejection kills the WHOLE subscription, so one crypto symbol
+        silently took the equity feed down with it. The slash makes the routing
+        unambiguous, so it is now routed rather than refused.
+        """
+        ordered = dict.fromkeys(
+            t for t in (*self.market_symbols, *self.crypto_symbols) if "/" in t)
+        return tuple(ordered)
+
+    @property
     def crypto_stream_url(self) -> str:
         """Crypto is a different endpoint, not a different feed of the same one.
 

@@ -442,14 +442,20 @@ class AlpacaStreamManager:
         self.settings = settings
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
-        self.market = AlpacaMarketStream(settings, on_quote, on_trade, on_error)
-        # Crypto only when symbols are configured — an empty subscribe list
+        # One socket per asset class, because they are different endpoints.
+        # Each is created only when it has symbols — an empty subscribe list
         # would hold a socket open receiving nothing.
+        self.market = (
+            AlpacaMarketStream(settings, on_quote, on_trade, on_error,
+                               symbols=settings.equity_stream_symbols)
+            if settings.equity_stream_symbols else None
+        )
         self.crypto = (
             AlpacaMarketStream(settings, on_quote, on_trade, on_error,
                                url=settings.crypto_stream_url,
-                               symbols=settings.crypto_symbols, label="crypto")
-            if settings.crypto_symbols else None
+                               symbols=settings.crypto_stream_symbols,
+                               label="crypto")
+            if settings.crypto_stream_symbols else None
         )
         self.trade_updates = AlpacaTradeUpdateStream(
             settings, on_order_update, on_error, on_order_stream_connected)
@@ -461,15 +467,14 @@ class AlpacaStreamManager:
             raise RuntimeError("Alpaca credentials are required to start streaming")
         self.stop_event.clear()
         self.tasks = [
-            asyncio.create_task(self.market.run_forever(self.stop_event),
-                                name="alpaca-market-stream"),
             asyncio.create_task(self.trade_updates.run_forever(self.stop_event),
                                 name="alpaca-trade-updates-stream"),
         ]
-        if self.crypto is not None:
-            self.tasks.append(
-                asyncio.create_task(self.crypto.run_forever(self.stop_event),
-                                    name="alpaca-crypto-stream"))
+        for stream, name in ((self.market, "alpaca-market-stream"),
+                             (self.crypto, "alpaca-crypto-stream")):
+            if stream is not None:
+                self.tasks.append(
+                    asyncio.create_task(stream.run_forever(self.stop_event), name=name))
 
     async def stop(self, timeout: float = 5.0) -> None:
         """Stop both streams, and do not hang if they will not stop politely.

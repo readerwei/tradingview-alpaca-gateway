@@ -87,8 +87,19 @@ a ticker.
 ```dotenv
 ALLOWED_SYMBOLS=QQQ,BTC/USD
 CRYPTO_MAX_QTY=0.001        # sized separately from MAX_QTY
-CRYPTO_SYMBOLS=BTC/USD      # streaming only
+CRYPTO_SYMBOLS=BTC/USD      # optional; MARKET_SYMBOLS also routes crypto
 ```
+
+Symbols are routed to the right socket by the slash, so a mixed list works:
+
+```dotenv
+MARKET_SYMBOLS=BTC/USD,QQQ    # QQQ -> /v2/<feed>, BTC/USD -> /v1beta3/crypto/us
+```
+
+Sending both to one endpoint is what Alpaca answers with
+`{"T":"error","code":400,"msg":"invalid syntax"}` — and that rejection kills the
+**whole** subscription, so one crypto symbol used to take the equity feed down
+with it.
 
 `CRYPTO_MAX_QTY` exists because one setting cannot serve both classes: `1` is a
 sane share count and an absurd amount of BTC, while `0.001` is sane BTC and an
