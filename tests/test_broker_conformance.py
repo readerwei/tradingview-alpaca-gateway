@@ -89,3 +89,48 @@ def test_the_engine_requirement_list_matches_what_the_engine_actually_calls():
     assert not unlisted, (
         f"the engine calls {sorted(unlisted)} but this file does not check for "
         f"it; add it to ENGINE_REQUIRES")
+
+
+def test_position_lookup_uses_the_spelling_that_endpoint_accepts():
+    """Alpaca's positions endpoint wants the slashless symbol.
+
+    Measured against the live paper account:
+
+        /v2/positions/BTC%2FUSD  -> 404
+        /v2/positions/BTCUSD     -> 200, qty 0.00348875
+
+    The crypto DATA endpoints require the slash, so the two conventions
+    disagree and it is easy to carry the wrong one across. Sending the slash
+    returns 404 — and 404 legitimately means flat, so a held position reads as
+    zero, the engine concludes there is nothing to protect, and a filled
+    position keeps no stop.
+
+    The wrong URL does not fail. It produces a plausible answer, which is why
+    this is asserted on the URL rather than left to a live check.
+    """
+    import urllib.request
+
+    from tv_alpaca_gateway.config import Settings
+
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _capture(request, *a, **k):
+        captured["url"] = request.full_url
+        raise _Stop
+
+    client = AlpacaPaperClient(Settings(alpaca_key_id="k", alpaca_secret_key="s"))
+    original = urllib.request.urlopen
+    urllib.request.urlopen = _capture
+    try:
+        client.position_qty("BTC/USD")
+    except _Stop:
+        pass
+    finally:
+        urllib.request.urlopen = original
+
+    assert captured["url"].endswith("/v2/positions/BTCUSD"), (
+        f"position lookup used {captured['url']!r}; a slash gives 404, which "
+        f"reads as flat and silently skips protection")

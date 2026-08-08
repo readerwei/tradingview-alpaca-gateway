@@ -5,7 +5,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from . import assets
 
@@ -126,6 +126,53 @@ class AlpacaPaperClient:
             raise RuntimeError("Alpaca crypto market-data returned a non-positive price")
         return price
 
+    def position_qty(self, symbol: str) -> Decimal:
+        """How much of `symbol` is actually held.
+
+        The execution engine sizes protection from this, never from the fill,
+        because Alpaca charges the crypto fee in kind: a filled 0.001 BTC
+        leaves a position of 0.0009975, and a stop sized to the fill asks to
+        sell more than is held and is refused.
+
+        A symbol with no position returns 0 rather than raising — Alpaca
+        answers 404 for a flat symbol, which is an answer, not a failure.
+
+        The positions endpoint wants the SLASHLESS spelling, unlike the crypto
+        data endpoints which require the slash:
+
+            /v2/positions/BTC%2FUSD  -> 404
+            /v2/positions/BTCUSD     -> 200, qty 0.00348875
+
+        Sending the slash returns 404, and 404 means flat — so a held position
+        reads as zero, the engine concludes there is nothing to protect, and a
+        filled position is left without a stop. The wrong URL does not fail; it
+        produces a plausible answer, which is worse.
+        """
+        url = (f"{self.settings.alpaca_base_url.rstrip('/')}/v2/positions/"
+               + urllib.parse.quote(symbol.replace("/", ""), safe=""))
+        request = urllib.request.Request(
+            url,
+            headers={
+                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                raw = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return Decimal("0")
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(
+                f"Alpaca position lookup failed: HTTP {exc.code}: {detail}") from exc
+        try:
+            return Decimal(str(raw["qty"]))
+        except (KeyError, TypeError, InvalidOperation) as exc:
+            raise RuntimeError(
+                f"Alpaca position response had no usable qty for {symbol}") from exc
+
     def get_order(self, order_id: str) -> BrokerResult:
         request = urllib.request.Request(
             f"{self.settings.alpaca_base_url.rstrip('/')}/v2/orders/{order_id}",
@@ -174,8 +221,36 @@ class AlpacaPaperClient:
 
 
 class FakeBroker:
+    """Mirrors AlpacaPaperClient's surface.
+
+    Kept in step deliberately: when the fakes and the real client disagree,
+    tests pass against an interface nothing implements — which is how a 502
+    reached the first genuine paper order.
+    """
+
     def __init__(self):
         self.orders: list[dict] = []
+        self.canceled: list[str] = []
+        self.positions: dict[str, Decimal] = {}
+
+    def submit_order(self, **kwargs) -> dict:
+        self.orders.append(dict(kwargs))
+        order_id = f"fake-{len(self.orders)}"
+        qty = Decimal(str(kwargs.get("qty", 0)))
+        symbol = kwargs.get("symbol", "")
+        resting = kwargs.get("type") in {"stop_limit", "stop", "trailing_stop"}
+        if not resting:
+            held = self.positions.get(symbol, Decimal("0"))
+            sign = 1 if kwargs.get("side") == "buy" else -1
+            self.positions[symbol] = held + sign * qty
+        return {"id": order_id, "status": "new" if resting else "filled",
+                "filled_qty": "0" if resting else str(qty)}
+
+    def cancel_order(self, order_id: str) -> None:
+        self.canceled.append(order_id)
+
+    def position_qty(self, symbol: str) -> Decimal:
+        return self.positions.get(symbol, Decimal("0"))
 
     def submit(self, order: ApprovedOrder, client_order_id: str) -> BrokerResult:
         raw = {"id": f"fake-{len(self.orders) + 1}", "client_order_id": client_order_id, **asdict(order)}
@@ -208,6 +283,53 @@ class FakeBroker:
         if price <= 0:
             raise RuntimeError("Alpaca crypto market-data returned a non-positive price")
         return price
+
+    def position_qty(self, symbol: str) -> Decimal:
+        """How much of `symbol` is actually held.
+
+        The execution engine sizes protection from this, never from the fill,
+        because Alpaca charges the crypto fee in kind: a filled 0.001 BTC
+        leaves a position of 0.0009975, and a stop sized to the fill asks to
+        sell more than is held and is refused.
+
+        A symbol with no position returns 0 rather than raising — Alpaca
+        answers 404 for a flat symbol, which is an answer, not a failure.
+
+        The positions endpoint wants the SLASHLESS spelling, unlike the crypto
+        data endpoints which require the slash:
+
+            /v2/positions/BTC%2FUSD  -> 404
+            /v2/positions/BTCUSD     -> 200, qty 0.00348875
+
+        Sending the slash returns 404, and 404 means flat — so a held position
+        reads as zero, the engine concludes there is nothing to protect, and a
+        filled position is left without a stop. The wrong URL does not fail; it
+        produces a plausible answer, which is worse.
+        """
+        url = (f"{self.settings.alpaca_base_url.rstrip('/')}/v2/positions/"
+               + urllib.parse.quote(symbol.replace("/", ""), safe=""))
+        request = urllib.request.Request(
+            url,
+            headers={
+                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                raw = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return Decimal("0")
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(
+                f"Alpaca position lookup failed: HTTP {exc.code}: {detail}") from exc
+        try:
+            return Decimal(str(raw["qty"]))
+        except (KeyError, TypeError, InvalidOperation) as exc:
+            raise RuntimeError(
+                f"Alpaca position response had no usable qty for {symbol}") from exc
 
     def get_order(self, order_id: str) -> BrokerResult:
         for raw in self.orders:
