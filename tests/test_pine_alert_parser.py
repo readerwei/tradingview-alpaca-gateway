@@ -44,6 +44,18 @@ def test_parses_relevant_fields_from_current_pine_alert():
     assert command.trail is None
 
 
+def test_current_deployed_alert_without_unverified_identity_fields_still_parses():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC"
+    )
+    command = parse_pine_alert(raw)
+
+    assert command.event_id is None
+    assert command.bar_time is None
+    assert command.symbol == "BTC/USD"
+
+
 def test_allows_documented_non_executable_instruction_fields():
     command = parse_pine_alert(
         ALERT + " | REQUIRED_ACTIONS=IGNORE_THIS_TOO"
