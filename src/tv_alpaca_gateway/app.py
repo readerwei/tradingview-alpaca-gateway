@@ -185,8 +185,11 @@ def create_app(
         }
 
     @app.post("/webhooks/tradingview/pine/submit")
-    async def pine_submit(request: Request,
-                          x_tv_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    async def pine_submit(
+        request: Request,
+        x_tv_secret: str | None = Header(default=None),
+        x_discord_message_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         """Authenticate, parse, and hand the command to the execution engine.
 
         Deliberately thin. An earlier draft did its own parse -> risk -> claim
@@ -206,8 +209,13 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         try:
+            # The relay sends its Discord snowflake, which is the fallback
+            # identity for an alert with no EVENT_ID. Accepting the header was
+            # missing, so the fallback existed in the engine and was
+            # unreachable through the only path that can supply it.
             result = await asyncio.to_thread(
-                execution.execute_pine_command, command, settings, broker, store)
+                execution.execute_pine_command, command, settings, broker, store,
+                delivery_id=x_discord_message_id)
         except ExecutionError as exc:
             # Refused before anything reached the broker.
             raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -235,7 +243,10 @@ def create_app(
             logger.exception("receipt notification failed for %s", result.entry_order_id)
 
         return {
-            "event_id": command.event_id,
+            # The identity actually used, not the one the alert happened to
+            # carry: reporting command.event_id showed None whenever the
+            # snowflake fallback was in play.
+            "event_id": command.event_id or x_discord_message_id,
             "order_id": result.entry_order_id,
             "entry_status": result.entry_status,
             "protection_order_id": result.protection_order_id,

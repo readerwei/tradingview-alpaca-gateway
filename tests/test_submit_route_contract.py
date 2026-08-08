@@ -91,8 +91,13 @@ class _RecordingBroker:
 
     def submit_order(self, **kwargs):
         self.submitted.append(dict(kwargs))
-        return {"id": f"ord-{len(self.submitted)}", "status": "filled",
-                "filled_qty": str(kwargs["qty"])}
+        # A market entry fills; a protective stop RESTS. Reporting everything
+        # as filled made the stop look terminal, so reconciliation correctly
+        # excluded it and the test read that as the order being invisible.
+        resting = kwargs.get("type") in {"stop_limit", "stop", "trailing_stop"}
+        return {"id": f"ord-{len(self.submitted)}",
+                "status": "new" if resting else "filled",
+                "filled_qty": "0" if resting else str(kwargs["qty"])}
 
     def position_qty(self, symbol):
         return Decimal(str(sum(Decimal(str(o["qty"])) for o in self.submitted
@@ -222,3 +227,81 @@ def test_the_relay_can_be_opted_into_execution_explicitly(tmp_path):
                 "http://evil.example.com:8000" + SUBMIT_PATH):
         with pytest.raises(ValueError):
             RelaySettings(internal_url=bad, **opted_in).validate_target()
+
+
+# ══════════════════ the snowflake fallback must work through the real path
+
+def test_a_bare_alert_is_accepted_when_the_relay_supplies_its_snowflake(tmp_path):
+    """The engine accepts a delivery_id; the route has to pass one.
+
+    Found in review: the relay sends `x-discord-message-id`, the engine takes
+    `delivery_id`, and nothing connected them — so the fallback worked in a unit
+    test and failed through the only path that can actually supply it. A
+    feature reachable only from its own tests is not a feature.
+    """
+    bare = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+    broker = _RecordingBroker()
+    client = _client(_settings(tmp_path), broker)
+
+    response = client.post(SUBMIT_PATH, content=bare, headers={
+        "x-tv-secret": SECRET, "x-discord-message-id": "1535708305480093756"})
+
+    assert response.status_code == 200, response.text
+    assert broker.submitted, "the snowflake did not satisfy identity"
+
+
+def test_a_bare_alert_with_no_snowflake_is_refused(tmp_path):
+    """And the other half: no EVENT_ID and no snowflake means no durable
+    identity, so it must be refused rather than share `pine-exec-None`."""
+    bare = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+    broker = _RecordingBroker()
+
+    response = _client(_settings(tmp_path), broker).post(
+        SUBMIT_PATH, content=bare, headers={"x-tv-secret": SECRET})
+
+    assert response.status_code == 403
+    assert broker.submitted == [], "an unidentifiable alert reached the broker"
+
+
+def test_the_response_reports_the_identity_actually_used(tmp_path):
+    """Reporting `command.event_id` showed None whenever the fallback was in
+    play, so the reply could not be used to reconcile the very orders it
+    created."""
+    bare = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+    snowflake = "1535708305480093756"
+
+    body = _client(_settings(tmp_path), _RecordingBroker()).post(
+        SUBMIT_PATH, content=bare,
+        headers={"x-tv-secret": SECRET, "x-discord-message-id": snowflake}).json()
+
+    assert body["event_id"] == snowflake
+
+
+def test_protective_orders_are_discoverable_by_reconciliation(tmp_path):
+    """A protective order recorded only in a text field cannot be found.
+
+    `unresolved_broker_orders()` drives the reconnect resync, so an order it
+    cannot see is an order live at the broker that reconciliation will never
+    check — and for a protective stop that means believing a position is
+    protected when nobody has confirmed it.
+    """
+    settings = _settings(tmp_path)
+    store = EventStore(settings.db_path)
+    client = _client(settings, _RecordingBroker(), store)
+
+    # The alert must actually ask for protection: _fresh_alert() does not, so
+    # an earlier version of this test asserted a protective order that the
+    # engine was correct not to place.
+    protected = (_fresh_alert(event_id="QQQ-1-recon")
+                 + " | PLACE_PROTECTIVE_STOP_AFTER_FILL"
+                   " | STOP_TRIGGER=700 | STOP_LIMIT=699")
+    client.post(SUBMIT_PATH, content=protected, headers={"x-tv-secret": SECRET})
+
+    roles = {role for _, role, _ in store.broker_orders_for("pine-exec-QQQ-1-recon")}
+    assert "entry" in roles, "the entry was not recorded per-order"
+    assert "protection" in roles, "the protective order is invisible to reconciliation"
+    assert len(store.unresolved_broker_orders()) >= 2, (
+        "resync would check fewer orders than were actually placed")
