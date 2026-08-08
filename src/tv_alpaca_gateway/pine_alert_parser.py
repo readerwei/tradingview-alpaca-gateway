@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from .assets import is_crypto
+
 
 class AlertParseError(ValueError):
     """The alert is not an executable Pine/TradingView order command."""
@@ -13,6 +15,7 @@ _REQUIRED_FIELDS = frozenset({"SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FO
 _EXECUTABLE_FIELDS = _REQUIRED_FIELDS | frozenset({
     "CANCEL_UNFILLED_AT_DEADLINE", "STOP_TRIGGER", "STOP_LIMIT", "TRAIL",
 })
+_IGNORABLE_FIELDS = frozenset({"REQUIRED_ACTIONS"})
 _ALLOWED_ORDER_TYPES = frozenset({"market"})
 _EXECUTABLE_FLAGS = frozenset({"PLACE_PROTECTIVE_STOP_AFTER_FILL"})
 # The parser stays independent of runtime allowlists. These are the current
@@ -38,12 +41,20 @@ class PineOrderCommand:
 def parse_pine_alert(content: str) -> PineOrderCommand:
     """Parse only the executable order fields from a Pine alert.
 
-    Unknown fields are deliberately ignored so explanatory directives such as
-    ``REQUIRED_ACTIONS`` do not become executable configuration.
+    Only explicitly documented non-executable fields are ignored. Unknown
+    fields fail closed so a typo cannot silently remove protection.
     """
     if not isinstance(content, str):
         raise AlertParseError("alert must be text")
-    parts = [part.strip() for part in content.split("|")]
+    if content.count(_PREFIX) != 1:
+        raise AlertParseError("alert must contain exactly one execution prefix")
+    prefix_start = content.index(_PREFIX)
+    prefix_end = prefix_start + len(_PREFIX)
+    if prefix_start > 0 and content[prefix_start - 1] not in " \t\r\n":
+        raise AlertParseError("missing EXECUTE_ALPACA_ORDER execution prefix")
+    if prefix_end < len(content) and content[prefix_end] not in "| \t\r\n":
+        raise AlertParseError("missing EXECUTE_ALPACA_ORDER execution prefix")
+    parts = [part.strip() for part in content[prefix_start:].split("|")]
     if not parts or parts[0] != _PREFIX:
         raise AlertParseError("missing EXECUTE_ALPACA_ORDER execution prefix")
 
@@ -55,11 +66,15 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         if "=" in part:
             key, value = part.split("=", 1)
             key = key.strip().upper()
+            if key not in _EXECUTABLE_FIELDS and key not in _IGNORABLE_FIELDS:
+                raise AlertParseError(f"unrecognised field: {key}")
             if key in _EXECUTABLE_FIELDS and key in fields:
                 raise AlertParseError(f"duplicate executable field: {key}")
             fields[key] = value.strip()
         else:
             flag = part.upper()
+            if flag not in _EXECUTABLE_FLAGS and flag != "DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL":
+                raise AlertParseError(f"unrecognised field: {flag}")
             if flag in _EXECUTABLE_FLAGS and flag in flags:
                 raise AlertParseError(f"duplicate executable flag: {flag}")
             flags.add(flag)
@@ -69,6 +84,7 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError(f"missing required fields: {', '.join(missing)}")
 
     symbol = _CANONICAL_CRYPTO.get(fields["SYMBOL"].upper(), fields["SYMBOL"].upper())
+    crypto_symbol = is_crypto(symbol)
     side = fields["SIDE"].lower()
     if side not in {"buy", "sell"}:
         raise AlertParseError("SIDE must be BUY or SELL")
@@ -77,7 +93,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     if order_type not in _ALLOWED_ORDER_TYPES:
         raise AlertParseError("ORDER_TYPE must be MARKET")
     time_in_force = fields["TIME_IN_FORCE"].lower()
-    if time_in_force not in {"day", "gtc", "ioc", "fok", "opg", "cls"}:
+    allowed_time_in_force = {"gtc", "ioc"} if crypto_symbol else {"day", "gtc", "ioc", "fok", "opg", "cls"}
+    if time_in_force not in allowed_time_in_force:
         raise AlertParseError("TIME_IN_FORCE is not supported")
 
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
@@ -98,6 +115,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
 
     trail_raw = fields.get("TRAIL", "NONE")
     trail = None if trail_raw.upper() == "NONE" else _positive_decimal(trail_raw, "trail")
+    if crypto_symbol and trail is not None:
+        raise AlertParseError("TRAIL is unsupported for crypto orders on Alpaca")
     cancel_raw = fields.get("CANCEL_UNFILLED_AT_DEADLINE", "NO").upper()
     if cancel_raw not in {"YES", "NO"}:
         raise AlertParseError("CANCEL_UNFILLED_AT_DEADLINE must be YES or NO")
