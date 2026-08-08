@@ -12,6 +12,9 @@ class EventStore:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', broker_order_id TEXT)"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pine_dry_runs (audit_id TEXT PRIMARY KEY, detail TEXT NOT NULL)"
+            )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
             if "broker_order_id" not in columns:
                 conn.execute("ALTER TABLE events ADD COLUMN broker_order_id TEXT")
@@ -23,6 +26,22 @@ class EventStore:
                 (event_id,),
             )
             return cur.rowcount == 1
+
+    def record_pine_dry_run(self, audit_id: str, detail: str) -> None:
+        """Persist a parsed Pine command outside the executable event-ID namespace."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO pine_dry_runs(audit_id, detail) VALUES (?, ?) "
+                "ON CONFLICT(audit_id) DO UPDATE SET detail = excluded.detail",
+                (audit_id, detail),
+            )
+
+    def pine_dry_run_status(self, audit_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT audit_id FROM pine_dry_runs WHERE audit_id = ?", (audit_id,)
+            ).fetchone()
+        return "pine_dry_run" if row else None
 
     def update(self, event_id: str, status: str, detail: str = "", broker_order_id: str | None = None) -> None:
         with self._connect() as conn:

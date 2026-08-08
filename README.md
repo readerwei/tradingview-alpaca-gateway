@@ -77,7 +77,16 @@ EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | ORDER_TYPE=MARKET 
 
 It parses and validates `SYMBOL`, `SIDE`, `QTY`, `ORDER_TYPE`, `TIME_IN_FORCE`, `CANCEL_UNFILLED_AT_DEADLINE`, the protective-stop flag, `STOP_TRIGGER`, `STOP_LIMIT`, and `TRAIL`. The current parser accepts only `ORDER_TYPE=MARKET`; it will not represent a non-market entry until the contract gains explicit entry-price fields. `BTCUSD` is normalized to `BTC/USD`; `TRAIL=NONE` becomes no trail, while `TRAIL=250` means a $250 trail distance. The parser deliberately ignores non-executable instruction fields such as `REQUIRED_ACTIONS` and `DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL`.
 
-This parser is not wired into the FastAPI order route yet: it does not submit an order, schedule a 60-second cancellation, or create stop/trailing orders. Those lifecycle operations require a separately tested persistent worker.
+This parser is not wired into the order-submission route. It is exposed only through an authenticated dry-run endpoint, `POST /webhooks/tradingview/pine/dry-run`, which parses and records the normalized command but never calls risk approval, an Alpaca client, order submission, fill monitoring, cancellation, or protection logic.
+
+```bash
+curl --data-binary @alert.txt \
+  -H 'content-type: text/plain' \
+  -H "x-tv-secret: $TV_WEBHOOK_SECRET" \
+  http://127.0.0.1:8000/webhooks/tradingview/pine/dry-run
+```
+
+The endpoint accepts raw request bytes (the example sends `text/plain`) and rejects bodies over 4,096 bytes with HTTP 413 before decoding or parsing. A successful response contains `dry_run: true`, an audit ID, and the normalized command. This is the safe way to verify that an actual Pine alert reaches the parser before any execution wiring exists.
 
 ## JSON webhook payload (existing FastAPI route)
 

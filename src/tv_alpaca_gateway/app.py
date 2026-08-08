@@ -13,12 +13,53 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from .broker import AlpacaPaperClient
 from .config import Settings
 from .models import AlertError, Signal
+from .pine_alert_parser import AlertParseError as PineAlertParseError, PineOrderCommand, parse_pine_alert
 from .notifier import DiscordNotifier, NullNotifier
 from .risk import RiskError, approve
 from .stream import AlpacaStreamManager, MarketQuote, MarketTrade, OrderUpdate
 from .store import EventStore
 
 logger = logging.getLogger(__name__)
+
+
+def _pine_command_payload(command: PineOrderCommand) -> dict[str, Any]:
+    """Return a JSON-safe command record; this never represents a broker order."""
+    return {
+        "symbol": command.symbol,
+        "side": command.side,
+        "qty": str(command.qty),
+        "order_type": command.order_type,
+        "time_in_force": command.time_in_force,
+        "cancel_unfilled_at_deadline": command.cancel_unfilled_at_deadline,
+        "place_protective_stop_after_fill": command.place_protective_stop_after_fill,
+        "stop_trigger": str(command.stop_trigger) if command.stop_trigger is not None else None,
+        "stop_limit": str(command.stop_limit) if command.stop_limit is not None else None,
+        "trail": str(command.trail) if command.trail is not None else None,
+    }
+
+
+MAX_PINE_ALERT_BYTES = 4096
+
+# Everything the dry-run deliberately does not evaluate. Kept beside the
+# endpoint so it cannot drift from what the route actually skips.
+_DRY_RUN_NOT_CHECKED = (
+    "allowlist", "sizing", "notional", "price_collar", "kill_switch",
+    "alert_freshness", "duplicate_event_id",
+)
+
+
+async def _read_limited_pine_body(request: Request) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_PINE_ALERT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Pine alert exceeds {MAX_PINE_ALERT_BYTES} byte limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def create_app(
@@ -109,6 +150,33 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         return {"ok": True, "paper_trading": settings.paper_trading, "trading_enabled": settings.trading_enabled}
+
+    @app.post("/webhooks/tradingview/pine/dry-run")
+    async def pine_dry_run(request: Request, x_tv_secret: str | None = Header(default=None)) -> dict[str, Any]:
+        """Authenticate, parse, and audit a Pine command without reaching risk or broker code."""
+        if not settings.webhook_secret or not x_tv_secret or not hmac.compare_digest(x_tv_secret, settings.webhook_secret):
+            raise HTTPException(status_code=401, detail="invalid webhook secret")
+        try:
+            raw = (await _read_limited_pine_body(request)).decode("utf-8")
+            command = parse_pine_alert(raw)
+        except (UnicodeDecodeError, PineAlertParseError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        command_payload = _pine_command_payload(command)
+        audit_id = "pine-dry-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        store.record_pine_dry_run(audit_id, json.dumps(command_payload, sort_keys=True))
+        # State the scope in the response. "dry_run": true reads as "this is
+        # what would happen if I sent it", but nothing here consults the risk
+        # layer: an alert for an unlisted symbol, with no configured size, over
+        # the notional cap, with the kill switch on, still returns 200. Four
+        # refusals, one green light. Naming what was NOT checked costs nothing
+        # and stops a parse being mistaken for an approval.
+        return {
+            "dry_run": True,
+            "validated": "parse_only",
+            "not_checked": list(_DRY_RUN_NOT_CHECKED),
+            "audit_id": audit_id,
+            "command": command_payload,
+        }
 
     @app.post("/webhooks/tradingview")
     async def tradingview_webhook(request: Request, x_tv_secret: str | None = Header(default=None)) -> dict[str, Any]:
