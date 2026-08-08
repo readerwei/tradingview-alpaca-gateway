@@ -127,10 +127,70 @@ def test_the_dry_run_target_is_accepted():
     _settings().validate_target()
 
 
-def test_a_rejected_message_says_why():
-    """`except ValueError: return` drops rejections silently, so a wrong
-    channel id is indistinguishable from no alert arriving — which is exactly
-    the first failure to expect when wiring a new webhook."""
+def test_a_rejected_message_carries_a_reason():
+    """The exception must explain itself. Necessary, and not sufficient — see
+    the next test, which is the one that actually matters."""
     with pytest.raises(ValueError) as caught:
         admit_message(_message(channel=CHANNEL + 1), _settings())
     assert str(caught.value), "the rejection carried no reason"
+
+
+def test_the_rejection_path_is_testable_without_discord(caplog):
+    """A reason nobody can read is not a reason — and a handler nobody can call
+    is not testable.
+
+    Two failed attempts before this one, both instructive:
+
+      v1  asserted `admit_message` raises with non-empty text. Passed against a
+          handler that discarded the exception entirely.
+      v2  asserted a log record exists — but the test emitted that record
+          itself, so it proved the logging module works, not the relay.
+
+    The handler is a closure inside `run_relay()`, reachable only by starting a
+    Discord client, which is why both versions tested something adjacent to it.
+    So the contract asks for what makes the behaviour checkable: a plain
+    function that takes a message and reports what it did with it.
+
+    `handle_message(message, settings, relay) -> bool` — True if forwarded,
+    False if ignored, and an ignored message leaves a WARNING saying why.
+    `run_relay` then wires `on_message` to it and stays a one-liner.
+    """
+    import logging
+
+    from tv_alpaca_gateway import relay as relay_module
+
+    handle = getattr(relay_module, "handle_message", None)
+    assert handle is not None, (
+        "no importable handler: the rejection path can only be exercised by "
+        "starting a Discord client, so nothing can assert on it")
+
+    class _NeverCalled:
+        def forward(self, _):
+            raise AssertionError("a rejected message was forwarded")
+
+    with caplog.at_level(logging.WARNING, logger=relay_module.__name__):
+        forwarded = handle(_message(channel=CHANNEL + 1), _settings(), _NeverCalled())
+
+    assert forwarded is False, "a wrong-channel message was reported as forwarded"
+    assert caplog.records, "a rejected alert produced no visible log record"
+    assert "channel" in caplog.text.lower(), (
+        "the record does not say why the message was ignored")
+
+
+def test_an_admitted_message_is_forwarded_once(caplog):
+    """The other half — the handler must actually forward what it admits, and
+    say so, or a silent success is indistinguishable from a silent drop."""
+    from tv_alpaca_gateway import relay as relay_module
+
+    handle = getattr(relay_module, "handle_message", None)
+    assert handle is not None, "no importable handler"
+
+    sent = []
+
+    class _Recording:
+        def forward(self, text):
+            sent.append(text)
+
+    forwarded = handle(_message(), _settings(), _Recording())
+    assert forwarded is True
+    assert sent == [PINE_ALERT], "the admitted alert was not forwarded verbatim"
