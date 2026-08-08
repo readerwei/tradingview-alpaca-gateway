@@ -43,5 +43,5 @@ def test_the_contract_suite_is_present_and_non_trivial():
     contract = pathlib.Path(__file__).parent / "test_execution_contract.py"
     assert contract.exists(), "the execution contract has gone missing"
     body = contract.read_text()
-    assert body.count("def test_") >= 15, (
-        f"the contract has shrunk to {body.count(chr(39)+chr(39))} cases")
+    cases = body.count("def test_")
+    assert cases >= 19, f"the contract has shrunk to {cases} cases"
