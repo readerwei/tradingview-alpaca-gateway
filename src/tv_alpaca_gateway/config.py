@@ -99,6 +99,19 @@ class Settings:
                 f"CRYPTO_MAX_QTY must be set to trade {', '.join(sorted(crypto_allowed))}")
         if any("/" not in t for t in self.crypto_symbols):
             raise ValueError("CRYPTO_SYMBOLS must use the slash form, e.g. BTC/USD")
+        # The two lists are deliberately NOT merged: each names one endpoint,
+        # and which socket a symbol belongs on is configuration, not inference.
+        #
+        # Enforced rather than merely documented because the failure is silent
+        # and disproportionate. Alpaca answers a crypto pair on the equity
+        # endpoint with {"T":"error","code":400,"msg":"invalid syntax"} and
+        # rejects the WHOLE subscription, so one misplaced symbol takes the
+        # equity feed down with it and then reconnects forever behind a warning.
+        misplaced = sorted(t for t in self.market_symbols if "/" in t)
+        if misplaced:
+            raise ValueError(
+                f"MARKET_SYMBOLS is for equities; move {', '.join(misplaced)} "
+                f"to CRYPTO_SYMBOLS")
         if not self.allowed_symbols:
             raise ValueError("ALLOWED_SYMBOLS cannot be empty")
         if self.market_data_feed not in {"iex", "sip", "delayed_sip"}:
@@ -107,25 +120,6 @@ class Settings:
     @property
     def market_stream_url(self) -> str:
         return f"wss://stream.data.alpaca.markets/v2/{self.market_data_feed}"
-
-    @property
-    def equity_stream_symbols(self) -> tuple[str, ...]:
-        """MARKET_SYMBOLS entries that belong on the equity socket."""
-        return tuple(t for t in self.market_symbols if "/" not in t)
-
-    @property
-    def crypto_stream_symbols(self) -> tuple[str, ...]:
-        """Crypto pairs to stream, from EITHER symbol list.
-
-        A crypto pair in MARKET_SYMBOLS used to be sent to the equity endpoint,
-        where Alpaca answers {"T":"error","code":400,"msg":"invalid syntax"} —
-        and that rejection kills the WHOLE subscription, so one crypto symbol
-        silently took the equity feed down with it. The slash makes the routing
-        unambiguous, so it is now routed rather than refused.
-        """
-        ordered = dict.fromkeys(
-            t for t in (*self.market_symbols, *self.crypto_symbols) if "/" in t)
-        return tuple(ordered)
 
     @property
     def crypto_stream_url(self) -> str:

@@ -447,15 +447,14 @@ class AlpacaStreamManager:
         # would hold a socket open receiving nothing.
         self.market = (
             AlpacaMarketStream(settings, on_quote, on_trade, on_error,
-                               symbols=settings.equity_stream_symbols)
-            if settings.equity_stream_symbols else None
+                               symbols=settings.market_symbols)
+            if settings.market_symbols else None
         )
         self.crypto = (
             AlpacaMarketStream(settings, on_quote, on_trade, on_error,
                                url=settings.crypto_stream_url,
-                               symbols=settings.crypto_stream_symbols,
-                               label="crypto")
-            if settings.crypto_stream_symbols else None
+                               symbols=settings.crypto_symbols, label="crypto")
+            if settings.crypto_symbols else None
         )
         self.trade_updates = AlpacaTradeUpdateStream(
             settings, on_order_update, on_error, on_order_stream_connected)
