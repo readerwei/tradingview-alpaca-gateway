@@ -197,6 +197,18 @@ def _frames(raw: str | bytes) -> list[dict[str, Any]]:
     return messages if isinstance(messages, list) else [messages]
 
 
+class ConnectionLimitExceeded(RuntimeError):
+    """Alpaca refused because the endpoint already has its allowed session.
+
+    Distinct from a normal disconnect because retrying cannot fix it. Alpaca
+    permits one connection per endpoint on most plans, so this means another
+    client — a second gateway, a notebook, scripts/ticks.py — is holding the
+    slot. Reconnecting just produces the same refusal forever, which is exactly
+    how it presented: a stream that looked like it was retrying transiently was
+    in fact never going to succeed.
+    """
+
+
 class _AlpacaSocket:
     """Shared transport. The handshake is NOT shared — see the module docstring."""
 
@@ -220,6 +232,12 @@ class _AlpacaSocket:
         )
 
     def _check(self, message: dict[str, Any], describe: str, is_error) -> None:
+        if message.get("T") == "error" and message.get("code") == 406:
+            raise ConnectionLimitExceeded(
+                f"Alpaca refused {describe}: {message.get('msg')}. "
+                f"{self.url} allows one connection per account on most plans and "
+                f"another client already holds it — stop any other gateway, "
+                f"notebook or scripts/ticks.py using this endpoint.")
         if is_error is not None and is_error(message):
             raise RuntimeError(f"Alpaca refused {describe}: {message}")
         if message.get("T") == "error":
@@ -413,6 +431,14 @@ async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]],
             logger.info("Alpaca %s stream closed by server", stream_name)
         except asyncio.CancelledError:
             raise
+        except ConnectionLimitExceeded as exc:
+            # Retrying cannot clear this, so say so plainly and go straight to
+            # the longest backoff instead of hammering a refusal that will not
+            # change. Logged at ERROR because a warning in a reconnect loop is
+            # what made this look like ordinary flakiness.
+            logger.error("Alpaca %s stream cannot start: %s", stream_name, exc)
+            await _invoke(on_error, exc)
+            delay = 30.0
         except (ConnectionClosed, OSError, RuntimeError, ValueError,
                 asyncio.TimeoutError, json.JSONDecodeError) as exc:
             logger.warning("Alpaca %s stream disconnected: %s", stream_name, exc)
@@ -442,9 +468,14 @@ class AlpacaStreamManager:
         self.settings = settings
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
-        self.market = AlpacaMarketStream(settings, on_quote, on_trade, on_error)
-        # Crypto only when symbols are configured — an empty subscribe list
+        # One socket per asset class, because they are different endpoints.
+        # Each is created only when it has symbols — an empty subscribe list
         # would hold a socket open receiving nothing.
+        self.market = (
+            AlpacaMarketStream(settings, on_quote, on_trade, on_error,
+                               symbols=settings.market_symbols)
+            if settings.market_symbols else None
+        )
         self.crypto = (
             AlpacaMarketStream(settings, on_quote, on_trade, on_error,
                                url=settings.crypto_stream_url,
@@ -461,15 +492,14 @@ class AlpacaStreamManager:
             raise RuntimeError("Alpaca credentials are required to start streaming")
         self.stop_event.clear()
         self.tasks = [
-            asyncio.create_task(self.market.run_forever(self.stop_event),
-                                name="alpaca-market-stream"),
             asyncio.create_task(self.trade_updates.run_forever(self.stop_event),
                                 name="alpaca-trade-updates-stream"),
         ]
-        if self.crypto is not None:
-            self.tasks.append(
-                asyncio.create_task(self.crypto.run_forever(self.stop_event),
-                                    name="alpaca-crypto-stream"))
+        for stream, name in ((self.market, "alpaca-market-stream"),
+                             (self.crypto, "alpaca-crypto-stream")):
+            if stream is not None:
+                self.tasks.append(
+                    asyncio.create_task(stream.run_forever(self.stop_event), name=name))
 
     async def stop(self, timeout: float = 5.0) -> None:
         """Stop both streams, and do not hang if they will not stop politely.

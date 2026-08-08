@@ -90,6 +90,32 @@ CRYPTO_MAX_QTY=0.001        # sized separately from MAX_QTY
 CRYPTO_SYMBOLS=BTC/USD      # streaming only
 ```
 
+### The two symbol lists are separate. Do not mix them.
+
+Each names a **different Alpaca endpoint**, and they are never merged:
+
+```dotenv
+MARKET_SYMBOLS=QQQ,META     # equities -> wss://stream.data.alpaca.markets/v2/<feed>
+CRYPTO_SYMBOLS=BTC/USD      # crypto   -> wss://stream.data.alpaca.markets/v1beta3/crypto/us
+```
+
+Putting a crypto pair in `MARKET_SYMBOLS` is refused at startup:
+
+```text
+ValueError: MARKET_SYMBOLS is for equities; move BTC/USD to CRYPTO_SYMBOLS
+```
+
+That check exists because the runtime failure is silent and out of proportion
+to the mistake. Alpaca answers a crypto pair on the equity endpoint with
+`{"T":"error","code":400,"msg":"invalid syntax"}` and rejects the **entire**
+subscription — so one misplaced symbol stops quotes for every equity in the
+list as well, and the stream then reconnects forever behind a warning log. The
+startup message names the symbol and the variable to move it to; Alpaca's does
+neither.
+
+A list may be empty. No socket is opened for one, since an empty subscription
+would hold a connection open receiving nothing.
+
 `CRYPTO_MAX_QTY` exists because one setting cannot serve both classes: `1` is a
 sane share count and an absurd amount of BTC, while `0.001` is sane BTC and an
 invalid share count for a stop order. Listing a pair without a size is refused

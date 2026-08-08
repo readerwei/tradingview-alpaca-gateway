@@ -140,3 +140,43 @@ def test_crypto_symbols_must_use_the_slash_form():
     with pytest.raises(ValueError, match="slash"):
         Settings(allowed_symbols=frozenset({BTC}), crypto_max_qty=Decimal("0.001"),
                  crypto_symbols=("BTCUSD",)).validate()
+
+
+# ──────────────────────── the two symbol lists are separate, and enforced
+
+def test_a_crypto_pair_in_market_symbols_is_refused_at_startup():
+    """The lists are deliberately not merged — which socket a symbol belongs on
+    is configuration, not inference.
+
+    Enforced rather than documented because the failure is silent and
+    disproportionate: Alpaca answers a crypto pair on the equity endpoint with
+    {"T":"error","code":400,"msg":"invalid syntax"} and rejects the WHOLE
+    subscription, so one misplaced symbol takes the equity feed down with it and
+    then reconnects forever behind a warning log. Reproduced live.
+
+    The message names the symbol and the variable to move it to, because
+    "invalid syntax" from Alpaca names neither.
+    """
+    with pytest.raises(ValueError, match="CRYPTO_SYMBOLS"):
+        _settings(market_symbols=("BTC/USD", "QQQ")).validate()
+
+
+def test_the_explicit_split_validates_and_builds_two_sockets():
+    s = _settings(market_symbols=("QQQ",), crypto_symbols=(BTC,),
+                  stream_enabled=True, alpaca_key_id="k", alpaca_secret_key="s")
+    s.validate()
+    manager = AlpacaStreamManager(s)
+    assert manager.market.symbols == ["QQQ"]
+    assert manager.crypto.symbols == [BTC]
+    assert manager.market.url.endswith("/v2/iex")
+    assert manager.crypto.url.endswith("/v1beta3/crypto/us")
+
+
+def test_no_socket_is_opened_for_an_empty_symbol_list():
+    """An empty subscribe list would hold a connection open receiving nothing."""
+    crypto_only = _settings(market_symbols=(), crypto_symbols=(BTC,),
+                            stream_enabled=True)
+    assert AlpacaStreamManager(crypto_only).market is None
+
+    equity_only = _settings(market_symbols=("QQQ",), stream_enabled=True)
+    assert AlpacaStreamManager(equity_only).crypto is None

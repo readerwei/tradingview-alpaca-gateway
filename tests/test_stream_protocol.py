@@ -268,3 +268,48 @@ def test_reconnect_resyncs_orders_before_reading():
         assert called == ["resync"]
 
     asyncio.run(scenario())
+
+
+# ────────────────────────────── connection limit (Alpaca allows one per endpoint)
+
+def test_a_connection_limit_refusal_is_distinct_from_a_disconnect():
+    """Alpaca answers a second connection with code 406.
+
+    Retrying cannot clear it — another client holds the only slot — so it must
+    not look like ordinary flakiness. It previously surfaced as a warning inside
+    the reconnect loop, so a stream that could never succeed appeared to be
+    retrying transiently, and `scripts/ticks.py` looked broken when it was being
+    refused.
+    """
+    from tv_alpaca_gateway.stream import ConnectionLimitExceeded
+
+    sock = FakeSocket([[{"T": "error", "code": 406,
+                         "msg": "connection limit exceeded"}]])
+    with pytest.raises(ConnectionLimitExceeded, match="one connection per account"):
+        asyncio.run(_MarketDataSocket(SETTINGS, SETTINGS.market_stream_url)
+                    .authenticate(sock))
+
+
+def test_the_limit_message_names_what_to_stop():
+    """A 406 is fixed by stopping the other client, so the message has to say
+    that — the raw text "connection limit exceeded" does not."""
+    from tv_alpaca_gateway.stream import ConnectionLimitExceeded
+
+    sock = FakeSocket([[{"T": "error", "code": 406, "msg": "connection limit exceeded"}]])
+    try:
+        asyncio.run(_MarketDataSocket(SETTINGS, SETTINGS.market_stream_url)
+                    .authenticate(sock))
+        pytest.fail("expected a refusal")
+    except ConnectionLimitExceeded as exc:
+        assert "ticks.py" in str(exc) and SETTINGS.market_stream_url in str(exc)
+
+
+def test_other_error_codes_remain_ordinary_failures():
+    """Only 406 is special; a bad key must not be mistaken for a busy slot."""
+    from tv_alpaca_gateway.stream import ConnectionLimitExceeded
+
+    sock = FakeSocket([[{"T": "error", "code": 402, "msg": "auth failed"}]])
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(_MarketDataSocket(SETTINGS, SETTINGS.market_stream_url)
+                    .authenticate(sock))
+    assert not isinstance(caught.value, ConnectionLimitExceeded)
