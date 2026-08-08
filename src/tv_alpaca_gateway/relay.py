@@ -74,15 +74,30 @@ class GatewayRelay:
         settings.validate_target()
         self.settings = settings
 
-    def forward(self, pine_alert: str) -> None:
+    def forward(self, pine_alert: str, *, discord_message_id: str) -> None:
         request = urllib.request.Request(
             self.settings.internal_url,
             data=pine_alert.encode("utf-8"),
-            headers={"content-type": "text/plain; charset=utf-8", "x-tv-secret": self.settings.internal_secret},
+            headers={
+                "content-type": "text/plain; charset=utf-8",
+                "x-tv-secret": self.settings.internal_secret,
+                "x-discord-message-id": discord_message_id,
+            },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=3):
             pass
+
+
+def _canonical_discord_message_id(message: Any) -> str:
+    """Return the actual Discord snowflake used as the durable relay identity."""
+    value = getattr(message, "id", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("source message has no canonical Discord message ID")
+    text = str(value)
+    if value <= 0 or not 17 <= len(text) <= 19:
+        raise ValueError("source message has no canonical Discord message ID")
+    return text
 
 
 def handle_message(message: Any, settings: RelaySettings, relay: GatewayRelay) -> bool:
@@ -94,7 +109,7 @@ def handle_message(message: Any, settings: RelaySettings, relay: GatewayRelay) -
     """
     try:
         payload = admit_message(message, settings)
-        relay.forward(payload)
+        relay.forward(payload, discord_message_id=_canonical_discord_message_id(message))
         return True
     except ValueError as exc:
         logger.warning("relay ignored a message: %s", exc)
