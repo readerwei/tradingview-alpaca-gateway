@@ -686,3 +686,53 @@ def test_an_unfilled_entry_without_the_cancel_flag_is_left_working(tmp_path):
 
     assert not broker.canceled, (
         "an entry was cancelled although the alert did not request it")
+
+
+# ═════════════ protection belongs to THIS entry, not to everything held
+
+def test_protection_covers_only_what_this_entry_added(tmp_path):
+    """A stop belongs to the entry that requested it.
+
+    Every fixture above starts from a flat position, so `position_after` and
+    `position_after - position_before` are identical and the contract could not
+    tell the two designs apart. It took a live account with a pre-existing
+    holding to expose it.
+
+    Two reasons this matters, and the second is not a preference:
+
+    One alert must not close a position another strategy opened.
+
+    And a resting stop RESERVES quantity. Measured live: 0.00648125 held with
+    0.00498125 available. A second alert sized to the TOTAL position asks to
+    sell more than is available and is refused — so the first protective alert
+    would work and every one after it would fail.
+    """
+    broker = RecordingBroker()
+    broker._positions["BTC/USD"] = Decimal("0.004985")     # from an earlier trade
+
+    _run(_crypto_alert(event_id="second-entry"), _settings(tmp_path), broker)
+
+    stop = broker.orders_of("stop_limit")[0]
+    covered = Decimal(str(stop["qty"]))
+
+    assert covered < Decimal("0.004985"), (
+        f"the stop covers {covered}, which includes the pre-existing position; "
+        f"a second alert sized this way would exceed available quantity")
+    assert covered == Decimal("0.001") * (1 - broker.fee_rate), (
+        "the stop should cover exactly what this entry added, fee-adjusted")
+
+
+def test_a_failed_protection_flattens_only_this_entry(tmp_path):
+    """Unwinding our own failure must not close someone else's position."""
+    broker = _ProtectionFails(fail_times=99)
+    broker._positions["BTC/USD"] = Decimal("0.004985")
+
+    _run(_crypto_alert(event_id="flatten-scope"), _settings(tmp_path), broker)
+
+    closing = [o for o in broker.submitted
+               if o.get("type") == "market" and o["side"] == "sell"]
+    assert closing, "nothing was flattened"
+    assert Decimal(str(closing[0]["qty"])) == Decimal("0.001") * (1 - broker.fee_rate), (
+        "the flatten closed more than this entry added")
+    assert broker.position_qty("BTC/USD") == Decimal("0.004985"), (
+        "the pre-existing position was closed too")
