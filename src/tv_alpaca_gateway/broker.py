@@ -55,6 +55,50 @@ class AlpacaPaperClient:
             detail = exc.read().decode(errors="replace")
             raise RuntimeError(f"Alpaca rejected order: HTTP {exc.code}: {detail}") from exc
         return BrokerResult(order_id=raw.get("id", ""), status=raw.get("status", "unknown"), raw=raw)
+
+    def submit_order(self, **kwargs) -> dict:
+        """Submit the keyword-based order shape used by Stage 3 execution."""
+        if not self.settings.alpaca_key_id or not self.settings.alpaca_secret_key:
+            raise RuntimeError("Alpaca paper credentials are not configured")
+        payload = dict(kwargs)
+        if "qty" in payload:
+            payload["qty"] = assets.format_qty(payload["qty"])
+        for key in ("limit_price", "stop_price", "trail_price"):
+            if key in payload and payload[key] is not None:
+                payload[key] = str(payload[key])
+        request = urllib.request.Request(
+            f"{self.settings.alpaca_base_url.rstrip('/')}/v2/orders",
+            data=json.dumps(payload).encode(),
+            headers={
+                "content-type": "application/json",
+                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"Alpaca rejected order: HTTP {exc.code}: {detail}") from exc
+
+    def cancel_order(self, order_id: str) -> None:
+        request = urllib.request.Request(
+            f"{self.settings.alpaca_base_url.rstrip('/')}/v2/orders/{order_id}",
+            headers={
+                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5):
+                return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"Alpaca order cancellation failed: HTTP {exc.code}: {detail}") from exc
+
     def _latest_crypto_price(self, symbol: str) -> float:
         url = ("https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols="
                + urllib.parse.quote(symbol, safe=""))
