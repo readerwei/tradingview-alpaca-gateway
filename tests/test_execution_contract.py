@@ -88,15 +88,24 @@ class RecordingBroker:
             raise RuntimeError("stop limit orders require both stop and limit price")
 
         held = self._positions.get(symbol, Decimal("0"))
-        if order_type != "market" and kwargs["side"] == "sell" and qty > held:
+        # ANY sell of more than is held is refused, market included. The real
+        # broker does this, and it is what makes "size the flatten from the
+        # position" an enforced requirement rather than a weak assertion about
+        # a number being small enough.
+        if kwargs["side"] == "sell" and qty > held:
             raise RuntimeError(
                 f"insufficient balance: requested {qty}, available {held}")
 
         self.submitted.append(dict(kwargs))
         order_id = f"ord-{len(self.submitted)}"
         if order_type == "market":
-            # The fee comes out of the asset received, not the cash.
-            self._positions[symbol] = held + qty * (1 - self.fee_rate)
+            if kwargs["side"] == "buy":
+                # The fee is deducted from the asset RECEIVED, so a buy credits
+                # less than it filled. Selling returns cash, so the position
+                # falls by exactly the quantity sold.
+                self._positions[symbol] = held + qty * (1 - self.fee_rate)
+            else:
+                self._positions[symbol] = held - qty
             return {"id": order_id, "status": "filled", "filled_qty": str(qty)}
         return {"id": order_id, "status": "new", "filled_qty": "0"}
 
@@ -402,16 +411,21 @@ def test_a_position_that_cannot_be_protected_is_flattened(tmp_path):
 
 
 def test_flattening_is_sized_from_the_position_too(tmp_path):
-    """The same in-kind fee problem: closing must sell what is held, not what
-    was filled, or the close is refused and the position survives."""
+    """The same in-kind fee problem, on the way out.
+
+    A close sized from `filled_qty` asks to sell more than is held. The fake
+    refuses it exactly as Alpaca does, so this requirement is enforced by the
+    broker's behaviour rather than by an assertion about a number being small
+    enough — a flatten sized from the fill cannot reach the assertion at all.
+    """
     broker = _ProtectionFails(fail_times=99)
-    held_before = None
     _run(CRYPTO_ALERT, _settings(tmp_path), broker)
 
     closing = [o for o in broker.submitted
-               if o.get("type") == "market" and o["side"] == "sell"][0]
-    assert Decimal(str(closing["qty"])) <= Decimal("0.001"), (
-        "the close was sized from the fill and would be refused")
+               if o.get("type") == "market" and o["side"] == "sell"]
+    assert closing, "no closing order was submitted"
+    assert Decimal(str(closing[0]["qty"])) == Decimal("0.001") * (
+        1 - broker.fee_rate), "the close was not sized from the held position"
 
 
 def test_a_failed_flatten_is_reported_unambiguously(tmp_path):
