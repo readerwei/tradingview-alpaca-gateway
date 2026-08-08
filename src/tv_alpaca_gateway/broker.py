@@ -21,11 +21,17 @@ class BrokerResult:
 
 
 class AlpacaPaperClient:
+    paper_only = True
+
     def __init__(self, settings: Settings):
         settings.validate()
         self.settings = settings
 
     def submit(self, order: ApprovedOrder, client_order_id: str) -> BrokerResult:
+        # Revalidate at the final network boundary as well as at app startup and
+        # request entry. This prevents a mutated/injected Settings object from
+        # turning a previously safe client into a live-capable one.
+        self.settings.validate()
         if not self.settings.alpaca_key_id or not self.settings.alpaca_secret_key:
             raise RuntimeError("Alpaca paper credentials are not configured")
         payload = {
@@ -130,6 +136,8 @@ class AlpacaPaperClient:
 
 
 class FakeBroker:
+    paper_only = True
+
     def __init__(self):
         self.orders: list[dict] = []
 

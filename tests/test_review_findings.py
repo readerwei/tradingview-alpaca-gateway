@@ -162,30 +162,21 @@ def test_a_receipt_failure_does_not_return_502(tmp_path):
 
 # ═════════════════════════════════════ P0 · retry semantics (TradingBot's find)
 
-class _FailingBroker:
-    """Fails once, then succeeds — a transient broker timeout.
+def _failing_broker(price=700.0):
+    """A trusted FakeBroker whose first submission times out."""
+    broker = FakeBroker()
+    broker.calls = 0
+    original_submit = broker.submit
 
-    Implements latest_trade_price too. Without it the collar's market-data
-    lookup fails first and the request never reaches the retry path at all —
-    the test would then be asserting on a 503 from a different code path and
-    would tell you nothing about retry semantics.
-    """
-
-    def __init__(self, price=700.0):
-        self.calls = 0
-        self.orders = []
-        self._price = price
-
-    def latest_trade_price(self, symbol=None):
-        return self._price
-
-    def submit(self, order, client_order_id):
-        self.calls += 1
-        if self.calls == 1:
+    def submit(order, client_order_id):
+        broker.calls += 1
+        if broker.calls == 1:
             raise RuntimeError("connection timed out")
-        from tv_alpaca_gateway.broker import BrokerResult
-        self.orders.append(client_order_id)
-        return BrokerResult(order_id="ok-1", status="accepted", raw={})
+        return original_submit(order, client_order_id)
+
+    broker.submit = submit
+    broker.latest_trade_price = lambda symbol=None: price
+    return broker
 
 
 def test_a_transient_broker_failure_can_be_retried(tmp_path):
@@ -198,7 +189,7 @@ def test_a_transient_broker_failure_can_be_retried(tmp_path):
 
     'Already claimed' must not be conflated with 'already submitted'.
     """
-    broker = _FailingBroker()
+    broker = _failing_broker()
     store = EventStore(tmp_path / "events.sqlite3")
     client = _client(_settings(tmp_path), broker, store)
 

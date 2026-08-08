@@ -35,7 +35,8 @@ class ApprovedOrder:
 
 
 def approve(signal: Signal, settings: Settings,
-            reference_price: float | None = None) -> ApprovedOrder:
+            reference_price: float | None = None,
+            requested_qty: Decimal | None = None) -> ApprovedOrder:
     # An alert may say BTCUSD while the allowlist declares BTC/USD. They name
     # one asset, so resolve to the allowlisted spelling before checking it —
     # otherwise a legitimate alert is refused for a punctuation mismatch.
@@ -57,7 +58,8 @@ def approve(signal: Signal, settings: Settings,
             )
 
     crypto = assets.is_crypto(symbol)
-    qty = settings.crypto_max_qty if crypto else Decimal(settings.max_qty)
+    maximum_qty = settings.crypto_max_qty if crypto else Decimal(settings.max_qty)
+    qty = maximum_qty if requested_qty is None else requested_qty
     if qty <= 0:
         # Reported as configuration, not as a risk limit. Saying "notional
         # exceeds limit" here sent an operator to raise MAX_NOTIONAL, which
@@ -65,6 +67,9 @@ def approve(signal: Signal, settings: Settings,
         raise RiskError(
             f"no order size configured for {symbol} "
             f"({'CRYPTO_MAX_QTY' if crypto else 'MAX_QTY'} is not set)")
+
+    if qty > maximum_qty:
+        raise RiskError("requested quantity exceeds configured limit")
 
     if qty * Decimal(str(signal.close)) > Decimal(str(settings.max_notional)):
         raise RiskError("notional exceeds configured limit")

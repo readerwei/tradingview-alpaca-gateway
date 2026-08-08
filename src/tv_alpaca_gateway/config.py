@@ -71,7 +71,7 @@ class Settings:
         )
 
     def validate(self) -> None:
-        if not self.paper_trading:
+        if self.paper_trading is not True:
             raise ValueError("This implementation is paper-only: PAPER_TRADING must be true")
         try:
             parsed = urlsplit(self.alpaca_base_url)
