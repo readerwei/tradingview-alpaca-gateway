@@ -626,3 +626,63 @@ def test_a_delivery_id_can_supply_identity_when_the_alert_does_not(tmp_path):
                                    EventStore(settings.db_path),
                                    delivery_id="1535708305480093756")
     assert broker.orders_of("market"), "a delivery id did not satisfy identity"
+
+
+# ═══════════ accepted-then-filled: the production failure, as a regression
+
+class _AcceptsThenFills(RecordingBroker):
+    """Alpaca answers a crypto market order with `accepted`, not `filled`.
+
+    It fills a moment later, asynchronously. This is the ordinary case for
+    crypto, not an edge one.
+    """
+
+    def submit_order(self, **kwargs):
+        result = super().submit_order(**kwargs)
+        if kwargs.get("type") == "market" and kwargs["side"] == "buy":
+            result["status"] = "accepted"
+        return result
+
+    def get_order(self, order_id):
+        return {"id": order_id, "status": "filled", "filled_qty": "0.0015"}
+
+
+def _alert_without_cancel_flag(event_id="no-cancel-flag") -> str:
+    """Wei's actual alert: protection requested, no CANCEL_UNFILLED_AT_DEADLINE."""
+    return ("EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+            f"EVENT_ID={event_id} | BAR_TIME={_now()} | ORDER_TYPE=MARKET | "
+            "TIME_IN_FORCE=GTC | PLACE_PROTECTIVE_STOP_AFTER_FILL | "
+            "STOP_TRIGGER=64000 | STOP_LIMIT=63900")
+
+
+def test_protection_happens_even_without_the_cancel_flag(tmp_path):
+    """The production failure, reproduced and pinned.
+
+    Waiting for the fill was gated on `cancel_unfilled_at_deadline`, which is
+    an unrelated question. With protection requested and that flag absent, the
+    executor returned on `accepted`, never reached protection, and the order
+    filled at the broker afterwards: entry filled, recorded, no stop.
+
+    Every contract fixture before this one set CANCEL_UNFILLED_AT_DEADLINE=YES,
+    so the branch that matters was never taken. It took a real order to find,
+    which is the cost of a fixture that only ever exercised one side.
+    """
+    broker = _AcceptsThenFills()
+    result = _run(_alert_without_cancel_flag(), _settings(tmp_path), broker,
+                  deadline_seconds=1.0, poll_interval=0.1)
+
+    assert result.entry_status == "filled", (
+        "the executor gave up on `accepted` and never learned it filled")
+    assert broker.orders_of("stop_limit"), (
+        "entry filled and no protective stop was placed")
+
+
+def test_an_unfilled_entry_without_the_cancel_flag_is_left_working(tmp_path):
+    """The other half: waiting to learn the outcome must not start cancelling
+    orders the alert never asked to cancel."""
+    broker = UnfilledBroker()
+    _run(_alert_without_cancel_flag(event_id="left-working"),
+         _settings(tmp_path), broker, deadline_seconds=0.3, poll_interval=0.1)
+
+    assert not broker.canceled, (
+        "an entry was cancelled although the alert did not request it")

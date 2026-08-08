@@ -223,7 +223,21 @@ def _await_fill_or_cancel(command, entry_id, entry_status, event_id, broker,
     exposed, and no stop, which is the precise outcome this module exists to
     prevent. Found in review by TradingBot; reproduced before fixing.
     """
-    if not command.cancel_unfilled_at_deadline:
+    # Waiting for the fill and cancelling at the deadline are DIFFERENT
+    # questions, and conflating them is what left a filled position
+    # unprotected in production.
+    #
+    # Alpaca answers a crypto market order with `accepted`, not `filled`. With
+    # protection requested but no CANCEL_UNFILLED_AT_DEADLINE, this returned
+    # immediately, execute_pine_command saw a non-filled status and returned
+    # before _protect_or_flatten — and the order then filled asynchronously at
+    # the broker. Entry filled, recorded, no stop, and every other signal
+    # looked like success.
+    #
+    # So: wait whenever the outcome depends on knowing the fill happened.
+    # Cancel only when the alert asked for it.
+    needs_fill = command.place_protective_stop_after_fill
+    if not (command.cancel_unfilled_at_deadline or needs_fill):
         return entry_status
 
     deadline = time.monotonic() + max(deadline_seconds, 0.0)
@@ -240,6 +254,15 @@ def _await_fill_or_cancel(command, entry_id, entry_status, event_id, broker,
         if status == "filled":
             store.update(event_id, "broker_filled", broker_order_id=entry_id)
             return "filled"
+
+    if not command.cancel_unfilled_at_deadline:
+        # We waited only to learn whether it filled. It did not, and the alert
+        # never asked for a cancellation — leaving it working is what was
+        # requested, and the caller is told it is still unfilled.
+        logger.warning("%s still unfilled after %.0fs and no cancellation was "
+                       "requested; it remains working and unprotected",
+                       entry_id, deadline_seconds)
+        return status
 
     try:
         broker.cancel_order(entry_id)
