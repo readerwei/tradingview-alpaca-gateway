@@ -165,6 +165,11 @@ def execute_pine_command(
         logger.info("duplicate delivery of %s; not resubmitting", command.event_id)
         return ExecutionResult(None, entry_status="duplicate")
 
+    # Read the position BEFORE the entry. Protection covers what THIS entry
+    # added, and the only way to know that without assuming a fee rate is to
+    # measure the difference across the fill.
+    position_before = _decimal(broker.position_qty(symbol))
+
     entry = _submit_entry(command, symbol, event_id, broker, store)
     entry_id, entry_status = entry
 
@@ -184,7 +189,7 @@ def execute_pine_command(
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     return _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
-                               event_id, broker, store)
+                               event_id, broker, store, position_before)
 
 
 def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:
@@ -298,10 +303,33 @@ def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
 
 
 def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
-                        event_id, broker, store) -> ExecutionResult:
-    held_qty = _decimal(broker.position_qty(symbol))
+                        event_id, broker, store,
+                        position_before: Decimal = Decimal("0")) -> ExecutionResult:
+    """Protect what THIS entry added, not the whole position.
+
+    Sizing from the total position was wrong twice over.
+
+    It is not what was asked for: a stop belongs to the entry that requested
+    it, and covering unrelated holdings in the same symbol means one alert can
+    close a position another strategy opened.
+
+    And it does not work more than once. A resting stop RESERVES quantity —
+    measured on the live account, 0.00648125 held with only 0.00498125
+    available — so a second alert sized to the total would ask to sell more
+    than is available and be refused. The first protective alert would succeed
+    and every one after it would fail.
+
+    The quantity is still measured rather than computed: position after minus
+    position before. That keeps the in-kind fee handled without assuming a fee
+    rate, which is the part that made total-position sizing attractive in the
+    first place.
+    """
+    position_after = _decimal(broker.position_qty(symbol))
+    held_qty = position_after - position_before
     if held_qty <= 0:
-        logger.warning("%s reports no position after a filled entry", symbol)
+        logger.warning(
+            "%s position did not increase after a filled entry (%s -> %s); "
+            "nothing to protect", symbol, position_before, position_after)
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     kwargs = _protection_kwargs(command, symbol, crypto, held_qty, event_id)
@@ -328,11 +356,11 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
         return ExecutionResult(entry_id, protection_id, entry_status, "submitted")
 
     return _flatten(command, symbol, entry_id, entry_status, event_id, broker,
-                    store, last_error)
+                    store, last_error, held_qty)
 
 
 def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
-             last_error) -> ExecutionResult:
+             last_error, held_qty: Decimal | None = None) -> ExecutionResult:
     """Close a position that cannot be protected.
 
     Sized from the broker's position for the same reason the stop is: a close
@@ -341,7 +369,11 @@ def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
     """
     store.update(event_id, "protection_failed", str(last_error),
                  broker_order_id=entry_id)
-    held_qty = _decimal(broker.position_qty(symbol))
+    # Close what this entry added, not the whole position — flattening
+    # someone else's holdings to unwind our own failure would be worse than
+    # the failure.
+    if held_qty is None:
+        held_qty = _decimal(broker.position_qty(symbol))
     if held_qty <= 0:
         return ExecutionResult(entry_id, entry_status=entry_status,
                                protection_status="failed_no_position")
