@@ -127,6 +127,39 @@ A minimal relay test therefore needs a **new event ID**, a current timestamp, an
 
 TradingView should POST to `/webhooks/tradingview` with the shared secret in the `X-TV-Secret` header. Do not put broker credentials in the alert body.
 
+## ⚠️ The submit route is not production-ready
+
+`POST /webhooks/tradingview/pine/submit` places real orders and **waits
+synchronously for the fill deadline** — up to `deadline_seconds`, 60 by default.
+
+The engine runs in a worker thread, so the event loop stays responsive and other
+requests are served. **That does not make this request asynchronous.** The caller
+waits.
+
+TradingView's webhook client has its own timeout. If it gives up before the
+gateway answers, it may retry — and a retry is a second HTTP request carrying the
+same alert.
+
+**What protects you, and what does not:**
+
+* `EVENT_ID` in the alert **does**. The same firing retried any number of times
+  resolves to one idempotency key and one order.
+* The Discord snowflake fallback **does not**. Each redelivered message can
+  arrive with a new snowflake, so a retry looks like a new firing and places a
+  second order.
+
+So while this route is synchronous:
+
+```dotenv
+# required for retry safety, not optional
+EVENT_ID={{ticker}}-{{interval}}-{{time}}
+```
+
+Treat this as a reviewed, paper-only integration milestone. **Do not connect a
+live TradingView alert to it**, and do not treat it as production-safe, until the
+background-task lifecycle replaces the in-request wait. The follow-up should
+return the entry id immediately and reconcile the fill out of band.
+
 ## Crypto
 
 Crypto is off by default. Enable it by declaring the pair in **slash form** —
