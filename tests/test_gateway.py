@@ -36,7 +36,13 @@ def test_health_is_paper_only_and_kill_switch_defaults_off(tmp_path):
     client, _ = make_app(tmp_path)
     response = client.get("/healthz")
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "paper_trading": True, "trading_enabled": False}
+    # Asserted per-field rather than as a whole dict: pinning the exact shape
+    # means every added field is a failure, which trains people to update the
+    # expectation without reading it.
+    body = response.json()
+    assert body["ok"] is True
+    assert body["paper_trading"] is True
+    assert body["trading_enabled"] is False
 
 
 def test_invalid_secret_is_rejected(tmp_path):
@@ -282,3 +288,63 @@ def test_the_not_checked_list_is_true_by_behaviour_not_by_comment(tmp_path):
     assert response.status_code == 200, "the risk or market-data path was taken"
     assert response.json()["validated"] == "parse_only"
     assert _DRY_RUN_NOT_CHECKED, "the list must not be empty while risk is skipped"
+
+
+def test_healthz_reports_the_running_commit(tmp_path):
+    """"Is the running code current?" must be answerable directly.
+
+    Three times in one day the runtime diverged from the repository, and the
+    third produced a filled, unprotected position: master was correct and the
+    process was not. /healthz reported configuration, so currency had to be
+    inferred by comparing process start time against commit time — which works
+    only if someone thinks to do it, and only if the checkout was also current.
+    """
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.app import create_app
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    settings = Settings(paper_trading=True, trading_enabled=False,
+                        webhook_secret="s", allowed_symbols=frozenset({"QQQ"}),
+                        crypto_max_qty=Decimal("0"), db_path=tmp_path / "h.db")
+    body = TestClient(create_app(settings, None, EventStore(settings.db_path), None)
+                      ).get("/healthz").json()
+
+    assert "commit" in body, "healthz does not report the running commit"
+    assert body["commit"], "the commit field is empty"
+
+
+def test_the_gateway_starts_when_the_commit_cannot_be_determined(tmp_path, monkeypatch):
+    """A deployment outside a git checkout should still run.
+
+    Refusing to start would trade a reporting gap for an outage, which is the
+    wrong direction — it just cannot prove its version.
+
+    My first version of this test monkeypatched the constant and then asserted
+    the constant, which proves the monkeypatch works. It also imported
+    `tv_alpaca_gateway.app` and got the FastAPI instance rather than the module
+    — the same collision that broke a test earlier today.
+    """
+    import importlib
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    module = importlib.import_module("tv_alpaca_gateway.app")
+    monkeypatch.setattr(module, "RUNNING_COMMIT", "unknown")
+
+    settings = Settings(paper_trading=True, trading_enabled=False,
+                        webhook_secret="s", allowed_symbols=frozenset({"QQQ"}),
+                        crypto_max_qty=Decimal("0"), db_path=tmp_path / "u.db")
+    body = TestClient(module.create_app(settings, None,
+                                        EventStore(settings.db_path), None)
+                      ).get("/healthz").json()
+
+    assert body["ok"] is True, "the gateway refused to serve without a commit"
+    assert body["commit"] == "unknown"

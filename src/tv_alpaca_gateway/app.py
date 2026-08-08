@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import pathlib
 import hmac
 import json
 import logging
@@ -26,6 +27,36 @@ from .stream import AlpacaStreamManager, MarketQuote, MarketTrade, OrderUpdate
 from .store import EventStore
 
 logger = logging.getLogger(__name__)
+
+
+def _running_commit() -> str:
+    """The commit this process is actually running, not the one on master.
+
+    Three times in one day the runtime diverged from the repository — an
+    unpushed commit, a stale checkout, and a process still running yesterday's
+    code. The third produced a filled, unprotected position: master was correct
+    and the process was not, and nothing exposed the difference.
+
+    /healthz reported configuration, which is why "is it current?" had to be
+    inferred from process start time against commit time. This makes it
+    directly checkable instead.
+
+    Resolved once at import. Returns "unknown" rather than raising if the
+    process is not running from a git checkout — a deployment that cannot
+    report its commit should still start, it just cannot prove its version.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=pathlib.Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5, check=True)
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+RUNNING_COMMIT = _running_commit()
 
 
 def _pine_command_payload(command: PineOrderCommand) -> dict[str, Any]:
@@ -149,13 +180,22 @@ def create_app(
     # Exposed so the streams can be inspected and exercised from outside —
     # an end-to-end test needs to trigger a resync without reaching into a
     # closure, and an operator needs a way to see whether a socket is up.
+    logger.info("gateway starting: commit=%s paper_trading=%s trading_enabled=%s",
+                RUNNING_COMMIT, settings.paper_trading, settings.trading_enabled)
     app.state.stream = stream
     app.state.store = store
     app.state.broker = broker
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
-        return {"ok": True, "paper_trading": settings.paper_trading, "trading_enabled": settings.trading_enabled}
+        return {
+            "ok": True,
+            "paper_trading": settings.paper_trading,
+            "trading_enabled": settings.trading_enabled,
+            # So "is the running code current?" is answerable without
+            # comparing process start times against commit timestamps.
+            "commit": RUNNING_COMMIT,
+        }
 
     @app.post("/webhooks/tradingview/pine/dry-run")
     async def pine_dry_run(request: Request, x_tv_secret: str | None = Header(default=None)) -> dict[str, Any]:
