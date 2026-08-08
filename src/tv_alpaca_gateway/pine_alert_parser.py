@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from .assets import is_crypto
@@ -11,11 +12,24 @@ class AlertParseError(ValueError):
 
 
 _PREFIX = "EXECUTE_ALPACA_ORDER"
-_REQUIRED_FIELDS = frozenset({"SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FORCE"})
+# EVENT_ID and BAR_TIME are required, and their absence is what this change
+# fixes. Without EVENT_ID the idempotency key was derived from the order fields
+# alone, so two firings of the same setup collapsed to one id and the second was
+# refused as a duplicate — inverting what idempotency is for. Without BAR_TIME
+# there was no freshness check at all, so a message re-forwarded after a relay
+# restart was indistinguishable from a live signal. The JSON path required both
+# from the start; the pipe format dropped them and both protections went too.
+_REQUIRED_FIELDS = frozenset({
+    "SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FORCE", "EVENT_ID", "BAR_TIME",
+})
 _EXECUTABLE_FIELDS = _REQUIRED_FIELDS | frozenset({
     "CANCEL_UNFILLED_AT_DEADLINE", "STOP_TRIGGER", "STOP_LIMIT", "TRAIL",
 })
 _IGNORABLE_FIELDS = frozenset({"REQUIRED_ACTIONS"})
+# Freshness, matching the 180s the JSON path has always used, with the same
+# 30s tolerance for a clock running slightly ahead.
+MAX_ALERT_AGE_SECONDS = 180
+MAX_ALERT_FUTURE_SECONDS = 30
 _ALLOWED_ORDER_TYPES = frozenset({"market"})
 _EXECUTABLE_FLAGS = frozenset({"PLACE_PROTECTIVE_STOP_AFTER_FILL"})
 # The parser stays independent of runtime allowlists. These are the current
@@ -26,6 +40,8 @@ _CANONICAL_CRYPTO = {"BTCUSD": "BTC/USD", "ETHUSD": "ETH/USD", "ETHBTC": "ETH/BT
 
 @dataclass(frozen=True)
 class PineOrderCommand:
+    event_id: str
+    bar_time: datetime
     symbol: str
     side: str
     qty: Decimal
@@ -83,6 +99,12 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     if missing:
         raise AlertParseError(f"missing required fields: {', '.join(missing)}")
 
+    event_id = fields["EVENT_ID"]
+    if len(event_id) > 256:
+        raise AlertParseError("EVENT_ID must be 1-256 characters")
+    bar_time = parse_bar_time(fields["BAR_TIME"])
+    _check_freshness(bar_time)
+
     symbol = _CANONICAL_CRYPTO.get(fields["SYMBOL"].upper(), fields["SYMBOL"].upper())
     crypto_symbol = is_crypto(symbol)
     side = fields["SIDE"].lower()
@@ -121,6 +143,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     if cancel_raw not in {"YES", "NO"}:
         raise AlertParseError("CANCEL_UNFILLED_AT_DEADLINE must be YES or NO")
     return PineOrderCommand(
+        event_id=event_id,
+        bar_time=bar_time,
         symbol=symbol,
         side=side,
         qty=qty,
@@ -132,6 +156,53 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         stop_limit=stop_limit,
         trail=trail,
     )
+
+
+def parse_bar_time(raw: str) -> datetime:
+    """Parse BAR_TIME, tolerantly but never silently.
+
+    Nobody has yet captured what TradingView renders for {{time}} or
+    {{timenow}}, so several plausible spellings are accepted rather than one
+    guessed. What is NOT acceptable is treating an unreadable timestamp as
+    "no timestamp" and proceeding: that is how the freshness check the JSON
+    path inherited quietly stopped existing here.
+
+    A unix epoch is accepted because TradingView's {{time}} renders as one in
+    some alert contexts, and reading 1754665800 as a year would be worse than
+    refusing it.
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise AlertParseError("BAR_TIME is required")
+
+    if text.isdigit():
+        seconds = int(text)
+        # Milliseconds if it is far past any plausible epoch second.
+        if seconds > 10_000_000_000:
+            seconds //= 1000
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise AlertParseError(f"BAR_TIME is not a valid timestamp: {raw!r}") from exc
+
+    candidate = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise AlertParseError(
+            f"BAR_TIME is not a recognised timestamp: {raw!r}") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _check_freshness(bar_time: datetime, now: datetime | None = None) -> None:
+    now = now or datetime.now(timezone.utc)
+    age = (now - bar_time).total_seconds()
+    if age > MAX_ALERT_AGE_SECONDS:
+        raise AlertParseError(
+            f"BAR_TIME is stale: {age:.0f}s old, limit {MAX_ALERT_AGE_SECONDS}s")
+    if age < -MAX_ALERT_FUTURE_SECONDS:
+        raise AlertParseError(
+            f"BAR_TIME is in the future by {-age:.0f}s; check the clock")
 
 
 def _positive_decimal(value: str | None, name: str) -> Decimal:

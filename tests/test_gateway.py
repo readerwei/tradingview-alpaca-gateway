@@ -84,8 +84,18 @@ def test_order_reconciliation_reads_broker_state(tmp_path):
     assert result.order_id == order_id
 
 
+
+def _pine_now() -> str:
+    """Generated per call. A hardcoded BAR_TIME passes the freshness rule when
+    written and fails it minutes later — a decayed fixture that reads as a
+    parser regression."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 PINE_ALERT = (
     "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+    f"EVENT_ID=gw-fixture | BAR_TIME={_pine_now()} | "
     "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | "
     "CANCEL_UNFILLED_AT_DEADLINE=YES | PLACE_PROTECTIVE_STOP_AFTER_FILL | "
     "STOP_TRIGGER=65000 | STOP_LIMIT=64950 | TRAIL=NONE | "
@@ -213,6 +223,7 @@ def test_the_dry_run_states_that_it_only_parsed(tmp_path):
     client = TestClient(create_app(settings, None, EventStore(settings.db_path), None),
                         raise_server_exceptions=False)
     alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+    f"EVENT_ID=gw-fixture | BAR_TIME={_pine_now()} | "
              "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC")
 
     body = client.post("/webhooks/tradingview/pine/dry-run", content=alert,
@@ -264,6 +275,7 @@ def test_the_not_checked_list_is_true_by_behaviour_not_by_comment(tmp_path):
     response = client.post(
         "/webhooks/tradingview/pine/dry-run",
         content=("EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=99 | "
+                 f"EVENT_ID=gw-oversize | BAR_TIME={_pine_now()} | "
                  "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC"),
         headers={"x-tv-secret": secret})
 
