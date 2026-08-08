@@ -580,3 +580,49 @@ def test_an_entry_that_never_fills_is_still_cancelled(tmp_path):
 
     assert broker.canceled, "an unfilled entry was left working"
     assert not broker.orders_of("stop_limit"), "protected a position that is not held"
+
+
+def test_an_alert_without_a_durable_identity_is_refused(tmp_path):
+    """EVENT_ID is optional in the alert, so it can be absent.
+
+    Falling back to the order fields restores the original bug. Falling back to
+    nothing is worse: `pine-exec-None` for every alert of every symbol means
+    the first order ever placed succeeds and all others are refused as
+    duplicates. Refusing is the only safe answer, and the message says how to
+    fix it.
+    """
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+
+    bare = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+    try:
+        command = parse_pine_alert(bare)
+    except Exception:
+        pytest.skip("the parser still requires EVENT_ID; nothing to guard yet")
+
+    broker = RecordingBroker()
+    with pytest.raises(Exception, match=r"(?i)EVENT_ID|identity|deliver"):
+        execution.execute_pine_command(command, _settings(tmp_path), broker,
+                                       EventStore(_settings(tmp_path).db_path))
+    assert broker.submitted == [], "an unidentifiable alert reached the broker"
+
+
+def test_a_delivery_id_can_supply_identity_when_the_alert_does_not(tmp_path):
+    """The relay knows the Discord snowflake even when the alert carries no
+    EVENT_ID, so the engine accepts one rather than forcing every deployment to
+    change its Pine template first."""
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+
+    bare = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+    try:
+        command = parse_pine_alert(bare)
+    except Exception:
+        pytest.skip("the parser still requires EVENT_ID; nothing to guard yet")
+
+    settings = _settings(tmp_path)
+    broker = RecordingBroker()
+    execution.execute_pine_command(command, settings, broker,
+                                   EventStore(settings.db_path),
+                                   delivery_id="1535708305480093756")
+    assert broker.orders_of("market"), "a delivery id did not satisfy identity"

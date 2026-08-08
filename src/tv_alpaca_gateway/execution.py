@@ -93,14 +93,31 @@ class ExecutionResult:
     protection_status: str | None = None
 
 
-def _command_id(command: PineOrderCommand) -> str:
-    """Identity comes from EVENT_ID, not the order contents.
+def _command_id(command: PineOrderCommand, delivery_id: str | None = None) -> str:
+    """Identity comes from EVENT_ID, or a delivery id, and never from the order.
 
     Hashing the order fields made two firings of the same setup produce one id,
     so the second was refused as a duplicate — inverting what idempotency is
     for. A strategy emitting identical signals is the normal case.
+
+    EVENT_ID is optional in the alert, so it can be absent. When it is, the
+    caller must supply something durable — the relay's Discord message
+    snowflake, say. Falling back to the order fields would restore the original
+    bug, and falling back to nothing produces `pine-exec-None` for EVERY alert
+    of every symbol, which is worse: the first order ever placed succeeds and
+    all others are refused as duplicates.
+
+    So an unidentifiable command is refused. That is a safe failure; a shared
+    identity is not.
     """
-    return f"pine-exec-{command.event_id}"
+    identity = command.event_id or delivery_id
+    if not identity:
+        raise ExecutionError(
+            "this alert carries no EVENT_ID and no delivery id was supplied, "
+            "so two firings could not be told apart; add "
+            "EVENT_ID={{ticker}}-{{interval}}-{{time}} to the alert or pass a "
+            "durable delivery id")
+    return f"pine-exec-{identity}"
 
 
 def _decimal(value: Any) -> Decimal:
@@ -115,6 +132,7 @@ def execute_pine_command(
     *,
     deadline_seconds: float = 60.0,
     poll_interval: float = 1.0,
+    delivery_id: str | None = None,
 ) -> ExecutionResult:
     settings.validate()
     if not settings.trading_enabled:
@@ -142,7 +160,7 @@ def execute_pine_command(
     if command.qty * reference_price > _decimal(settings.max_notional):
         raise ExecutionError("notional exceeds configured limit")
 
-    event_id = _command_id(command)
+    event_id = _command_id(command, delivery_id)
     if not store.claim(event_id):
         logger.info("duplicate delivery of %s; not resubmitting", command.event_id)
         return ExecutionResult(None, entry_status="duplicate")
