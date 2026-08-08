@@ -230,7 +230,7 @@ TradingView → Discord incoming webhook → private channel
              → outbound Python Discord bot → 127.0.0.1 gateway → Alpaca paper API
 ```
 
-The relay admits only messages from one configured channel and source webhook ID. It requires Discord's Message Content intent, forwards structured JSON to the local gateway, and ignores human messages, other bots, other channels, malformed content, and unapproved webhooks. Keep the bot token, source webhook URL, and broker credentials out of Git and out of Discord messages.
+The relay admits only messages from one configured channel and an explicitly allowlisted source identity. A source may be either an incoming webhook (`message.webhook_id`) or a normal bot user (`message.author.id`); these are different IDs and must not be conflated. Accepted and rejected messages log message ID, channel ID, author ID, and webhook ID; the relay bot's own messages are suppressed. Raw `EXECUTE_ALPACA_ORDER` Pine alerts are preserved byte-for-byte and sent only to the non-trading dry-run endpoint. Keep the bot token, source webhook URL, and broker credentials out of Git and out of Discord messages.
 
 Run the relay separately:
 
