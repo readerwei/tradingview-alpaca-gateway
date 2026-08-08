@@ -133,12 +133,23 @@ class UnfilledBroker(RecordingBroker):
 
 # ───────────────────────────────────────────────────────── fixtures
 
-CRYPTO_ALERT = (
-    "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
-    "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | CANCEL_UNFILLED_AT_DEADLINE=YES | "
-    "PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=64000 | STOP_LIMIT=63900 | "
-    "TRAIL=NONE"
-)
+def _now() -> str:
+    """Generated per call: a hardcoded BAR_TIME passes the freshness rule when
+    written and fails it minutes later, which reads as a parser regression."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _crypto_alert(event_id="BTCUSD-1-exec") -> str:
+    return ("EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+            f"EVENT_ID={event_id} | BAR_TIME={_now()} | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | "
+            "CANCEL_UNFILLED_AT_DEADLINE=YES | "
+            "PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=64000 | "
+            "STOP_LIMIT=63900 | TRAIL=NONE")
+
+
+CRYPTO_ALERT = _crypto_alert()
 
 
 def _settings(tmp_path, **kw):
@@ -213,7 +224,7 @@ def test_a_crypto_trail_never_reaches_the_broker(tmp_path):
     """The parser already rejects it; the executor must not resurrect it."""
     broker = RecordingBroker()
     with pytest.raises(Exception):
-        _run(CRYPTO_ALERT.replace("TRAIL=NONE", "TRAIL=250"),
+        _run(_crypto_alert().replace("TRAIL=NONE", "TRAIL=250"),
              _settings(tmp_path), broker)
     assert not broker.orders_of("trailing_stop")
 
@@ -315,7 +326,7 @@ def test_quantity_is_capped_by_configuration_not_by_the_alert(tmp_path):
     resize makes the fill disagree with the strategy that generated it."""
     broker = RecordingBroker()
     with pytest.raises(Exception):
-        _run(CRYPTO_ALERT.replace("QTY=0.001", "QTY=5"),
+        _run(_crypto_alert().replace("QTY=0.001", "QTY=5"),
              _settings(tmp_path, crypto_max_qty=Decimal("0.01")), broker)
     assert broker.submitted == []
 
@@ -328,11 +339,14 @@ def test_a_paper_only_configuration_is_still_enforced(tmp_path):
 
 # ═════════════════════════════════════ equities are a different asset class
 
-EQUITY_ALERT = (
-    "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | ORDER_TYPE=MARKET | "
-    "TIME_IN_FORCE=DAY | PLACE_PROTECTIVE_STOP_AFTER_FILL | "
-    "STOP_TRIGGER=700 | STOP_LIMIT=699"
-)
+def _equity_alert(event_id="QQQ-1-exec", extra="") -> str:
+    return ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+            f"EVENT_ID={event_id} | BAR_TIME={_now()} | ORDER_TYPE=MARKET | "
+            "TIME_IN_FORCE=DAY | PLACE_PROTECTIVE_STOP_AFTER_FILL | "
+            f"STOP_TRIGGER=700 | STOP_LIMIT=699{extra}")
+
+
+EQUITY_ALERT = _equity_alert()
 
 
 def test_an_equity_trail_is_allowed_because_alpaca_supports_it(tmp_path):
@@ -344,9 +358,7 @@ def test_an_equity_trail_is_allowed_because_alpaca_supports_it(tmp_path):
     it — the natural over-correction, and the reason this test exists.
     """
     broker = RecordingBroker()
-    _run(EQUITY_ALERT.replace("STOP_TRIGGER=700 | STOP_LIMIT=699",
-                              "STOP_TRIGGER=700 | STOP_LIMIT=699 | TRAIL=5"),
-         _settings(tmp_path), broker)
+    _run(_equity_alert(extra=" | TRAIL=5"), _settings(tmp_path), broker)
 
     assert broker.orders_of("market"), "the equity entry was not submitted"
 
@@ -455,17 +467,19 @@ def test_a_failed_flatten_is_reported_unambiguously(tmp_path):
     assert broker.position_qty("BTC/USD") > 0, "fixture: the position is stuck open"
 
 
-def test_a_failed_protective_order_still_reports_the_open_position(tmp_path):
-    """The most expensive state in the system: filled, exposed, no stop.
+def test_a_failed_protective_order_still_reports_which_order_was_exposed(tmp_path):
+    """Whatever happens to the position, the caller must learn the entry id.
 
-    Whatever the executor does about it — retry, flatten, escalate — the caller
-    must be told which order left them exposed. Raising without the entry id
-    means the only trace is a database row, and whoever catches the exception
-    cannot act on it.
+    This case originally asserted the position stayed OPEN, which was right
+    when it was written and wrong the moment Wei chose retry-then-flatten — two
+    cases in this same file then disagreed about the outcome, and an
+    implementation could not satisfy both. The durable requirement is not what
+    happens to the position; it is that the caller is told which order left
+    them exposed, rather than having to find out from a database row.
     """
     class ProtectionRejected(RecordingBroker):
         def submit_order(self, **kwargs):
-            if kwargs.get("type") != "market":
+            if kwargs.get("type") == "stop_limit":
                 raise RuntimeError("broker refused the protective order")
             return super().submit_order(**kwargs)
 
@@ -480,10 +494,8 @@ def test_a_failed_protective_order_still_reports_the_open_position(tmp_path):
     except Exception as exc:
         entry_id = getattr(exc, "entry_order_id", None)
 
-    assert broker.position_qty("BTC/USD") > 0, "fixture: the position should be open"
     assert entry_id, (
-        "the position is open and unprotected and the caller was not told "
-        "which order it belongs to")
+        "protection failed and the caller was not told which order it was for")
 
 
 def test_protective_orders_outlive_the_session(tmp_path):
