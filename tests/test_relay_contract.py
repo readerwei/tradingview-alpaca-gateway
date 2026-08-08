@@ -44,8 +44,8 @@ def _settings(**kw):
     return RelaySettings(**base)
 
 
-def _message(content=PINE_ALERT, channel=CHANNEL, webhook=WEBHOOK):
-    return SimpleNamespace(channel=SimpleNamespace(id=channel),
+def _message(content=PINE_ALERT, channel=CHANNEL, webhook=WEBHOOK, message_id=123456789012345678):
+    return SimpleNamespace(id=message_id, channel=SimpleNamespace(id=channel),
                            webhook_id=webhook, content=content)
 
 
@@ -188,9 +188,10 @@ def test_an_admitted_message_is_forwarded_once(caplog):
     sent = []
 
     class _Recording:
-        def forward(self, text):
-            sent.append(text)
+        def forward(self, text, *, discord_message_id):
+            sent.append((text, discord_message_id))
 
     forwarded = handle(_message(), _settings(), _Recording())
     assert forwarded is True
-    assert sent == [PINE_ALERT], "the admitted alert was not forwarded verbatim"
+    assert sent == [(PINE_ALERT, "123456789012345678")], (
+        "the admitted alert or its Discord message identity was not forwarded")
