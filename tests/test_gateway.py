@@ -282,3 +282,42 @@ def test_the_not_checked_list_is_true_by_behaviour_not_by_comment(tmp_path):
     assert response.status_code == 200, "the risk or market-data path was taken"
     assert response.json()["validated"] == "parse_only"
     assert _DRY_RUN_NOT_CHECKED, "the list must not be empty while risk is skipped"
+
+
+def test_healthz_reports_the_running_commit(tmp_path):
+    """"Is the running code current?" must be answerable directly.
+
+    Three times in one day the runtime diverged from the repository, and the
+    third produced a filled, unprotected position: master was correct and the
+    process was not. /healthz reported configuration, so currency had to be
+    inferred by comparing process start time against commit time — which works
+    only if someone thinks to do it, and only if the checkout was also current.
+    """
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.app import create_app
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    settings = Settings(paper_trading=True, trading_enabled=False,
+                        webhook_secret="s", allowed_symbols=frozenset({"QQQ"}),
+                        crypto_max_qty=Decimal("0"), db_path=tmp_path / "h.db")
+    body = TestClient(create_app(settings, None, EventStore(settings.db_path), None)
+                      ).get("/healthz").json()
+
+    assert "commit" in body, "healthz does not report the running commit"
+    assert body["commit"], "the commit field is empty"
+
+
+def test_an_unknown_commit_does_not_stop_the_gateway(monkeypatch):
+    """A deployment that cannot report its commit should still start.
+
+    Refusing to run outside a git checkout would trade a reporting gap for an
+    outage, which is the wrong direction — it just cannot prove its version.
+    """
+    from tv_alpaca_gateway import app as app_module
+
+    monkeypatch.setattr(app_module, "RUNNING_COMMIT", "unknown")
+    assert app_module.RUNNING_COMMIT == "unknown"
