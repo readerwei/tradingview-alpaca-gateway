@@ -209,6 +209,7 @@ def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:
     entry_id = str(entry["id"])
     status = str(entry.get("status", "unknown"))
     store.update(event_id, f"broker_{status}", broker_order_id=entry_id)
+    store.record_broker_order(entry_id, event_id, "entry", status)
     return entry_id, status
 
 
@@ -297,6 +298,10 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
         store.update(event_id, "protection_submitted",
                      f"protection_order_id={protection_id}",
                      broker_order_id=entry_id)
+        # Recorded as its own row: reconciliation must be able to find a
+        # protective order, and a missed one means an unprotected position.
+        store.record_broker_order(protection_id, event_id, "protection",
+                                  str(protection.get("status", "new")))
         return ExecutionResult(entry_id, protection_id, entry_status, "submitted")
 
     return _flatten(command, symbol, entry_id, entry_status, event_id, broker,
@@ -335,8 +340,11 @@ def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
             f"{symbol} {held_qty} is open, unprotected, and could not be "
             f"closed: {exc}", entry_order_id=entry_id) from exc
 
+    flatten_id = str(closing.get("id", ""))
+    store.record_broker_order(flatten_id, event_id, "flatten",
+                              str(closing.get("status", "new")))
     store.update(event_id, "flattened_unprotected",
-                 f"flatten_order_id={str(closing.get('id', ''))}; {last_error}",
+                 f"flatten_order_id={flatten_id}; {last_error}",
                  broker_order_id=entry_id)
     return ExecutionResult(entry_id, entry_status=entry_status,
                            protection_status="flattened")

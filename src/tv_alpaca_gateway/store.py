@@ -15,6 +15,16 @@ class EventStore:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS pine_dry_runs (audit_id TEXT PRIMARY KEY, detail TEXT NOT NULL)"
             )
+            # One row per broker order, not one per event. An event can produce
+            # an entry, a protective stop and a flatten, and reconciliation has
+            # to be able to find all three. Recording them in events.detail as
+            # text made them unqueryable: a resync could discover the entry and
+            # miss a protective order that was live at the broker.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS broker_orders ("
+                "order_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, "
+                "role TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new')"
+            )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
             if "broker_order_id" not in columns:
                 conn.execute("ALTER TABLE events ADD COLUMN broker_order_id TEXT")
@@ -56,7 +66,14 @@ class EventStore:
                 "UPDATE events SET status = ?, detail = ? WHERE broker_order_id = ?",
                 (status, detail[:2000], order_id),
             )
-            return cur.rowcount == 1
+            # Also update the per-order row, so a status arriving for a
+            # protective order is not silently dropped for want of a matching
+            # events row.
+            side = conn.execute(
+                "UPDATE broker_orders SET status = ? WHERE order_id = ?",
+                (status.removeprefix("broker_"), order_id),
+            )
+            return cur.rowcount == 1 or side.rowcount == 1
 
     def release(self, event_id: str) -> bool:
         """Release an event after submission failure so the same alert can retry."""
@@ -75,6 +92,32 @@ class EventStore:
         "broker_expired", "broker_done_for_day",
     )
 
+    def record_broker_order(self, order_id: str, event_id: str, role: str,
+                            status: str = "new") -> None:
+        """Record one broker order and what it is for.
+
+        `role` is entry / protection / flatten. Reconciliation needs the role
+        because the three have different consequences: a missed entry means a
+        position nobody knows about, a missed protection means an unprotected
+        one.
+        """
+        if not order_id:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO broker_orders(order_id, event_id, role, status) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET "
+                "status = excluded.status",
+                (order_id, event_id, role, status),
+            )
+
+    def broker_orders_for(self, event_id: str) -> list[tuple[str, str, str]]:
+        """(order_id, role, status) for one event, entry and protection alike."""
+        with self._connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                "SELECT order_id, role, status FROM broker_orders "
+                "WHERE event_id = ? ORDER BY rowid", (event_id,))]
+
     def unresolved_broker_orders(self) -> list[str]:
         """Broker order ids whose last known status is not terminal.
 
@@ -85,6 +128,8 @@ class EventStore:
         needlessly costs one REST call, one missed costs a position.
         """
         placeholders = ",".join("?" for _ in self.TERMINAL)
+        terminal_bare = tuple(t.removeprefix("broker_") for t in self.TERMINAL)
+        bare_marks = ",".join("?" for _ in terminal_bare)
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT broker_order_id FROM events "
@@ -92,7 +137,14 @@ class EventStore:
                 f"AND status NOT IN ({placeholders})",
                 self.TERMINAL,
             ).fetchall()
-        return [row[0] for row in rows]
+            # Protective and flatten orders live here, and a resync that only
+            # looked at events would never see them.
+            rows += conn.execute(
+                f"SELECT order_id FROM broker_orders "
+                f"WHERE status NOT IN ({bare_marks})", terminal_bare,
+            ).fetchall()
+        seen = dict.fromkeys(row[0] for row in rows if row[0])
+        return list(seen)
 
     def status(self, event_id: str) -> str | None:
         with self._connect() as conn:

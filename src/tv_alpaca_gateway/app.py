@@ -13,6 +13,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from .broker import AlpacaPaperClient
 from .config import Settings
 from .models import AlertError, Signal
+# Imported as a module, not as a bound name. The route's only job is to
+# delegate, and calling through `execution.` keeps that seam visible and
+# substitutable — a directly-bound function cannot be observed or replaced,
+# which makes "does this actually delegate?" untestable.
+from . import execution
+from .execution import ExecutionError, UnprotectedPositionError
 from .pine_alert_parser import AlertParseError as PineAlertParseError, PineOrderCommand, parse_pine_alert
 from .notifier import DiscordNotifier, NullNotifier
 from .risk import RiskError, approve
@@ -176,6 +182,75 @@ def create_app(
             "not_checked": list(_DRY_RUN_NOT_CHECKED),
             "audit_id": audit_id,
             "command": command_payload,
+        }
+
+    @app.post("/webhooks/tradingview/pine/submit")
+    async def pine_submit(
+        request: Request,
+        x_tv_secret: str | None = Header(default=None),
+        x_discord_message_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Authenticate, parse, and hand the command to the execution engine.
+
+        Deliberately thin. An earlier draft did its own parse -> risk -> claim
+        -> submit, which created a second execution path where only the engine
+        was covered by the Stage 3 contract — so the lifecycle rules were
+        enforced on the path nobody used and absent from the one wired to a
+        route. Everything between parsing and the broker belongs to
+        execute_pine_command, and this route's job is to stop being clever.
+        """
+        if not settings.webhook_secret or not x_tv_secret or not hmac.compare_digest(
+                x_tv_secret, settings.webhook_secret):
+            raise HTTPException(status_code=401, detail="invalid webhook secret")
+        try:
+            raw = (await _read_limited_pine_body(request)).decode("utf-8")
+            command = parse_pine_alert(raw)
+        except (UnicodeDecodeError, PineAlertParseError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        try:
+            # The relay sends its Discord snowflake, which is the fallback
+            # identity for an alert with no EVENT_ID. Accepting the header was
+            # missing, so the fallback existed in the engine and was
+            # unreachable through the only path that can supply it.
+            result = await asyncio.to_thread(
+                execution.execute_pine_command, command, settings, broker, store,
+                delivery_id=x_discord_message_id)
+        except ExecutionError as exc:
+            # Refused before anything reached the broker.
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except UnprotectedPositionError as exc:
+            # Filled, exposed, and neither protected nor closed. The entry id
+            # goes in the response because the caller has to be able to act on
+            # it without reading the database.
+            logger.critical("unprotected position from %s: %s", command.event_id, exc)
+            raise HTTPException(status_code=500, detail={
+                "error": "position is open and unprotected",
+                "entry_order_id": exc.entry_order_id,
+                "detail": str(exc),
+            }) from exc
+        except Exception as exc:
+            logger.exception("submission failed for %s", command.event_id)
+            raise HTTPException(status_code=502, detail="broker submission failed") from exc
+
+        notifier_note = (f"Pine order: {command.side.upper()} {command.qty} "
+                         f"{command.symbol}; entry={result.entry_order_id}; "
+                         f"protection={result.protection_status}")
+        try:
+            notifier.send(notifier_note)
+        except Exception:
+            # A receipt is a courtesy and must never rewrite order state.
+            logger.exception("receipt notification failed for %s", result.entry_order_id)
+
+        return {
+            # The identity actually used, not the one the alert happened to
+            # carry: reporting command.event_id showed None whenever the
+            # snowflake fallback was in play.
+            "event_id": command.event_id or x_discord_message_id,
+            "order_id": result.entry_order_id,
+            "entry_status": result.entry_status,
+            "protection_order_id": result.protection_order_id,
+            "protection_status": result.protection_status,
         }
 
     @app.post("/webhooks/tradingview")
