@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 PINE_EXECUTION_PREFIX = "EXECUTE_ALPACA_ORDER"
 DISCORD_MESSAGE_MAX_CHARS = 2000
 PINE_DRY_RUN_PATH = "/webhooks/tradingview/pine/dry-run"
+PINE_SUBMIT_PATH = "/webhooks/tradingview/pine/submit"
 logger = logging.getLogger(__name__)
 
 
@@ -22,20 +23,33 @@ class RelaySettings:
     source_webhook_id: int
     internal_url: str = "http://127.0.0.1:8000/webhooks/tradingview"
     internal_secret: str = ""
+    # Reaching a route that trades is an explicit decision, not a URL edit.
+    # Default False so the relay stays incapable of execution unless somebody
+    # deliberately turns it on.
+    allow_execution: bool = False
 
     def validate_target(self) -> None:
-        """Ensure this private relay can only reach the Pine dry-run route."""
+        """Restrict the relay to the one route it is allowed to reach.
+
+        Dry-run by default. `allow_execution` widens it to the submit route and
+        nothing else — a flag that widened the target to "anything" would not
+        be a gate, so the host, scheme and path checks all still apply.
+        """
+        permitted = {PINE_DRY_RUN_PATH}
+        if self.allow_execution:
+            permitted.add(PINE_SUBMIT_PATH)
         parsed = urlsplit(self.internal_url)
         if (
             parsed.scheme != "http"
             or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-            or parsed.path != PINE_DRY_RUN_PATH
+            or parsed.path not in permitted
             or parsed.query
             or parsed.fragment
             or parsed.username is not None
             or parsed.password is not None
         ):
-            raise ValueError("relay target must be a local Pine dry-run endpoint")
+            allowed = " or ".join(sorted(permitted))
+            raise ValueError(f"relay target must be a local {allowed} endpoint")
 
     @classmethod
     def from_env(cls) -> "RelaySettings":
@@ -50,6 +64,8 @@ class RelaySettings:
             source_webhook_id=source_webhook_id,
             internal_url=os.getenv("GATEWAY_INTERNAL_URL", cls.internal_url),
             internal_secret=os.getenv("TV_WEBHOOK_SECRET", ""),
+            allow_execution=os.getenv("RELAY_ALLOW_EXECUTION", "").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
 
