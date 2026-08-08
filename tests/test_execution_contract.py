@@ -229,11 +229,32 @@ def test_the_entry_is_submitted_before_any_protection(tmp_path):
 
 
 def test_an_unfilled_entry_is_cancelled_when_the_alert_asks(tmp_path):
-    """CANCEL_UNFILLED_AT_DEADLINE=YES is in Wei's live alert."""
-    broker = UnfilledBroker()
-    _run(CRYPTO_ALERT, _settings(tmp_path), broker, deadline_seconds=0)
+    """CANCEL_UNFILLED_AT_DEADLINE=YES is in Wei's live alert.
 
-    assert broker.canceled, "the unfilled entry was left working"
+    Called with the DEFAULT deadline, deliberately. My first version passed
+    `deadline_seconds=0`, which is the one value where a `deadline <= 0` guard
+    happens to fire — so an implementation that never waits and never cancels
+    satisfied the test while leaving the entry working forever. Specifying the
+    degenerate path and calling it a contract is the exact failure this file
+    exists to prevent, and I committed it here first.
+
+    A short but non-zero deadline is used so the test stays fast while still
+    exercising the real branch.
+    """
+    broker = UnfilledBroker()
+    _run(CRYPTO_ALERT, _settings(tmp_path), broker, deadline_seconds=0.05)
+
+    assert broker.canceled, (
+        "an unfilled entry with CANCEL_UNFILLED_AT_DEADLINE=YES was left working")
+
+
+def test_a_filled_entry_is_never_cancelled(tmp_path):
+    """The other half: the deadline must not cancel something already filled,
+    or the position is closed out from under the strategy."""
+    broker = RecordingBroker()
+    _run(CRYPTO_ALERT, _settings(tmp_path), broker, deadline_seconds=0.05)
+
+    assert not broker.canceled, "a filled entry was cancelled at the deadline"
 
 
 # ═════════════════════════════════════════════════════════════ idempotency
@@ -329,6 +350,53 @@ def test_an_equity_entry_keeps_its_day_time_in_force(tmp_path):
 
     entry = broker.orders_of("market")[0]
     assert entry["time_in_force"] == "day"
+
+
+def test_a_failed_protective_order_still_reports_the_open_position(tmp_path):
+    """The most expensive state in the system: filled, exposed, no stop.
+
+    Whatever the executor does about it — retry, flatten, escalate — the caller
+    must be told which order left them exposed. Raising without the entry id
+    means the only trace is a database row, and whoever catches the exception
+    cannot act on it.
+    """
+    class ProtectionRejected(RecordingBroker):
+        def submit_order(self, **kwargs):
+            if kwargs.get("type") != "market":
+                raise RuntimeError("broker refused the protective order")
+            return super().submit_order(**kwargs)
+
+    broker = ProtectionRejected()
+    settings = _settings(tmp_path)
+    store = EventStore(settings.db_path)
+
+    entry_id = None
+    try:
+        result = _run(CRYPTO_ALERT, settings, broker, store)
+        entry_id = getattr(result, "entry_order_id", None)
+    except Exception as exc:
+        entry_id = getattr(exc, "entry_order_id", None)
+
+    assert broker.position_qty("BTC/USD") > 0, "fixture: the position should be open"
+    assert entry_id, (
+        "the position is open and unprotected and the caller was not told "
+        "which order it belongs to")
+
+
+def test_protective_orders_outlive_the_session(tmp_path):
+    """A `day` protective stop expires at the close, so an overnight position
+    wakes up unprotected while the log still says a stop was placed.
+
+    The alert's TIF describes how the ENTRY should behave. Protection is a
+    different order with a different lifetime.
+    """
+    broker = RecordingBroker()
+    _run(EQUITY_ALERT, _settings(tmp_path), broker)
+
+    protection = [o for o in broker.submitted if o.get("type") != "market"][0]
+    assert protection["time_in_force"] == "gtc", (
+        f"protective stop uses {protection['time_in_force']!r}; it expires at "
+        "the close and leaves an overnight position unprotected")
 
 
 def test_the_broker_order_id_is_recorded_for_every_submission(tmp_path):
