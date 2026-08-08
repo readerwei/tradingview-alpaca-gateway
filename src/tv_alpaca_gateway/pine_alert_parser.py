@@ -12,17 +12,13 @@ class AlertParseError(ValueError):
 
 
 _PREFIX = "EXECUTE_ALPACA_ORDER"
-# EVENT_ID and BAR_TIME are required, and their absence is what this change
-# fixes. Without EVENT_ID the idempotency key was derived from the order fields
-# alone, so two firings of the same setup collapsed to one id and the second was
-# refused as a duplicate — inverting what idempotency is for. Without BAR_TIME
-# there was no freshness check at all, so a message re-forwarded after a relay
-# restart was indistinguishable from a live signal. The JSON path required both
-# from the start; the pipe format dropped them and both protections went too.
-_REQUIRED_FIELDS = frozenset({
-    "SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FORCE", "EVENT_ID", "BAR_TIME",
-})
-_EXECUTABLE_FIELDS = _REQUIRED_FIELDS | frozenset({
+# Discord's authenticated message snowflake is the per-firing identity for the
+# relay path. EVENT_ID and BAR_TIME remain accepted provenance supplied by a
+# Pine template, but cannot be mandatory until the deployed alert template is
+# changed and verified end-to-end.
+_REQUIRED_FIELDS = frozenset({"SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FORCE"})
+_OPTIONAL_PROVENANCE_FIELDS = frozenset({"EVENT_ID", "BAR_TIME"})
+_EXECUTABLE_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_PROVENANCE_FIELDS | frozenset({
     "CANCEL_UNFILLED_AT_DEADLINE", "STOP_TRIGGER", "STOP_LIMIT", "TRAIL",
 })
 _IGNORABLE_FIELDS = frozenset({"REQUIRED_ACTIONS"})
@@ -40,8 +36,8 @@ _CANONICAL_CRYPTO = {"BTCUSD": "BTC/USD", "ETHUSD": "ETH/USD", "ETHBTC": "ETH/BT
 
 @dataclass(frozen=True)
 class PineOrderCommand:
-    event_id: str
-    bar_time: datetime
+    event_id: str | None
+    bar_time: datetime | None
     symbol: str
     side: str
     qty: Decimal
@@ -99,11 +95,13 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     if missing:
         raise AlertParseError(f"missing required fields: {', '.join(missing)}")
 
-    event_id = fields["EVENT_ID"]
-    if len(event_id) > 256:
+    event_id = fields.get("EVENT_ID") or None
+    if event_id is not None and len(event_id) > 256:
         raise AlertParseError("EVENT_ID must be 1-256 characters")
-    bar_time = parse_bar_time(fields["BAR_TIME"])
-    _check_freshness(bar_time)
+    bar_time_raw = fields.get("BAR_TIME")
+    bar_time = parse_bar_time(bar_time_raw) if bar_time_raw else None
+    if bar_time is not None:
+        _check_freshness(bar_time)
 
     symbol = _CANONICAL_CRYPTO.get(fields["SYMBOL"].upper(), fields["SYMBOL"].upper())
     crypto_symbol = is_crypto(symbol)

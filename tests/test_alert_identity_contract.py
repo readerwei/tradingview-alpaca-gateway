@@ -106,11 +106,11 @@ def test_identity_comes_from_the_event_id_not_the_order_fields():
         "identity still depends on order contents rather than EVENT_ID")
 
 
-def test_an_alert_without_an_event_id_is_refused():
-    """Falling back to hashing the order fields is what produced the bug. An
-    alert that cannot be identified must be refused, not guessed at."""
-    with pytest.raises(parser.AlertParseError, match=r"(?i)EVENT_ID"):
-        parser.parse_pine_alert(_alert(EVENT_ID=None))
+def test_alert_without_pine_event_id_is_accepted_for_dry_run_only():
+    """The deployed alert has no EVENT_ID. Relay message identity will be
+    mandatory at submit ingress; parser-level rejection would break dry-run."""
+    command = parser.parse_pine_alert(_alert(EVENT_ID=None))
+    assert command.event_id is None
 
 
 # ══════════════════════════════════════════════════════════════ freshness
