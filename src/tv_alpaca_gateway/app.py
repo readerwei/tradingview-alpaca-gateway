@@ -40,6 +40,13 @@ def _pine_command_payload(command: PineOrderCommand) -> dict[str, Any]:
 
 MAX_PINE_ALERT_BYTES = 4096
 
+# Everything the dry-run deliberately does not evaluate. Kept beside the
+# endpoint so it cannot drift from what the route actually skips.
+_DRY_RUN_NOT_CHECKED = (
+    "allowlist", "sizing", "notional", "price_collar", "kill_switch",
+    "alert_freshness", "duplicate_event_id",
+)
+
 
 async def _read_limited_pine_body(request: Request) -> bytes:
     chunks: list[bytes] = []
@@ -157,7 +164,19 @@ def create_app(
         command_payload = _pine_command_payload(command)
         audit_id = "pine-dry-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
         store.record_pine_dry_run(audit_id, json.dumps(command_payload, sort_keys=True))
-        return {"dry_run": True, "audit_id": audit_id, "command": command_payload}
+        # State the scope in the response. "dry_run": true reads as "this is
+        # what would happen if I sent it", but nothing here consults the risk
+        # layer: an alert for an unlisted symbol, with no configured size, over
+        # the notional cap, with the kill switch on, still returns 200. Four
+        # refusals, one green light. Naming what was NOT checked costs nothing
+        # and stops a parse being mistaken for an approval.
+        return {
+            "dry_run": True,
+            "validated": "parse_only",
+            "not_checked": list(_DRY_RUN_NOT_CHECKED),
+            "audit_id": audit_id,
+            "command": command_payload,
+        }
 
     @app.post("/webhooks/tradingview")
     async def tradingview_webhook(request: Request, x_tv_secret: str | None = Header(default=None)) -> dict[str, Any]:

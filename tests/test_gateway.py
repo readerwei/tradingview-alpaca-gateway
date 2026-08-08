@@ -186,3 +186,87 @@ def test_pine_dry_run_never_looks_up_or_submits_to_broker(tmp_path):
     )
 
     assert response.status_code == 200
+
+
+def test_the_dry_run_states_that_it_only_parsed(tmp_path):
+    """"dry_run": true reads as "this is what would happen if I sent it".
+
+    It means "this parsed". With an unlisted symbol, no configured crypto size,
+    a notional over the cap and the kill switch on, the endpoint still returns
+    200 — four independent risk refusals behind one green response. Naming what
+    was not checked is what stops a parse being read as an approval.
+    """
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.app import create_app
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    secret = "s3cret"
+    settings = Settings(
+        paper_trading=True, trading_enabled=False, webhook_secret=secret,
+        allowed_symbols=frozenset({"QQQ"}), crypto_max_qty=Decimal("0"),
+        max_notional=10.0, db_path=tmp_path / "g.sqlite3",
+    )
+    client = TestClient(create_app(settings, None, EventStore(settings.db_path), None),
+                        raise_server_exceptions=False)
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC")
+
+    body = client.post("/webhooks/tradingview/pine/dry-run", content=alert,
+                       headers={"x-tv-secret": secret}).json()
+
+    assert body["validated"] == "parse_only"
+    # Each of these would have refused the order; none was consulted.
+    for skipped in ("allowlist", "sizing", "notional", "kill_switch"):
+        assert skipped in body["not_checked"]
+
+
+def test_the_not_checked_list_is_true_by_behaviour_not_by_comment(tmp_path):
+    """The list is a claim about what the route skips. Assert it behaviourally.
+
+    A broker whose every method raises proves the risk and price paths were not
+    taken: if the route consulted them the request would fail instead of
+    returning 200. Inspecting the source for `approve(` would also "pass" and
+    would break the moment the code is reformatted — the point is the behaviour,
+    not the spelling.
+    """
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.app import _DRY_RUN_NOT_CHECKED, create_app
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    class ExplodingBroker:
+        def submit(self, *a, **k):
+            raise AssertionError("dry-run reached the broker")
+
+        def get_order(self, *a, **k):
+            raise AssertionError("dry-run reached the broker")
+
+        def latest_trade_price(self, *a, **k):
+            raise AssertionError("dry-run reached market data")
+
+    secret = "s3cret"
+    settings = Settings(
+        paper_trading=True, trading_enabled=True, webhook_secret=secret,
+        allowed_symbols=frozenset({"QQQ"}), crypto_max_qty=Decimal("0"),
+        max_notional=1.0, db_path=tmp_path / "g.sqlite3",
+    )
+    client = TestClient(
+        create_app(settings, ExplodingBroker(), EventStore(settings.db_path), None),
+        raise_server_exceptions=False)
+
+    response = client.post(
+        "/webhooks/tradingview/pine/dry-run",
+        content=("EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=99 | "
+                 "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC"),
+        headers={"x-tv-secret": secret})
+
+    assert response.status_code == 200, "the risk or market-data path was taken"
+    assert response.json()["validated"] == "parse_only"
+    assert _DRY_RUN_NOT_CHECKED, "the list must not be empty while risk is skipped"
