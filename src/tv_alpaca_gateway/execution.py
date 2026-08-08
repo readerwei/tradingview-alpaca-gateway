@@ -151,8 +151,16 @@ def execute_pine_command(
     entry_id, entry_status = entry
 
     if entry_status != "filled":
-        return _handle_unfilled(command, entry_id, entry_status, event_id, broker,
-                                store, deadline_seconds, poll_interval)
+        # Wait it out. This may observe a fill, in which case the entry is
+        # filled and must be protected exactly like one that filled instantly —
+        # returning here was a real bug: an order accepted as `new` that filled
+        # a second later got no protective stop at all.
+        entry_status = _await_fill_or_cancel(
+            command, entry_id, entry_status, event_id, broker, store,
+            deadline_seconds, poll_interval)
+
+    if entry_status != "filled":
+        return ExecutionResult(entry_id, entry_status=entry_status)
 
     if not command.place_protective_stop_after_fill:
         return ExecutionResult(entry_id, entry_status=entry_status)
@@ -186,16 +194,18 @@ def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:
     return entry_id, status
 
 
-def _handle_unfilled(command, entry_id, entry_status, event_id, broker, store,
-                     deadline_seconds, poll_interval) -> ExecutionResult:
-    """Wait out the deadline, then cancel if it still has not filled.
+def _await_fill_or_cancel(command, entry_id, entry_status, event_id, broker,
+                          store, deadline_seconds, poll_interval) -> str:
+    """Wait out the deadline; return the status the entry ended up in.
 
-    The previous version only cancelled when `deadline_seconds <= 0`, so at the
-    default of 60 nothing waited and nothing cancelled — the unfilled entry
-    stayed working forever while the alert asked for the opposite.
+    Returns a STATUS rather than a result, because the caller must decide what
+    happens next. An earlier version returned an ExecutionResult directly, so
+    an entry that filled during polling skipped protection entirely — filled,
+    exposed, and no stop, which is the precise outcome this module exists to
+    prevent. Found in review by TradingBot; reproduced before fixing.
     """
     if not command.cancel_unfilled_at_deadline:
-        return ExecutionResult(entry_id, entry_status=entry_status)
+        return entry_status
 
     deadline = time.monotonic() + max(deadline_seconds, 0.0)
     status = entry_status
@@ -210,7 +220,7 @@ def _handle_unfilled(command, entry_id, entry_status, event_id, broker, store,
             else str(getattr(current, "status", status))
         if status == "filled":
             store.update(event_id, "broker_filled", broker_order_id=entry_id)
-            return ExecutionResult(entry_id, entry_status="filled")
+            return "filled"
 
     try:
         broker.cancel_order(entry_id)
@@ -221,7 +231,8 @@ def _handle_unfilled(command, entry_id, entry_status, event_id, broker, store,
         # It may have filled in the race between the last poll and the cancel.
         logger.warning("could not cancel %s at the deadline: %s", entry_id, exc)
         store.update(event_id, "cancel_failed", str(exc), broker_order_id=entry_id)
-    return ExecutionResult(entry_id, entry_status=status)
+        return status
+    return "canceled"
 
 
 def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
@@ -262,7 +273,12 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
                            attempt, PROTECTION_ATTEMPTS, exc)
             continue
         protection_id = str(protection["id"])
-        store.update(event_id, "protection_submitted", broker_order_id=entry_id)
+        # The protective order's id is recorded too. Without it a reconnect
+        # resync can find the entry and not the stop, so an order that exists
+        # at the broker is invisible to reconciliation.
+        store.update(event_id, "protection_submitted",
+                     f"protection_order_id={protection_id}",
+                     broker_order_id=entry_id)
         return ExecutionResult(entry_id, protection_id, entry_status, "submitted")
 
     return _flatten(command, symbol, entry_id, entry_status, event_id, broker,
@@ -286,7 +302,7 @@ def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
 
     logger.error("could not protect %s; flattening %s", symbol, held_qty)
     try:
-        broker.submit_order(
+        closing = broker.submit_order(
             symbol=symbol, qty=held_qty,
             side="sell" if command.side == "buy" else "buy",
             type="market", time_in_force=PROTECTION_TIME_IN_FORCE,
@@ -301,7 +317,8 @@ def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
             f"{symbol} {held_qty} is open, unprotected, and could not be "
             f"closed: {exc}", entry_order_id=entry_id) from exc
 
-    store.update(event_id, "flattened_unprotected", str(last_error),
+    store.update(event_id, "flattened_unprotected",
+                 f"flatten_order_id={str(closing.get('id', ''))}; {last_error}",
                  broker_order_id=entry_id)
     return ExecutionResult(entry_id, entry_status=entry_status,
                            protection_status="flattened")

@@ -528,3 +528,55 @@ def test_the_broker_order_id_is_recorded_for_every_submission(tmp_path):
     assert getattr(result, "entry_order_id", None) or (
         isinstance(result, dict) and result.get("entry_order_id")), (
         "the entry's broker order id was not returned")
+
+
+# ═══════════════════ a fill observed while polling is still a fill (regression)
+
+class _FillsDuringPolling(RecordingBroker):
+    """Accepted as `new`, filled by the first poll.
+
+    The ordinary case for a marketable order that does not fill instantly, and
+    the one the first engine got wrong.
+    """
+
+    def submit_order(self, **kwargs):
+        result = super().submit_order(**kwargs)
+        if kwargs.get("type") == "market" and kwargs["side"] == "buy":
+            result["status"] = "new"
+        return result
+
+    def get_order(self, order_id):
+        return {"id": order_id, "status": "filled", "filled_qty": "0.001"}
+
+
+def test_an_entry_that_fills_during_polling_is_still_protected(tmp_path):
+    """Found by TradingBot in review of the first engine.
+
+    The deadline handler returned as soon as polling observed a fill, so the
+    command never reached the protection path: entry accepted as `new`, filled
+    a second later, no stop placed. Filled and unprotected — the exact outcome
+    the module exists to prevent, reached by the ordinary route rather than an
+    exotic one.
+
+    Reproduced before fixing: 0.0009975 held, zero stop orders.
+    """
+    broker = _FillsDuringPolling()
+    result = _run(_crypto_alert(), _settings(tmp_path), broker,
+                  deadline_seconds=1.5, poll_interval=0.2)
+
+    assert result.entry_status == "filled"
+    assert broker.orders_of("stop_limit"), (
+        "the entry filled during polling and no protective stop was placed")
+    assert Decimal(str(broker.orders_of("stop_limit")[0]["qty"])) == \
+        broker.position_qty("BTC/USD")
+
+
+def test_an_entry_that_never_fills_is_still_cancelled(tmp_path):
+    """The other half: the fix must not turn every unfilled entry into a
+    protection attempt on a position that does not exist."""
+    broker = UnfilledBroker()
+    _run(_crypto_alert(), _settings(tmp_path), broker,
+         deadline_seconds=0.4, poll_interval=0.1)
+
+    assert broker.canceled, "an unfilled entry was left working"
+    assert not broker.orders_of("stop_limit"), "protected a position that is not held"
