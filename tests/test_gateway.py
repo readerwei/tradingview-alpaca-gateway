@@ -73,6 +73,8 @@ def test_symbol_allowlist_rejects_unapproved_symbol(tmp_path):
     assert broker.orders == []
 
 
+
+
 def test_order_reconciliation_reads_broker_state(tmp_path):
     client, broker = make_app(tmp_path, enabled=True)
     response = client.post("/webhooks/tradingview", json=payload("reconcile-me"), headers={"x-tv-secret": "secret"})
@@ -80,3 +82,107 @@ def test_order_reconciliation_reads_broker_state(tmp_path):
     result = reconcile("reconcile-me", order_id, broker, EventStore(tmp_path / "events.sqlite3"))
     assert result.status == "accepted"
     assert result.order_id == order_id
+
+
+PINE_ALERT = (
+    "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
+    "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | "
+    "CANCEL_UNFILLED_AT_DEADLINE=YES | PLACE_PROTECTIVE_STOP_AFTER_FILL | "
+    "STOP_TRIGGER=65000 | STOP_LIMIT=64950 | TRAIL=NONE | "
+    "REQUIRED_ACTIONS=SUBMIT_ORDER | DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL"
+)
+
+
+def test_pine_dry_run_parses_and_audits_without_broker_submission(tmp_path):
+    client, broker = make_app(tmp_path, enabled=True)
+    response = client.post(
+        "/webhooks/tradingview/pine/dry-run",
+        content=PINE_ALERT,
+        headers={"x-tv-secret": "secret", "content-type": "text/plain"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["dry_run"] is True
+    assert result["command"] == {
+        "symbol": "BTC/USD",
+        "side": "buy",
+        "qty": "0.001",
+        "order_type": "market",
+        "time_in_force": "gtc",
+        "cancel_unfilled_at_deadline": True,
+        "place_protective_stop_after_fill": True,
+        "stop_trigger": "65000",
+        "stop_limit": "64950",
+        "trail": None,
+    }
+    assert client.app.state.store.pine_dry_run_status(result["audit_id"]) == "pine_dry_run"
+    assert broker.orders == []
+
+
+def test_pine_dry_run_rejects_invalid_alert_without_broker_submission(tmp_path):
+    client, broker = make_app(tmp_path, enabled=True)
+    response = client.post(
+        "/webhooks/tradingview/pine/dry-run",
+        content=PINE_ALERT.replace("QTY=0.001", "QTY=0"),
+        headers={"x-tv-secret": "secret", "content-type": "text/plain"},
+    )
+
+    assert response.status_code == 422
+    assert broker.orders == []
+
+
+def test_pine_dry_run_requires_the_webhook_secret(tmp_path):
+    client, broker = make_app(tmp_path, enabled=True)
+    response = client.post(
+        "/webhooks/tradingview/pine/dry-run", content=PINE_ALERT,
+        headers={"x-tv-secret": "wrong", "content-type": "text/plain"},
+    )
+
+    assert response.status_code == 401
+    assert broker.orders == []
+
+
+def test_pine_dry_run_rejects_oversized_body_without_broker_submission(tmp_path):
+    client, broker = make_app(tmp_path, enabled=True)
+    response = client.post(
+        "/webhooks/tradingview/pine/dry-run", content=b"x" * 4097,
+        headers={"x-tv-secret": "secret", "content-type": "text/plain"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Pine alert exceeds 4096 byte limit"
+    assert broker.orders == []
+
+
+def test_pine_dry_run_cannot_block_an_executable_event_id(tmp_path):
+    client, broker = make_app(tmp_path, enabled=True)
+    dry_run = client.post(
+        "/webhooks/tradingview/pine/dry-run", content=PINE_ALERT,
+        headers={"x-tv-secret": "secret", "content-type": "text/plain"},
+    )
+    assert dry_run.status_code == 200
+
+    executable = client.post(
+        "/webhooks/tradingview", json=payload(dry_run.json()["audit_id"]),
+        headers={"x-tv-secret": "secret"},
+    )
+    assert executable.status_code == 200
+    assert executable.json()["executed"] is True
+    assert len(broker.orders) == 1
+
+
+def test_pine_dry_run_never_looks_up_or_submits_to_broker(tmp_path):
+    client, broker = make_app(tmp_path, enabled=True)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("dry run reached broker")
+
+    broker.latest_trade_price = forbidden
+    broker.submit = forbidden
+    response = client.post(
+        "/webhooks/tradingview/pine/dry-run", content=PINE_ALERT,
+        headers={"x-tv-secret": "secret", "content-type": "text/plain"},
+    )
+
+    assert response.status_code == 200
