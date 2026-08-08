@@ -85,7 +85,27 @@ class GatewayRelay:
             pass
 
 
+def handle_message(message: Any, settings: RelaySettings, relay: GatewayRelay) -> bool:
+    """Admit and forward one Discord message.
+
+    Returns True only when the raw Pine text was forwarded. Rejections are
+    visible at WARNING level; forwarding failures remain visible as errors and
+    are not retried.
+    """
+    try:
+        payload = admit_message(message, settings)
+        relay.forward(payload)
+        return True
+    except ValueError as exc:
+        logger.warning("relay ignored a message: %s", exc)
+        return False
+    except Exception as exc:
+        print(f"relay forwarding failed: {exc}")
+        return False
+
+
 def run_relay() -> None:
+    logging.basicConfig(level=logging.INFO)
     try:
         import discord
     except ImportError as exc:
@@ -103,12 +123,6 @@ def run_relay() -> None:
 
     @client.event
     async def on_message(message):
-        try:
-            payload = admit_message(message, settings)
-            relay.forward(payload)
-        except ValueError as exc:
-            logger.info("relay ignored a message: %s", exc)
-        except Exception as exc:
-            print(f"relay forwarding failed: {exc}")
+        handle_message(message, settings, relay)
 
     client.run(settings.token)
