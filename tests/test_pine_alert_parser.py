@@ -31,13 +31,47 @@ def test_parses_relevant_fields_from_current_pine_alert():
     assert command.trail is None
 
 
-def test_ignores_unrelated_instruction_fields():
+def test_allows_documented_non_executable_instruction_fields():
     command = parse_pine_alert(
-        ALERT + " | REQUIRED_ACTIONS=IGNORE_THIS_TOO | UNKNOWN_FUTURE_FIELD=value"
+        ALERT + " | REQUIRED_ACTIONS=IGNORE_THIS_TOO"
+        " | DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL"
     )
 
     assert command.symbol == "BTC/USD"
     assert command.stop_limit == Decimal("64950")
+
+
+def test_accepts_leading_transport_decoration_before_unique_prefix():
+    command = parse_pine_alert("<@12345> " + ALERT)
+
+    assert command.symbol == "BTC/USD"
+
+
+@pytest.mark.parametrize(
+    ("alert", "message"),
+    [
+        (ALERT.replace("TRAIL=NONE", "TRAIL=250"), "TRAIL is unsupported for crypto"),
+        (ALERT.replace("TIME_IN_FORCE=GTC", "TIME_IN_FORCE=DAY"),
+         "TIME_IN_FORCE is not supported"),
+    ],
+)
+def test_rejects_crypto_incompatible_controls_at_parse_time(alert, message):
+    with pytest.raises(AlertParseError, match=message):
+        parse_pine_alert(alert)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["UNKNOWN_FUTURE_FIELD=value", "TRIAL=250", "STOP_TRIGER=65000"],
+)
+def test_rejects_unrecognised_fields(field):
+    with pytest.raises(AlertParseError, match="unrecognised field"):
+        parse_pine_alert(ALERT + " | " + field)
+
+
+def test_rejects_multiple_execution_prefixes():
+    with pytest.raises(AlertParseError, match="exactly one"):
+        parse_pine_alert(ALERT + " | EXECUTE_ALPACA_ORDER")
 
 
 @pytest.mark.parametrize(
