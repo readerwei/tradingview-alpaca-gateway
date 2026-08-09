@@ -76,8 +76,44 @@ class LotSupervisor:
                 logger.exception("could not restore lot %s on %s", event_id, symbol)
                 continue
             self._remember(lot)
+            self._seed_trail(lot)
             restored.append(lot)
         return restored
+
+    def _seed_trail(self, lot) -> None:
+        """Replay recent completed bars so a restarted runner trails from the
+        right place.
+
+        Without it the stop sits at its last persisted value until a live bar
+        arrives — up to a minute on 1m, and indefinitely if the one
+        market-data connection slot is held by another process. The lot would
+        look managed and would not be.
+
+        Only the runner stage needs it; before that the trail is not moving.
+        Bars go through `on_bar`, so the no-trades rule applies here too rather
+        than being reimplemented — a quote-only bar must not seed a stop at a
+        price nothing traded at, and least of all at startup where there is
+        nothing to correct it.
+        """
+        if lot.stage != "runner":
+            return
+        try:
+            bars = self.broker.recent_bars(lot.symbol, lot.timeframe)
+        except Exception:
+            # Startup must survive a market-data outage. A lot with a stale
+            # trail is worse than one with a fresh trail and better than a
+            # gateway that will not start at all.
+            logger.exception("could not seed the trail for lot %s; it will "
+                             "trail from its stored stop", lot.event_id)
+            return
+        for bar in bars:
+            lot.on_bar(high=Decimal(str(bar.high)), low=Decimal(str(bar.low)),
+                       close=Decimal(str(bar.close)),
+                       trade_count=getattr(bar, "trade_count", None))
+        if bars:
+            logger.info("seeded lot %s with %d bar(s); working stop %s",
+                        lot.event_id, len(bars), lot.working_stop)
+        self._remember(lot)
 
     def adopt(self, lot: Lot) -> Lot:
         self._remember(lot)

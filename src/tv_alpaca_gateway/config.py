@@ -30,6 +30,10 @@ class Settings:
     market_symbols: tuple[str, ...] = ("QQQ",)
     crypto_symbols: tuple[str, ...] = ()
     stream_enabled: bool = False
+    # How often every open lot is re-checked against the broker. Alpaca
+    # does not replay trade_updates missed while the socket was down, so
+    # without this a lot keeps its pre-outage state forever. 0 disables.
+    lot_reconcile_seconds: float = 60.0
     discord_webhook_url: str = ""
 
     @classmethod
@@ -67,6 +71,7 @@ class Settings:
                 if t.strip()
             ),
             stream_enabled=_bool_env("ALPACA_STREAM_ENABLED", False),
+            lot_reconcile_seconds=float(os.getenv("LOT_RECONCILE_SECONDS", "60")),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
         )
 

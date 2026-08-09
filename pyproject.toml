@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Paper-only TradingView webhook gateway for Alpaca order simulation"
 requires-python = ">=3.11"
 dependencies = [
+    "alpaca-py>=0.42",
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.30,<1",
   "websockets>=13,<16",

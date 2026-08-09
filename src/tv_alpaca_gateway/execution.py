@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from . import assets
+from . import assets, exit_manager, exit_plans
 from .config import Settings
 from .pine_alert_parser import PineOrderCommand
 from .store import EventStore
@@ -174,6 +174,18 @@ def execute_pine_command(
     if command.qty * reference_price > _decimal(settings.max_notional):
         raise ExecutionError("notional exceeds configured limit")
 
+    # One lot at a time per symbol — Wei's rule, and on crypto it is also
+    # forced: the open lot's stop is a resting sell, and a resting sell makes
+    # Alpaca refuse the entry buy at submission with NO order record at all.
+    # Refusing here produces a reason; letting it through produces silence.
+    open_lot_id = store.open_lot_for(symbol)
+    if open_lot_id and command.exit_plan:
+        store.record_refusal(command.event_id or "", "lot_already_open",
+                             f"{symbol} is managed by lot {open_lot_id}")
+        raise ExecutionError(
+            f"{symbol} already has an open managed lot ({open_lot_id}); "
+            f"one lot at a time. Close it or let its ladder finish first")
+
     event_id = _command_id(command, delivery_id)
     if not store.claim(event_id):
         logger.info("duplicate delivery of %s; not resubmitting", command.event_id)
@@ -203,7 +215,7 @@ def execute_pine_command(
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     return _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
-                               event_id, broker, store, position_before)
+                               event_id, broker, store, position_before, settings)
 
 
 def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:
@@ -318,7 +330,8 @@ def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
 
 def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
                         event_id, broker, store,
-                        position_before: Decimal = Decimal("0")) -> ExecutionResult:
+                        position_before: Decimal = Decimal("0"),
+                        settings=None) -> ExecutionResult:
     """Protect what THIS entry added, not the whole position.
 
     Sizing from the total position was wrong twice over.
@@ -346,6 +359,17 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
             "nothing to protect", symbol, position_before, position_after)
         return ExecutionResult(entry_id, entry_status=entry_status)
 
+    if command.exit_plan:
+        managed = _open_managed_lot(command, symbol, entry_id, entry_status,
+                                    event_id, broker, store, held_qty, settings)
+        if managed is not None:
+            return managed
+        # Falling through is deliberate. A ladder that cannot be built is a
+        # reason to place the ordinary stop, not a reason to leave the position
+        # naked or to flatten a fill the user wanted.
+        logger.warning("exit plan %s could not be armed for %s; falling back "
+                       "to a single protective stop", command.exit_plan, symbol)
+
     kwargs = _protection_kwargs(command, symbol, crypto, held_qty, event_id)
     last_error: Exception | None = None
     for attempt in range(1, PROTECTION_ATTEMPTS + 1):
@@ -371,6 +395,66 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
 
     return _flatten(command, symbol, entry_id, entry_status, event_id, broker,
                     store, last_error, held_qty)
+
+
+def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
+                      broker, store, held_qty, settings=None) -> ExecutionResult | None:
+    """Hand this entry to the exit manager. None means it could not be armed.
+
+    The disaster stop is placed by `open_lot`, so this REPLACES the ordinary
+    protective order rather than adding to it. Two resting sells for the same
+    coins is not double protection — the second is refused for want of
+    available quantity, and on crypto both then block the next entry.
+
+    The entry price comes from the broker's `filled_avg_price`, never from the
+    signal: R is entry minus stop, and a market order into a fast tape does not
+    fill where the alert fired.
+    """
+    # A lot on a symbol nobody subscribed to is the quietest failure in this
+    # system. ALLOWED_SYMBOLS says what may be traded; MARKET_SYMBOLS and
+    # CRYPTO_SYMBOLS say what the sockets listen to, and nothing reconciled
+    # them. The ladder would arm, the disaster stop would rest, every order
+    # would look right — and no bar would ever arrive, so the runner would
+    # never trail. Falling back to an ordinary stop is honest about that;
+    # pretending to manage a lot we cannot see is not.
+    if settings is not None:
+        streamed = {assets.normalise(t) for t in
+                    (*settings.market_symbols, *settings.crypto_symbols)}
+        if assets.normalise(symbol) not in streamed:
+            store.record_refusal(
+                command.event_id or "", "symbol_not_streamed",
+                f"{symbol} is tradable but not subscribed; add it to "
+                f"{'CRYPTO_SYMBOLS' if assets.is_crypto(symbol) else 'MARKET_SYMBOLS'}")
+            logger.error(
+                "%s is in ALLOWED_SYMBOLS but not in the stream subscription, so "
+                "no bars will arrive and the runner could never trail; placing an "
+                "ordinary protective stop instead of an exit plan", symbol)
+            return None
+
+    try:
+        entry_price = broker.fill_price(entry_id)
+        if not entry_price:
+            raise ExecutionError(
+                f"no fill price for {entry_id}; R cannot be measured and every "
+                f"target would sit at the wrong distance from the real risk")
+        lot = exit_manager.Lot.opened(
+            event_id=event_id, symbol=symbol, entry_price=entry_price,
+            initial_stop=command.stop_trigger, held_qty=held_qty,
+            timeframe=command.interval, plan=exit_plans.resolve(command.exit_plan),
+            min_order_size=broker.min_order_size(symbol))
+        exit_manager.open_lot(lot, broker)
+    except Exception as exc:
+        logger.warning("could not arm exit plan %s on %s: %s",
+                       command.exit_plan, symbol, exc)
+        return None
+
+    store.save_lot(event_id, symbol, lot.stage, exit_manager.dump_lot(lot))
+    store.update(event_id, "lot_opened",
+                 f"plan={command.exit_plan} stop={lot.stop_order_id}",
+                 broker_order_id=entry_id)
+    if lot.stop_order_id:
+        store.record_broker_order(lot.stop_order_id, event_id, "protection", "new")
+    return ExecutionResult(entry_id, lot.stop_order_id, entry_status, "lot_opened")
 
 
 def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
