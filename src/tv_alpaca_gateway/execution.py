@@ -136,7 +136,21 @@ def execute_pine_command(
 ) -> ExecutionResult:
     settings.validate()
     if not settings.trading_enabled:
-        logger.info("kill switch on; %s not submitted", command.event_id)
+        # Recorded, not merely logged. A refusal that leaves no trace is
+        # indistinguishable from an alert that never arrived — both look like
+        # an empty database and a quiet log, which is exactly the ambiguity
+        # that made a blocked alert unprovable.
+        #
+        # The kill switch is the last line of defence, and an audit that
+        # cannot say what it stopped is not an audit. If it were mis-set for a
+        # week, nothing would show what failed to trade.
+        event_id = _command_id(command, delivery_id)
+        store.record_refusal(
+            event_id, "kill_switch",
+            f"TRADING_ENABLED=false; {command.side} {command.qty} "
+            f"{command.symbol} was not submitted")
+        logger.warning("kill switch engaged: refused %s %s %s (event %s)",
+                       command.side, command.qty, command.symbol, command.event_id)
         return ExecutionResult(None, entry_status="kill_switch")
 
     symbol = assets.resolve(command.symbol, settings.allowed_symbols)

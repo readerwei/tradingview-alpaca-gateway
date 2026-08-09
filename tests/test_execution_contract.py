@@ -736,3 +736,49 @@ def test_a_failed_protection_flattens_only_this_entry(tmp_path):
         "the flatten closed more than this entry added")
     assert broker.position_qty("BTC/USD") == Decimal("0.004985"), (
         "the pre-existing position was closed too")
+
+
+def test_a_kill_switch_refusal_is_recorded(tmp_path):
+    """A refusal that leaves no trace cannot be audited.
+
+    The kill switch previously returned without writing anything, so a blocked
+    alert and an alert that never arrived produced the same empty database and
+    the same quiet log. That ambiguity made it impossible to prove what
+    happened to a real alert.
+
+    It is the last line of defence: if it were mis-set for a week, nothing
+    would show what failed to trade.
+    """
+    settings = _settings(tmp_path, trading_enabled=False)
+    store = EventStore(settings.db_path)
+    broker = RecordingBroker()
+
+    result = _run(_crypto_alert(event_id="blocked-1"), settings, broker, store)
+
+    assert result.entry_status == "kill_switch"
+    assert broker.submitted == [], "the kill switch did not stop the order"
+    assert store.refusals_for("pine-exec-blocked-1") == [
+        ("kill_switch", "TRADING_ENABLED=false; buy 0.001 BTC/USD was not submitted")
+    ], ("the refusal left no record; a blocked alert is indistinguishable from "
+        "one that never arrived")
+
+
+def test_a_kill_switch_refusal_does_not_consume_the_event_id(tmp_path):
+    """Blocking must not poison the id.
+
+    If a refusal claimed the event permanently, re-firing the same alert after
+    arming would be rejected as a duplicate — the kill switch would silently
+    become a one-shot ban on that signal.
+    """
+    blocked = _settings(tmp_path, trading_enabled=False)
+    store = EventStore(blocked.db_path)
+    _run(_crypto_alert(event_id="retry-after-arming"), blocked,
+         RecordingBroker(), store)
+
+    armed = _settings(tmp_path, trading_enabled=True)
+    broker = RecordingBroker()
+    _run(_crypto_alert(event_id="retry-after-arming"), armed, broker, store)
+
+    assert broker.orders_of("market"), (
+        "the same alert was refused after arming; the kill switch consumed "
+        "its identity")
