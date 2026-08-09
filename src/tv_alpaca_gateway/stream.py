@@ -259,6 +259,14 @@ class _AlpacaSocket:
         # discarding non-matches ate the auth reply on endpoints that send no
         # greeting.
         self._buffer: list[dict[str, Any]] = []
+        # Whether this socket is actually carrying data, and why not.
+        # /healthz reported ok:true while the trade-update stream 403'd in a
+        # reconnect loop all day — the module docstring warned that getting
+        # this wrong "does not look broken, it looks quiet", and then nothing
+        # was built that could see it. A stream nobody can observe is a stream
+        # nobody knows is down.
+        self.connected = False
+        self.last_error: str | None = None
 
     def connect(self):
         return websockets.connect(
@@ -414,13 +422,15 @@ class AlpacaMarketStream(_MarketDataSocket):
                     else self.settings.market_symbols)
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
-        await _run_with_reconnect(self._run_once, stop_event, self.on_error, self.label)
+        await _run_with_reconnect(self._run_once, stop_event, self.on_error,
+                                  self.label, socket=self)
 
     async def _run_once(self) -> None:
         self._buffer.clear()          # frames never survive a reconnect
         async with self.connect() as websocket:
             await self.authenticate(websocket)
             await self.subscribe(websocket, self.symbols)
+            self.connected, self.last_error = True, None
             async for raw in websocket:
                 for message in _frames(raw):
                     event = parse_market_message(message)
@@ -447,13 +457,14 @@ class AlpacaTradeUpdateStream(_TradingSocket):
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         await _run_with_reconnect(self._run_once, stop_event, self.on_error,
-                                  "trade_updates")
+                                  "trade_updates", socket=self)
 
     async def _run_once(self) -> None:
         self._buffer.clear()          # frames never survive a reconnect
         async with self.connect() as websocket:
             await self.authenticate(websocket)
             await self.listen(websocket, ["trade_updates"])
+            self.connected, self.last_error = True, None
             if self.on_connected is not None:
                 # Resync BEFORE reading, so anything missed during the outage is
                 # recovered even if no new update ever arrives.
@@ -465,9 +476,16 @@ class AlpacaTradeUpdateStream(_TradingSocket):
                         await _invoke(self.on_update, event)
 
 
+def _mark_down(socket: Any, reason: str) -> None:
+    if socket is not None:
+        socket.connected = False
+        socket.last_error = reason
+
+
 async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]],
                               stop_event: asyncio.Event,
-                              on_error: Callback | None, stream_name: str) -> None:
+                              on_error: Callback | None, stream_name: str,
+                              socket: Any = None) -> None:
     delay = 1.0
     loop = asyncio.get_running_loop()
     while not stop_event.is_set():
@@ -477,6 +495,7 @@ async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]],
             # Returning normally means the server closed the socket cleanly.
             # That is a disconnect, not a success.
             logger.info("Alpaca %s stream closed by server", stream_name)
+            _mark_down(socket, "closed by server")
         except asyncio.CancelledError:
             raise
         except ConnectionLimitExceeded as exc:
@@ -485,14 +504,17 @@ async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]],
             # change. Logged at ERROR because a warning in a reconnect loop is
             # what made this look like ordinary flakiness.
             logger.error("Alpaca %s stream cannot start: %s", stream_name, exc)
+            _mark_down(socket, str(exc))
             await _invoke(on_error, exc)
             delay = 30.0
         except (ConnectionClosed, OSError, RuntimeError, ValueError,
                 asyncio.TimeoutError, json.JSONDecodeError) as exc:
             logger.warning("Alpaca %s stream disconnected: %s", stream_name, exc)
+            _mark_down(socket, f"{type(exc).__name__}: {exc}")
             await _invoke(on_error, exc)
         except Exception as exc:  # keep the persistent stream alive, but surface it
             logger.exception("unexpected Alpaca %s stream failure", stream_name)
+            _mark_down(socket, f"{type(exc).__name__}: {exc}")
             await _invoke(on_error, exc)
 
         # Only a connection that stayed up earns a reset. Resetting on every
@@ -550,6 +572,27 @@ class AlpacaStreamManager:
             if stream is not None:
                 self.tasks.append(
                     asyncio.create_task(stream.run_forever(self.stop_event), name=name))
+
+    def health(self) -> dict:
+        """What each socket is actually doing, for /healthz.
+
+        The trade-update stream carries fill routing for the exit ladder. With
+        it down the ladder still works — the reconcile timer catches every fill
+        within its interval, and firing a rung resizes the disaster stop BEFORE
+        selling, so nothing is ever over-committed — but breakeven and the
+        bookkeeping lag by up to that interval. A degradation worth seeing
+        rather than inferring from logs, which is how the 403 was found.
+        """
+        out = {}
+        for name, socket in (("market", self.market), ("crypto", self.crypto),
+                             ("trade_updates", self.trade_updates)):
+            if socket is None:
+                out[name] = "disabled"
+            elif socket.connected:
+                out[name] = "connected"
+            else:
+                out[name] = f"down: {socket.last_error or 'not yet connected'}"
+        return out
 
     async def stop(self, timeout: float = 5.0) -> None:
         """Stop both streams, and do not hang if they will not stop politely.

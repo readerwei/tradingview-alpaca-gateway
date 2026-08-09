@@ -257,3 +257,57 @@ def test_the_stream_was_given_the_handlers_it_is_supposed_to_have(tmp_path, hand
     app = _streaming_app(tmp_path, _Broker())
     assert getattr(app.state.stream.crypto, handler) is not None, (
         f"the crypto socket was constructed without {handler}")
+
+
+# ══════════════════════════════════════════════ a stream nobody can see
+
+def test_healthz_reports_a_stream_that_is_down(tmp_path):
+    """The gap this closes, found the hard way.
+
+    The trade-update stream spent a day returning 403 inside a reconnect loop
+    while `/healthz` answered `ok: true`. `stream.py`'s own docstring says
+    getting this wrong "does not look broken; it looks quiet" — and then
+    nothing was built that could see it. It was found by reading logs, which
+    is not a check.
+    """
+    settings = _settings(tmp_path, stream_enabled=True,
+                         alpaca_key_id="PK-test", alpaca_secret_key="s",
+                         crypto_symbols=("BTC/USD",))
+    app = create_app(settings, _Broker(), EventStore(settings.db_path))
+    app.state.stream.trade_updates.last_error = "InvalidStatus: HTTP 403"
+
+    health = app.state.stream.health()
+
+    assert health["trade_updates"].startswith("down"), health
+    assert "403" in health["trade_updates"], "the reason was not carried through"
+
+
+def test_healthz_is_not_ok_while_a_stream_is_down(tmp_path):
+    """`ok` has to mean the thing an operator reads it as. A gateway answering
+    HTTP while carrying no market data is not ok — it is exactly the state that
+    looks fine and silently degrades the ladder to reconcile-interval
+    granularity."""
+    from fastapi.testclient import TestClient
+
+    settings = _settings(tmp_path, stream_enabled=True,
+                         alpaca_key_id="PK-test", alpaca_secret_key="s",
+                         crypto_symbols=("BTC/USD",))
+    app = create_app(settings, _Broker(), EventStore(settings.db_path))
+    body = TestClient(app).get("/healthz").json()
+
+    assert body["ok"] is False, "ok stayed true with every socket down"
+    assert body["streams"]["crypto"].startswith("down")
+
+
+def test_healthz_still_hides_the_secrets(tmp_path):
+    """Adding a field is the moment this gets broken. The endpoint is
+    unauthenticated."""
+    from fastapi.testclient import TestClient
+
+    settings = _settings(tmp_path, webhook_secret="s3cret",
+                         alpaca_key_id="PK-real", alpaca_secret_key="sh-h-h")
+    body = TestClient(create_app(settings, _Broker(),
+                                 EventStore(settings.db_path))).get("/healthz").text
+
+    for secret in ("s3cret", "PK-real", "sh-h-h", str(settings.db_path)):
+        assert secret not in body, f"{secret!r} leaked into /healthz"
