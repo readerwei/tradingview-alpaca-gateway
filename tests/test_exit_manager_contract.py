@@ -487,6 +487,91 @@ def test_reconciliation_recovers_a_rung_that_filled_while_we_were_down():
     assert rebuilt.working_stop == ENTRY, "breakeven was not applied on recovery"
 
 
+def test_reconciliation_re_places_a_stop_that_vanished_while_we_were_down():
+    """Raised by TradingBot reviewing #31, and the most dangerous of the four.
+
+    Carrying `stop_order_id` over from the database means a stop cancelled or
+    filled while the process was down comes back as still resting. `_reserve()`
+    short-circuits when it believes the reservation already matches, so the lot
+    would sit unprotected and never notice — a restart that silently disarms
+    the protection is worse than one that crashes.
+    """
+    broker = _RecordingBroker()
+    stored = _lot()
+    stored.stop_order_id, stored.reserved_qty = "ord-gone", HELD   # DB says protected
+
+    rebuilt = manager.reconcile_lot(stored, broker)
+
+    stops = [o for o in broker.submitted if o["type"] in ("stop", "stop_limit")]
+    assert stops, "reconciliation left the position with no resting stop"
+    assert Decimal(str(stops[-1]["qty"])) == HELD
+    assert rebuilt.stop_order_id == stops[-1]["id"]
+
+
+def test_reconciliation_adopts_a_stop_that_is_still_resting():
+    """The other half: a stop that survived must not be cancelled and re-placed
+    on every restart, which would churn orders and open a gap each time."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    placed = len(broker.submitted)
+
+    rebuilt = manager.reconcile_lot(lot, broker)
+
+    assert len(broker.submitted) == placed, "reconciliation re-placed a live stop"
+    assert rebuilt.reserved_qty == HELD
+
+
+def test_reconciliation_counts_fills_from_every_attempt_at_a_rung():
+    """A rung that filled partially and was topped up has a second order under
+    a different client id. Looking only at the base id reconstructs it as
+    unfilled — and sells the tranche a second time."""
+    broker = _RecordingBroker()
+    stored = _lot()
+    tranche = stored.tranche_qty(1)
+    stored.rung_attempts[1] = 2
+    broker.orders["pine-exec-evt-1-tp1"] = {"status": "filled",
+                                            "filled_qty": str(tranche / 3)}
+    broker.orders["pine-exec-evt-1-tp1r1"] = {"status": "filled",
+                                              "filled_qty": str(tranche * 2 / 3)}
+
+    rebuilt = manager.reconcile_lot(stored, broker)
+
+    assert rebuilt.rung_filled(1), "a topped-up rung came back as unfilled"
+    assert rebuilt.working_stop == ENTRY
+
+
+def test_a_redelivered_fill_is_counted_once():
+    """Alpaca's trade_updates stream can redeliver. A duplicate partial would
+    otherwise decrement twice, so the lot believes it holds less than it does
+    and under-sizes its own protection. A deterministic client order id
+    prevents a double *submission* and does nothing about this."""
+    lot = manager.open_lot(_lot(), _RecordingBroker())
+    before = lot.remaining_qty
+
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="evt-99")
+    once = lot.remaining_qty
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="evt-99")
+
+    assert once == before - lot.tranche_qty(1)
+    assert lot.remaining_qty == once, "a redelivered fill was counted twice"
+
+
+def test_the_remainder_exit_cancels_a_rung_still_in_flight():
+    """A take-profit is a market order and does not rest for long, but "not
+    long" is not "never". One filling alongside the remainder exit sells the
+    same coins twice — rejected on crypto, an unintended short elsewhere."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.advance_to_runner()
+    lot.on_bar(high=ENTRY + 3 * R, low=ENTRY + R, close=ENTRY + 3 * R, trade_count=9)
+    lot.pending_rungs.add(1)
+    lot.rung_order_ids[1] = ["ord-tp-inflight"]
+
+    lot.on_price(ENTRY + R - Decimal("1"))
+
+    assert "ord-tp-inflight" in broker.cancelled, "an in-flight rung was left live"
+
+
 def test_reconciliation_does_not_write_back_into_the_lot_it_read():
     """`dataclasses.replace` passes the stored lot's own sets straight through.
 
@@ -500,6 +585,67 @@ def test_reconciliation_does_not_write_back_into_the_lot_it_read():
     rebuilt.filled_rungs.add(2)
 
     assert 2 not in stored.filled_rungs, "reconciliation mutated the stored lot"
+
+
+# ═══════════════════════════════════════════════════════ persistence fidelity
+
+def test_a_lot_survives_a_round_trip_through_the_store_unchanged():
+    """The restart path is only as good as the serialisation under it.
+
+    Every quantity goes out as a string. `float(Decimal("0.00149625"))` and
+    back is not the same number, and here a quantity wrong in the ninth place
+    is an order the broker rejects — so JSON's native number type is exactly
+    the wrong tool.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.on_price(TP1_PRICE)
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1))
+
+    revived = manager.load_lot(manager.dump_lot(lot))
+
+    assert revived.held_qty == lot.held_qty
+    assert isinstance(revived.held_qty, Decimal)
+    assert revived.tranche_qty(2) == lot.tranche_qty(2)
+    assert revived.working_stop == lot.working_stop == ENTRY
+    assert revived.filled_rungs == {1}
+    assert revived.rung_filled_qty == lot.rung_filled_qty
+    assert revived.target_price(2) == lot.target_price(2)
+    assert revived.stop_order_id == lot.stop_order_id
+
+
+def test_a_stored_lot_reloads_even_if_the_config_would_now_reject_it():
+    """A position that is already open must be recoverable.
+
+    Validating on the way in means a config edit — or a tightened minimum —
+    turns a live managed position into an unmanaged one at the next restart,
+    which is the opposite of what validation is for.
+    """
+    lot = _lot()
+    state = manager.dump_lot(lot)
+
+    revived = manager.load_lot(state.replace(
+        f'"min_order_size": "{MIN_ORDER}"', '"min_order_size": "999"'))
+
+    assert revived.held_qty == HELD, "a live lot failed to reload"
+
+
+def test_the_store_answers_whether_a_symbol_is_busy_across_a_restart(tmp_path):
+    """One lot at a time has to survive the process, or a gateway that came
+    back up would open a second lot on top of the first."""
+    from tv_alpaca_gateway.store import EventStore
+
+    store = EventStore(tmp_path / "lots.sqlite3")
+    lot = _lot(event_id="evt-1")
+    store.save_lot(lot.event_id, lot.symbol, lot.stage, manager.dump_lot(lot))
+
+    assert store.open_lot_for("BTC/USD") == "evt-1"
+    assert store.open_lot_for("QQQ") is None
+    assert [row[0] for row in store.open_lots()] == ["evt-1"]
+
+    store.save_lot(lot.event_id, lot.symbol, "closed", manager.dump_lot(lot))
+    assert store.open_lot_for("BTC/USD") is None
+    assert store.open_lots() == []
 
 
 # ══════════════════════════════════════════════ crypto is not equities at night
@@ -579,8 +725,8 @@ class _RecordingBroker:
                 f"insufficient qty available for order (requested: {qty}, "
                 f"available: {self.available()})")
 
-        self.submitted.append(dict(kwargs))
-        order_id = f"ord-{len(self.submitted)}"
+        order_id = f"ord-{len(self.submitted) + 1}"
+        self.submitted.append({**kwargs, "id": order_id})
         if kwargs.get("type") == "market":
             # A market order fills and is done; any unfilled remainder is
             # cancelled rather than left resting. `next_fill_ratio` models the

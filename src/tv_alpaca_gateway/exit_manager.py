@@ -17,6 +17,7 @@ teach it a rule that belongs here.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
 
@@ -82,6 +83,8 @@ class Lot:
     pending_rungs: set[int] = field(default_factory=set)
     rung_filled_qty: dict[int, Decimal] = field(default_factory=dict)
     rung_attempts: dict[int, int] = field(default_factory=dict)
+    rung_order_ids: dict[int, list[str]] = field(default_factory=dict)
+    seen_fills: set[str] = field(default_factory=set)
     stage: str = "ladder"
     stop_order_id: str | None = None
     reserved_qty: Decimal = Decimal("0")
@@ -226,7 +229,7 @@ class Lot:
         if self.plan.breakeven_after and self.working_stop < self.entry_price:
             self.working_stop = self.entry_price
 
-    def on_fill(self, rung: int, filled_qty: Decimal) -> None:
+    def on_fill(self, rung: int, filled_qty: Decimal, fill_id: str | None = None) -> None:
         """A fill against a rung, whole or partial.
 
         "I want the whole tranche managed" — so a rung is not done when the
@@ -234,7 +237,17 @@ class Lot:
         market order for 3 QQQ may come back as 1 and then 2; treating the
         first as completion strands the rest outside the ladder, with the stop
         sized as though it had all sold.
+
+        `fill_id` deduplicates. Alpaca's trade_updates stream can redeliver,
+        and a redelivered partial would otherwise be counted twice — the lot
+        would believe it holds less than it does and under-size its own
+        protection. Idempotency at submission (a deterministic client order id)
+        does nothing for a message arriving twice on the way back.
         """
+        if fill_id is not None:
+            if fill_id in self.seen_fills:
+                return
+            self.seen_fills.add(fill_id)
         if rung in self.filled_rungs:
             return
         self.rung_filled_qty[rung] = self.rung_filled_qty.get(rung, Decimal("0")) + filled_qty
@@ -287,13 +300,25 @@ class Lot:
         self.pending_rungs.add(rung)
         attempt = self.rung_attempts.get(rung, 0)
         self.rung_attempts[rung] = attempt + 1
-        self._broker.submit_order(
+        placed = self._broker.submit_order(
             symbol=self.symbol, side="sell", qty=assets.format_qty(qty),
             type="market", time_in_force=assets.time_in_force(self.symbol),
             client_order_id=self.rung_client_order_id(rung, attempt))
+        self.rung_order_ids.setdefault(rung, []).append(placed["id"])
 
     def _exit_remainder(self, reason: str) -> None:
-        """The working stop was breached, or the runner's trail was hit."""
+        """The working stop was breached, or the runner's trail was hit.
+
+        Any rung still in flight is cancelled first. A take-profit is a market
+        order and does not rest for long, but "not for long" is not "never":
+        one filling alongside the remainder exit sells the same coins twice —
+        rejected on crypto, and an unintended short on anything that can go
+        short.
+        """
+        for rung in sorted(self.pending_rungs):
+            for order_id in self.rung_order_ids.get(rung, []):
+                self._broker.cancel_order(order_id)
+        self.pending_rungs.clear()
         self._reserve(Decimal("0"))       # the stop holds the coins we must sell
         qty = self._sellable(self.remaining_qty)
         if qty >= self.min_order_size:
@@ -331,6 +356,69 @@ class Lot:
         order["client_order_id"] = f"{self.stop_client_order_id}-{self.stop_generation}"
         self.stop_generation += 1
         return self._broker.submit_order(**order)["id"]
+
+
+_DECIMAL_FIELDS = ("entry_price", "initial_stop", "held_qty", "min_order_size",
+                   "remaining_qty", "working_stop", "reserved_qty")
+
+
+def dump_lot(lot: Lot) -> str:
+    """Serialise a lot for the store.
+
+    Every quantity and price goes through as a **string**, never a float.
+    ``float(Decimal("0.00149625"))`` and back is not the same number, and this
+    is a system where a quantity that is off in the ninth place is an order the
+    broker rejects. JSON's native number type is exactly the wrong tool here.
+    """
+    state = {
+        "event_id": lot.event_id, "symbol": lot.symbol, "timeframe": lot.timeframe,
+        "stage": lot.stage, "stop_order_id": lot.stop_order_id,
+        "stop_generation": lot.stop_generation,
+        "filled_rungs": sorted(lot.filled_rungs),
+        "pending_rungs": sorted(lot.pending_rungs),
+        "rung_filled_qty": {str(k): str(v) for k, v in lot.rung_filled_qty.items()},
+        "rung_attempts": {str(k): v for k, v in lot.rung_attempts.items()},
+        "rung_order_ids": {str(k): list(v) for k, v in lot.rung_order_ids.items()},
+        "seen_fills": sorted(lot.seen_fills),
+        "plan": {
+            "name": lot.plan.name,
+            "tranches": [[str(f), str(m)] for f, m in lot.plan.tranches],
+            "runner_fraction": str(lot.plan.runner_fraction),
+            "trail_source": lot.plan.trail_source,
+            "breakeven_after": lot.plan.breakeven_after,
+        },
+    }
+    state |= {name: str(getattr(lot, name)) for name in _DECIMAL_FIELDS}
+    return json.dumps(state)
+
+
+def load_lot(state: str) -> Lot:
+    """Rebuild a lot from the store. Not validated on the way in: a lot that is
+    already open must be recoverable even if a config change would now make its
+    plan illegal, or a restart would abandon a live position."""
+    raw = json.loads(state)
+    plan = raw["plan"]
+    lot = Lot(
+        event_id=raw["event_id"], symbol=raw["symbol"], timeframe=raw["timeframe"],
+        plan=ExitPlan(
+            name=plan["name"],
+            tranches=tuple((Decimal(f), Decimal(m)) for f, m in plan["tranches"]),
+            runner_fraction=Decimal(plan["runner_fraction"]),
+            trail_source=plan["trail_source"],
+            breakeven_after=plan["breakeven_after"],
+        ),
+        **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
+    )
+    lot.stage = raw["stage"]
+    lot.stop_order_id = raw["stop_order_id"]
+    lot.stop_generation = raw["stop_generation"]
+    lot.filled_rungs = set(raw["filled_rungs"])
+    lot.pending_rungs = set(raw["pending_rungs"])
+    lot.rung_filled_qty = {int(k): Decimal(v) for k, v in raw["rung_filled_qty"].items()}
+    lot.rung_attempts = {int(k): v for k, v in raw["rung_attempts"].items()}
+    lot.rung_order_ids = {int(k): list(v) for k, v in raw.get("rung_order_ids", {}).items()}
+    lot.seen_fills = set(raw.get("seen_fills", []))
+    return lot
 
 
 def build_stop_order(symbol: str, qty: Decimal, stop_price: Decimal,
@@ -387,13 +475,26 @@ def reconcile_lot(stored: Lot, broker) -> Lot:
     # sets straight through, so mutating the rebuilt lot would edit the record
     # it was rebuilt from.
     lot = replace(stored, filled_rungs=set(stored.filled_rungs),
-                  pending_rungs=set(stored.pending_rungs))
+                  pending_rungs=set(stored.pending_rungs),
+                  rung_filled_qty=dict(stored.rung_filled_qty),
+                  rung_attempts=dict(stored.rung_attempts),
+                  rung_order_ids={k: list(v) for k, v in stored.rung_order_ids.items()},
+                  seen_fills=set(stored.seen_fills))
     lot._broker = broker
     position = Decimal(str(broker.position_qty(lot.symbol)))
 
+    # Every attempt, not just the first. A rung that filled partially and was
+    # topped up has a second order under a different client id; looking only at
+    # the base id reconstructs it as unfilled and sells the tranche again.
     for rung in range(1, len(lot.plan.tranches) + 1):
-        order = broker.get_order_by_client_id(lot.rung_client_order_id(rung))
-        if order and order.get("status") == "filled":
+        total = Decimal("0")
+        for attempt in range(lot.rung_attempts.get(rung, 0) + 1):
+            order = broker.get_order_by_client_id(lot.rung_client_order_id(rung, attempt))
+            if order:
+                total += Decimal(str(order.get("filled_qty") or "0"))
+        if total > lot.rung_filled_qty.get(rung, Decimal("0")):
+            lot.rung_filled_qty[rung] = total
+        if lot.rung_filled_qty.get(rung, Decimal("0")) >= lot.tranche_qty(rung):
             lot.filled_rungs.add(rung)
             lot.pending_rungs.discard(rung)
             if rung == lot.plan.breakeven_after and lot.working_stop < lot.entry_price:
@@ -405,4 +506,22 @@ def reconcile_lot(stored: Lot, broker) -> Lot:
     lot.remaining_qty = min(lot.remaining_qty, position)
     if lot.remaining_qty <= 0:
         lot.stage = "closed"
+        lot.stop_order_id, lot.reserved_qty = None, Decimal("0")
+        return lot
+
+    # The resting stop comes from the broker too. Carrying stop_order_id over
+    # from the database means a stop that was cancelled or filled while we were
+    # down comes back as still resting — and _reserve() short-circuits when it
+    # believes the reservation already matches, so the lot would sit unprotected
+    # and never notice. This is the failure the whole restart path exists for.
+    resting = [o for o in broker.open_orders(lot.symbol)
+               if str(o.get("client_order_id") or "").startswith(
+                   f"{lot.stop_client_order_id}-")]
+    if resting:
+        lot.stop_order_id = resting[-1].get("id")
+        lot.reserved_qty = Decimal(str(resting[-1]["qty"]))
+    else:
+        lot.stop_order_id, lot.reserved_qty = None, Decimal("0")
+
+    lot._resize_stop()      # re-protect if the stop is missing or mis-sized
     return lot

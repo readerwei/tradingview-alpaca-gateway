@@ -37,6 +37,15 @@ class EventStore:
                 "order_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, "
                 "role TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new')"
             )
+            # An open lot is a position the gateway is actively managing, so it
+            # has to outlive the process. `stage` is a column rather than a key
+            # inside the blob so "is this symbol busy?" is a query and not a
+            # scan-and-parse — that question is asked on every entry.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS lots ("
+                "event_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, "
+                "stage TEXT NOT NULL, state TEXT NOT NULL)"
+            )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
             if "broker_order_id" not in columns:
                 conn.execute("ALTER TABLE events ADD COLUMN broker_order_id TEXT")
@@ -176,6 +185,42 @@ class EventStore:
             ).fetchall()
         seen = dict.fromkeys(row[0] for row in rows if row[0])
         return list(seen)
+
+    def save_lot(self, event_id: str, symbol: str, stage: str, state: str) -> None:
+        """Upsert one managed lot. Called after every state change, because the
+        window between deciding and persisting is the window a crash loses."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO lots(event_id, symbol, stage, state) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(event_id) DO UPDATE SET stage = excluded.stage, "
+                "state = excluded.state",
+                (event_id, symbol, stage, state),
+            )
+
+    def open_lots(self) -> list[tuple[str, str, str]]:
+        """(event_id, symbol, state) for every lot not yet closed.
+
+        What the gateway re-arms from at startup. Closed lots stay in the table
+        as history rather than being deleted — a lot that closed unexpectedly is
+        the record you most want afterwards.
+        """
+        with self._connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                "SELECT event_id, symbol, state FROM lots WHERE stage != 'closed' "
+                "ORDER BY rowid")]
+
+    def open_lot_for(self, symbol: str) -> str | None:
+        """The event id of the open lot on this symbol, if there is one.
+
+        One lot at a time per crypto symbol is Wei's rule, and it has to be
+        answerable across a restart — otherwise a gateway that came back up
+        would happily open a second lot on top of the first.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT event_id FROM lots WHERE symbol = ? AND stage != 'closed' "
+                "LIMIT 1", (symbol,)).fetchone()
+        return row[0] if row else None
 
     def status(self, event_id: str) -> str | None:
         with self._connect() as conn:
