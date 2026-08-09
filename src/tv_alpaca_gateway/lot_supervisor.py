@@ -1,0 +1,166 @@
+"""Routes market and order events into the lots that care about them.
+
+`exit_manager.Lot` decides; this decides *which* lot is asked. Keeping the two
+apart is what lets the ladder be tested without a socket, and it is also the
+seam where the interesting mistakes live — a fill routed to the wrong rung is
+indistinguishable, from inside the lot, from a fill that really happened.
+
+Every handler persists after it acts. The window between deciding and writing
+is the window a crash loses, and what it loses is the record of an order that
+already exists at the broker.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from decimal import Decimal
+
+from . import assets
+from .exit_manager import Lot, dump_lot, load_lot, reconcile_lot
+
+logger = logging.getLogger(__name__)
+
+# pine-exec-<event id>-tp<rung>[r<attempt>]
+_RUNG = re.compile(r"^pine-exec-(?P<event>.+)-tp(?P<rung>\d+)(?:r\d+)?$")
+
+
+def rung_of(client_order_id: str) -> tuple[str, int] | None:
+    """(event id, rung) for a take-profit order, or None if it is not one.
+
+    Matched on the whole id, not by `in`: the protective order for event
+    `abc-tp1` would otherwise look like a rung of event `abc`.
+    """
+    match = _RUNG.match(client_order_id or "")
+    return (match["event"], int(match["rung"])) if match else None
+
+
+def fill_identity(update) -> str:
+    """A stable id for one execution.
+
+    Alpaca puts `execution_id` on a trade_update; when it is missing, the order
+    id plus the cumulative filled quantity is still unique per execution,
+    because that quantity only ever increases. Falling back to the order id
+    alone would collapse every partial into one and drop all but the first.
+    """
+    data = (getattr(update, "raw", None) or {}).get("data") or {}
+    execution = data.get("execution_id")
+    return str(execution) if execution else f"{update.order_id}:{update.filled_qty}"
+
+
+class LotSupervisor:
+    """Owns the open lots and feeds them."""
+
+    def __init__(self, store, broker):
+        self.store = store
+        self.broker = broker
+        self.lots: dict[str, Lot] = {}          # keyed by normalised symbol
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    def start(self) -> list[Lot]:
+        """Re-arm from the database, then check every lot against the broker.
+
+        Reconciliation is not optional here and not deferred to the first tick:
+        a lot whose stop was cancelled while the process was down is
+        unprotected right now, and the first tick may be a minute away.
+        """
+        restored = []
+        for event_id, symbol, state in self.store.open_lots():
+            try:
+                lot = reconcile_lot(load_lot(state), self.broker)
+            except Exception:
+                # A lot that cannot be rebuilt is a position with no manager.
+                # Log it loudly and keep going: one unreadable row must not
+                # stop the other lots being re-protected.
+                logger.exception("could not restore lot %s on %s", event_id, symbol)
+                continue
+            self._remember(lot)
+            restored.append(lot)
+        return restored
+
+    def adopt(self, lot: Lot) -> Lot:
+        self._remember(lot)
+        return lot
+
+    def _remember(self, lot: Lot) -> None:
+        key = assets.normalise(lot.symbol)
+        if lot.is_closed:
+            self.lots.pop(key, None)
+        else:
+            self.lots[key] = lot
+        self.store.save_lot(lot.event_id, lot.symbol, lot.stage, dump_lot(lot))
+
+    def _for(self, symbol: str) -> Lot | None:
+        return self.lots.get(assets.normalise(symbol))
+
+    # ── market events ───────────────────────────────────────────────────────
+
+    def on_bar(self, bar) -> None:
+        lot = self._for(bar.symbol)
+        if lot is None:
+            return
+        lot.on_bar(high=bar.high, low=bar.low, close=bar.close,
+                   trade_count=bar.trade_count)
+        self._remember(lot)
+
+    def on_trade(self, trade) -> None:
+        lot = self._for(trade.symbol)
+        if lot is None:
+            return
+        lot.on_price(Decimal(str(trade.price)))
+        self._remember(lot)
+
+    # ── order events ────────────────────────────────────────────────────────
+
+    def on_order_update(self, update) -> None:
+        """Route a fill to the rung that caused it.
+
+        Only fills are routed. A `new` or `accepted` update for the same order
+        carries a filled quantity of zero and would otherwise be counted as an
+        execution of nothing, consuming the dedupe id that the real fill needs.
+        """
+        if not update.is_fill:
+            return
+        identified = rung_of(update.client_order_id)
+        if identified is None:
+            # The disaster stop firing is the one event that ends a lot without
+            # the lot deciding anything. Left to the timer it would be up to a
+            # reconcile interval before the gateway noticed the position was
+            # gone — and during that window it would still be arming rungs
+            # against coins that had already been sold.
+            if "-protection-" in (update.client_order_id or ""):
+                lot = self._for(update.symbol)
+                if lot is not None:
+                    self._remember(reconcile_lot(lot, self.broker))
+            return
+        event_id, rung = identified
+        lot = self._for(update.symbol)
+        if lot is None or lot.event_id != event_id:
+            # A fill for a lot this process does not hold. Not an error — it may
+            # belong to a closed lot — but worth seeing, because the other way
+            # it happens is a routing bug.
+            logger.info("fill for unmanaged lot %s (%s)", event_id, update.symbol)
+            return
+        filled = Decimal(str(update.filled_qty or "0")) - lot.rung_filled_qty.get(
+            rung, Decimal("0"))
+        if filled <= 0:
+            return          # cumulative total we have already accounted for
+        lot.on_fill(rung=rung, filled_qty=filled, fill_id=fill_identity(update))
+        self._remember(lot)
+
+    # ── the timer ───────────────────────────────────────────────────────────
+
+    def reconcile_all(self) -> None:
+        """Re-check every open lot against the broker.
+
+        Alpaca does not replay trade_updates missed while the socket was down,
+        so a stream that dropped and came back leaves state that looks fine and
+        is not. A timer costs one REST call per lot; being wrong costs a
+        position.
+        """
+        for lot in list(self.lots.values()):
+            try:
+                self._remember(reconcile_lot(lot, self.broker))
+            except Exception:
+                logger.exception("reconcile failed for lot %s", lot.event_id)
