@@ -62,6 +62,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
 import websockets
@@ -109,6 +110,31 @@ class MarketTrade:
 
 
 @dataclass(frozen=True)
+class MarketBar:
+    """One completed bar.
+
+    Prices are Decimal, not float. They feed a stop price, and a trailing stop
+    that is off in the last place is an order the broker rejects — the rest of
+    this module can afford float because nothing downstream of a quote becomes
+    an order field.
+
+    `trade_count` is carried because it decides whether the bar counts at all:
+    two thirds of Alpaca's 1m crypto bars have no trades and are built from
+    quotes, and trailing off those walks a stop to prices nothing traded at.
+    """
+
+    symbol: str
+    timestamp: str
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    trade_count: int
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class OrderUpdate:
     event: str
     order_id: str
@@ -144,9 +170,22 @@ async def _invoke(callback: Callback | None, value: Any) -> None:
         await result
 
 
-def parse_market_message(message: dict[str, Any]) -> MarketQuote | MarketTrade | None:
+def parse_market_message(
+        message: dict[str, Any]) -> MarketQuote | MarketTrade | MarketBar | None:
     """Convert one Alpaca market-data message into a typed event."""
     message_type = message.get("T")
+    if message_type == "b":
+        return MarketBar(
+            symbol=str(message["S"]),
+            timestamp=str(message["t"]),
+            open=Decimal(str(message["o"])),
+            high=Decimal(str(message["h"])),
+            low=Decimal(str(message["l"])),
+            close=Decimal(str(message["c"])),
+            volume=Decimal(str(message.get("v", 0))),
+            trade_count=int(message.get("n", 0) or 0),
+            raw=message,
+        )
     if message_type == "q":
         return MarketQuote(
             symbol=str(message["S"]),
@@ -312,8 +351,14 @@ class _MarketDataSocket(_AlpacaSocket):
     async def subscribe(self, websocket: Any, symbols: list[str]) -> None:
         if not symbols:
             return
+        # Bars as well as quotes and trades: the exit manager trails the
+        # previous completed bar's low, and there is one market-data connection
+        # per feed for the whole account — so a second socket just to receive
+        # bars would be refused with "connection limit exceeded" rather than
+        # coexisting.
         await websocket.send(json.dumps({
             "action": "subscribe", "quotes": symbols, "trades": symbols,
+            "bars": symbols,
         }))
         await self._await_frame(
             websocket, lambda m: m.get("T") == "subscription", "subscription")
@@ -351,10 +396,11 @@ class AlpacaMarketStream(_MarketDataSocket):
     def __init__(self, settings: Settings, on_quote: Callback | None = None,
                  on_trade: Callback | None = None, on_error: Callback | None = None,
                  url: str | None = None, symbols: tuple[str, ...] | None = None,
-                 label: str = "market"):
+                 label: str = "market", on_bar: Callback | None = None):
         super().__init__(settings, url or settings.market_stream_url)
         self.on_quote = on_quote
         self.on_trade = on_trade
+        self.on_bar = on_bar
         self.on_error = on_error
         # Crypto is a separate endpoint with its own symbol list, not another
         # feed of the equity socket — so the URL and symbols are injectable
@@ -382,6 +428,8 @@ class AlpacaMarketStream(_MarketDataSocket):
                         await _invoke(self.on_quote, event)
                     elif isinstance(event, MarketTrade):
                         await _invoke(self.on_trade, event)
+                    elif isinstance(event, MarketBar):
+                        await _invoke(self.on_bar, event)
 
 
 class AlpacaTradeUpdateStream(_TradingSocket):
