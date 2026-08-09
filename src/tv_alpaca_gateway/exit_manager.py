@@ -110,9 +110,20 @@ class Lot:
         if self.held_qty <= 0:
             raise ExitPlanError("a lot needs a positive held quantity")
         if self.initial_stop >= self.entry_price:
+            # Long-only, said out loud. Everything here assumes it: targets sit
+            # above entry, rungs fire on price >= target, the trail ratchets up
+            # on bar LOWS, and every exit is a sell. A short entry satisfies
+            # none of that, and the giveaway is a stop above the entry.
+            #
+            # Without this the failure was still safe but misleading — it came
+            # out as "R would be zero or negative", which reads like a bad
+            # alert rather than an unsupported direction, and would have sent
+            # whoever hit it looking in the wrong place.
             raise ExitPlanError(
-                f"stop {self.initial_stop} is not below entry {self.entry_price}; "
-                "R would be zero or negative")
+                f"stop {self.initial_stop} is at or above entry {self.entry_price}. "
+                "The exit manager is long-only: targets are above entry, the "
+                "trail follows bar lows, and every exit is a sell. A short "
+                "position needs its own plan, not this one inverted")
 
         # Every rung is checked now, not when it fires. A ladder that clears TP1
         # and then cannot place TP2 leaves a position half managed, with a

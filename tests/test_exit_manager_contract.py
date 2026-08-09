@@ -169,6 +169,22 @@ def test_no_rung_may_leave_an_unsellable_remainder():
             f"a rung leaves {remaining}, below the {MIN_ORDER} floor")
 
 
+def test_a_short_entry_is_refused_by_name():
+    """This module is long-only, and until now that was true by accident.
+
+    Every part of it assumes the direction: targets above entry, rungs firing
+    on `price >= target`, a trail that ratchets up on bar LOWS, and exits that
+    are all sells. A short satisfies none of it.
+
+    The parser accepts `SIDE=SELL`, so a short entry can reach here. It was
+    already refused — but as "R would be zero or negative", which reads like a
+    malformed alert and sends whoever hits it looking in the wrong place. A
+    wrong diagnosis costs more than a plain refusal.
+    """
+    with pytest.raises(manager.ExitPlanError, match=r"(?i)long-only|short"):
+        _lot(entry_price=STOP, initial_stop=ENTRY)      # stop above entry
+
+
 def test_the_plan_is_snapshotted_onto_the_lot():
     """Editing the config must not re-price a position that is already open.
 
