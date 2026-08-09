@@ -188,13 +188,35 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
+        """Everything needed to answer "why was my order refused?".
+
+        Four failures in one day came from runtime state rather than code: a
+        stale checkout, a stale process, a stale environment, and a decision
+        that never reached the machine. In each case the repository and the
+        agreed configuration were right and the running process was not.
+
+        `commit` closed the first two. The risk settings close the rest — a
+        drift like MAX_NOTIONAL still being 2000 after it was raised to 3500
+        is then one request away instead of requiring someone to dump a
+        process environment on another host.
+
+        Deliberately excluded: the webhook secret, the API keys, and the
+        database path. This endpoint is unauthenticated, and "what would help
+        me debug" is not sufficient reason to publish a credential.
+        """
         return {
             "ok": True,
             "paper_trading": settings.paper_trading,
             "trading_enabled": settings.trading_enabled,
-            # So "is the running code current?" is answerable without
-            # comparing process start times against commit timestamps.
             "commit": RUNNING_COMMIT,
+            "risk": {
+                "allowed_symbols": sorted(settings.allowed_symbols),
+                "max_qty": settings.max_qty,
+                "crypto_max_qty": str(settings.crypto_max_qty),
+                "max_notional": settings.max_notional,
+                "max_price_deviation": settings.max_price_deviation,
+                "max_alert_age_seconds": settings.max_alert_age_seconds,
+            },
         }
 
     @app.post("/webhooks/tradingview/pine/dry-run")

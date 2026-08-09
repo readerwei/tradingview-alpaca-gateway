@@ -348,3 +348,60 @@ def test_the_gateway_starts_when_the_commit_cannot_be_determined(tmp_path, monke
 
     assert body["ok"] is True, "the gateway refused to serve without a commit"
     assert body["commit"] == "unknown"
+
+
+def test_healthz_reports_the_risk_configuration(tmp_path):
+    """"Why was my order refused?" should be answerable from one request.
+
+    Four failures in one day came from runtime state rather than code — a
+    stale checkout, a stale process, a stale environment, and a decision that
+    never reached the machine. MAX_NOTIONAL was still 2000 hours after being
+    raised to 3500, which would have refused every 3-share QQQ order while
+    blaming the cap rather than the drift.
+    """
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.app import create_app
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    settings = Settings(paper_trading=True, trading_enabled=False,
+                        webhook_secret="s3cret",
+                        allowed_symbols=frozenset({"QQQ", "BTC/USD"}),
+                        max_qty=3, crypto_max_qty=Decimal("0.05"),
+                        max_notional=3500.0, db_path=tmp_path / "r.db")
+    body = TestClient(create_app(settings, None, EventStore(settings.db_path), None)
+                      ).get("/healthz").json()
+
+    assert body["risk"]["allowed_symbols"] == ["BTC/USD", "QQQ"]
+    assert body["risk"]["max_notional"] == 3500.0
+    assert body["risk"]["crypto_max_qty"] == "0.05"
+
+
+def test_healthz_never_exposes_a_secret(tmp_path):
+    """The endpoint is unauthenticated.
+
+    "It would help me debug" is not a reason to publish a credential, and an
+    endpoint that grows fields over time is exactly where one leaks in.
+    """
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from tv_alpaca_gateway.app import create_app
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.store import EventStore
+
+    secret = "s3cret-do-not-publish"
+    settings = Settings(paper_trading=True, trading_enabled=False,
+                        webhook_secret=secret, alpaca_key_id="PKDONOTPUBLISH",
+                        alpaca_secret_key="SKDONOTPUBLISH",
+                        allowed_symbols=frozenset({"QQQ"}),
+                        crypto_max_qty=Decimal("0"), db_path=tmp_path / "s.db")
+    raw = TestClient(create_app(settings, None, EventStore(settings.db_path), None)
+                     ).get("/healthz").text
+
+    for leaked in (secret, "PKDONOTPUBLISH", "SKDONOTPUBLISH", str(settings.db_path)):
+        assert leaked not in raw, f"/healthz exposed {leaked!r}"
