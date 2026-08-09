@@ -249,8 +249,14 @@ def create_app(
         database path. This endpoint is unauthenticated, and "what would help
         me debug" is not sufficient reason to publish a credential.
         """
+        # Stream state, because a socket in a reconnect loop is invisible
+        # otherwise: the trade-update stream 403'd all day behind log warnings
+        # while this endpoint answered ok:true. `ok` now means the streams are
+        # carrying data too, not merely that the process is answering HTTP.
+        streams = stream.health() if stream is not None else {}
         return {
-            "ok": True,
+            "ok": all(v == "connected" for v in streams.values()) if streams else True,
+            "streams": streams,
             "paper_trading": settings.paper_trading,
             "trading_enabled": settings.trading_enabled,
             "commit": RUNNING_COMMIT,
