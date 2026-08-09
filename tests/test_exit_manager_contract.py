@@ -333,6 +333,72 @@ def test_an_exit_is_never_larger_than_what_the_account_actually_holds():
                 "an exit was sized past the real position")
 
 
+# ══════════════════════════ reservation: what the first fake was too kind to see
+
+def test_the_stop_is_resized_before_the_tranche_sells_not_after():
+    """Found by teaching the fake about reserved quantity, not by reasoning.
+
+    A resting stop holds its whole quantity, so with the stop covering the
+    position there is nothing available for a take-profit to sell. Something
+    has to give the quantity back first. The order chosen here — cancel,
+    re-place at the size the lot will have once the rung fills, then sell —
+    leaves one short gap instead of two, and leaves the stop already correct
+    if the sell never lands.
+
+    Cancel -> sell -> re-place would strand the entire position naked across
+    two round-trips at exactly the moment price is moving.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+
+    lot.on_price(TP1_PRICE)
+
+    kinds = [(o["type"], Decimal(str(o["qty"]))) for o in broker.submitted]
+    assert kinds[0][0] in ("stop", "stop_limit") and kinds[0][1] == HELD
+    assert kinds[1][0] in ("stop", "stop_limit"), (
+        f"the tranche sold before the stop was resized: {kinds}")
+    assert kinds[1][1] == HELD - lot.tranche_qty(1), (
+        "the replacement stop was not sized to the post-fill position")
+    assert kinds[2][0] == "market" and kinds[2][1] == lot.tranche_qty(1)
+
+
+def test_the_final_exit_cancels_the_stop_that_is_holding_the_coins():
+    """The stop reserves exactly the quantity the exit needs to sell.
+
+    Without cancelling it first the flatten is rejected for insufficient
+    quantity — a stop breach that fails to exit, which is the worst possible
+    moment to discover a reservation rule.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.advance_to_runner()                      # working stop is now breakeven
+    lot.on_bar(high=ENTRY + 3 * R, low=ENTRY + R, close=ENTRY + 3 * R)
+
+    lot.on_price(ENTRY + R - Decimal("1"))       # trail breached
+
+    assert broker.cancelled, "the resting stop was never cancelled"
+    exits = [o for o in broker.submitted if o["type"] == "market"]
+    assert exits and Decimal(str(exits[-1]["qty"])) == HELD
+
+
+def test_the_software_stop_stays_out_of_the_way_of_the_resting_one():
+    """Before breakeven the two stops sit at the same price.
+
+    Selling here as well would race our own resting order for the same coins:
+    the broker stop triggers, the software fires a market sell, and one of them
+    is rejected — or on an asset that can go short, is not. The resting stop is
+    already at that level and does not need us alive, so software does nothing
+    until its stop is strictly tighter.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+
+    lot.on_price(STOP - Decimal("1"))
+
+    assert not broker.cancelled, "software raced the resting stop at its own price"
+    assert [o["type"] for o in broker.submitted] == ["stop_limit"]
+
+
 # ═══════════════════════════════════════════════════════ surviving a restart
 
 def test_state_is_rebuilt_from_the_broker_not_trusted_from_the_database():
@@ -362,6 +428,21 @@ def test_reconciliation_recovers_a_rung_that_filled_while_we_were_down():
 
     assert rebuilt.rung_filled(1)
     assert rebuilt.working_stop == ENTRY, "breakeven was not applied on recovery"
+
+
+def test_reconciliation_does_not_write_back_into_the_lot_it_read():
+    """`dataclasses.replace` passes the stored lot's own sets straight through.
+
+    Sharing them means the rebuilt lot edits the record it was rebuilt from, so
+    a reconciliation that turns out to be wrong has already overwritten the
+    evidence of what was stored.
+    """
+    stored = _lot()
+    rebuilt = manager.reconcile_lot(stored, _RecordingBroker())
+
+    rebuilt.filled_rungs.add(2)
+
+    assert 2 not in stored.filled_rungs, "reconciliation mutated the stored lot"
 
 
 # ══════════════════════════════════════════════ crypto is not equities at night
@@ -400,12 +481,26 @@ def test_a_second_crypto_entry_is_refused_while_a_lot_is_open():
 
 # ═════════════════════════════════════════════════════════════════════ fake
 
-class _RecordingBroker:
-    """Deliberately dumber than the real adapter.
+class InsufficientQty(RuntimeError):
+    """What Alpaca returns when an order asks for quantity that is spoken for."""
 
-    It records and reports; it does not decide. Anything this fake would have
-    to be taught in order to keep a test green is a rule that belongs in the
-    manager, not in the double.
+
+class _RecordingBroker:
+    """Dumber than the real adapter in every way except one.
+
+    It models **quantity reservation**, because that is the rule the manager
+    has to be right about and the one a permissive fake hides. A resting sell
+    holds its quantity until it is cancelled or filled; `qty_available` falls
+    to zero under a full-size stop, which is exactly what the live account
+    shows:
+
+        qty            0.00149625
+        qty_available  0
+
+    The first version of this fake accepted any sell, and every test below was
+    green against a manager that would have been rejected by Alpaca on its
+    first take-profit. That is the fifth time in this repo a double has been
+    more agreeable than the broker; it is worth the twenty lines.
     """
 
     def __init__(self, position: Decimal = HELD):
@@ -413,14 +508,29 @@ class _RecordingBroker:
         self.cancelled: list[str] = []
         self.orders: dict[str, dict] = {}
         self._position = position
+        self._resting: dict[str, Decimal] = {}
+
+    def available(self) -> Decimal:
+        return self._position - sum(self._resting.values())
 
     def submit_order(self, **kwargs):
+        qty = Decimal(str(kwargs["qty"]))
+        if kwargs["side"] == "sell" and qty > self.available():
+            raise InsufficientQty(
+                f"insufficient qty available for order (requested: {qty}, "
+                f"available: {self.available()})")
+
         self.submitted.append(dict(kwargs))
         order_id = f"ord-{len(self.submitted)}"
+        if kwargs.get("type") == "market":
+            self._position -= qty          # fills immediately
+            return {"id": order_id, "status": "filled", "filled_qty": str(qty)}
+        self._resting[order_id] = qty      # holds its quantity until cancelled
         return {"id": order_id, "status": "new", "filled_qty": "0"}
 
     def cancel_order(self, order_id: str) -> None:
         self.cancelled.append(order_id)
+        self._resting.pop(order_id, None)
 
     def position_qty(self, symbol: str) -> Decimal:
         return self._position
@@ -429,5 +539,7 @@ class _RecordingBroker:
         return self.orders.get(client_order_id)
 
     def open_orders(self, symbol: str) -> list[dict]:
-        return [o for o in self.submitted
-                if o.get("client_order_id") not in self.cancelled]
+        resting_ids = {f"ord-{i + 1}" for i in range(len(self.submitted))
+                       if f"ord-{i + 1}" in self._resting}
+        return [o for i, o in enumerate(self.submitted)
+                if f"ord-{i + 1}" in resting_ids]
