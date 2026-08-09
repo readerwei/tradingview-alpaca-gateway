@@ -275,6 +275,27 @@ def test_the_trail_only_ever_moves_up():
     assert lot.working_stop == high_water, "the trail loosened on a pullback"
 
 
+def test_a_bar_with_no_trades_does_not_move_the_trail():
+    """Measured, not assumed. Twelve hours of Alpaca's BTC/USD 1m bars:
+
+        1Min    479/719 minutes have a bar,  167 of those have any trades
+        5Min    142/144                       92
+        15Min    48/48                        46
+
+    Two thirds of the 1m bars are built from quotes, many with low == high.
+    Trailing off them ratchets the stop to a price nothing traded at, and the
+    next spread wobble takes the position out.
+    """
+    lot = manager.open_lot(_lot(), _RecordingBroker())
+    lot.advance_to_runner()
+    lot.on_bar(high=ENTRY + 3 * R, low=ENTRY + 2 * R, close=ENTRY + 3 * R, trade_count=41)
+    settled = lot.working_stop
+
+    lot.on_bar(high=ENTRY + 4 * R, low=ENTRY + 3 * R, close=ENTRY + 4 * R, trade_count=0)
+
+    assert lot.working_stop == settled, "the trail followed a bar with no trades"
+
+
 def test_the_trail_timeframe_comes_from_the_alert():
     """"Last bar's low" is meaningless without a bar size, and a configured
     default would silently trail a 1h signal on 5m bars — a stop four times
@@ -313,6 +334,42 @@ def test_a_rung_already_filled_does_not_fire_again_when_price_revisits_it():
 
     sells = [o for o in broker.submitted if o.get("client_order_id", "").endswith("-tp1")]
     assert len(sells) == 1, f"TP1 fired {len(sells)} times"
+
+
+def test_a_partially_filled_rung_is_topped_up_not_written_off():
+    """Wei: "I want the whole tranche managed."
+
+    A market order for 3 QQQ can come back as 1 and then 2. Treating the first
+    fill as completion strands the rest outside the ladder — and worse, resizes
+    the stop as though the whole tranche had sold, leaving the position
+    under-protected by the part that never went.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    tranche = lot.tranche_qty(1)
+    broker.next_fill_ratio = Decimal("1") / 3            # only a third trades
+
+    lot.on_price(TP1_PRICE)
+    part = Decimal(broker.filled[-1]["filled_qty"])
+    lot.on_fill(rung=1, filled_qty=part)
+
+    assert not lot.rung_filled(1), "a partial fill closed the rung"
+    assert lot.working_stop == STOP, "breakeven applied before the tranche was done"
+
+    lot.on_price(TP1_PRICE)                              # still breached: top up
+    sold = sum(Decimal(o["filled_qty"]) for o in broker.filled
+               if "-tp1" in o["client_order_id"])
+    assert sold == tranche, (
+        f"the rung sold {sold} of a {tranche} tranche and stopped")
+
+
+def test_a_topped_up_rung_does_not_reuse_the_first_order_id():
+    """The remainder is a genuinely new order. Reusing the id would have Alpaca
+    reject it as a duplicate — the same mechanism that protects against a
+    double-fire would here prevent the tranche from ever completing."""
+    lot = _lot(event_id="evt-7")
+    assert lot.rung_client_order_id(1) == "pine-exec-evt-7-tp1"
+    assert lot.rung_client_order_id(1, attempt=1) != lot.rung_client_order_id(1)
 
 
 def test_an_exit_is_never_larger_than_what_the_account_actually_holds():
@@ -505,8 +562,10 @@ class _RecordingBroker:
 
     def __init__(self, position: Decimal = HELD):
         self.submitted: list[dict] = []
+        self.filled: list[dict] = []
         self.cancelled: list[str] = []
         self.orders: dict[str, dict] = {}
+        self.next_fill_ratio = Decimal("1")
         self._position = position
         self._resting: dict[str, Decimal] = {}
 
@@ -523,8 +582,17 @@ class _RecordingBroker:
         self.submitted.append(dict(kwargs))
         order_id = f"ord-{len(self.submitted)}"
         if kwargs.get("type") == "market":
-            self._position -= qty          # fills immediately
-            return {"id": order_id, "status": "filled", "filled_qty": str(qty)}
+            # A market order fills and is done; any unfilled remainder is
+            # cancelled rather than left resting. `next_fill_ratio` models the
+            # partial case, where the position falls by what actually traded
+            # and not by what was asked for.
+            filled = (qty * self.next_fill_ratio).quantize(Decimal("1E-9"))
+            self.next_fill_ratio = Decimal("1")
+            self._position -= filled
+            self.filled.append({**kwargs, "filled_qty": str(filled)})
+            return {"id": order_id,
+                    "status": "filled" if filled == qty else "partially_filled",
+                    "filled_qty": str(filled)}
         self._resting[order_id] = qty      # holds its quantity until cancelled
         return {"id": order_id, "status": "new", "filled_qty": "0"}
 

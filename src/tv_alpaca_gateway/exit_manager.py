@@ -22,10 +22,10 @@ from decimal import ROUND_DOWN, Decimal
 
 from . import assets
 
-# A sell stop that triggers into a thin book can fill far below its trigger, so
-# the disaster stop is a stop_limit with the limit set a little below. Wide
-# enough to fill in a normal move, tight enough not to be a market order.
-STOP_LIMIT_OFFSET = Decimal("0.0015")
+# Crypto has no plain stop order, only stop_limit, so a gap straight through the
+# limit leaves the position held with its protection unfilled. Wei's number:
+# 0.05% below the trigger. Tighter fills better and misses more often.
+STOP_LIMIT_OFFSET = Decimal("0.0005")
 
 
 class ExitPlanError(ValueError):
@@ -80,6 +80,8 @@ class Lot:
     working_stop: Decimal = Decimal("0")
     filled_rungs: set[int] = field(default_factory=set)
     pending_rungs: set[int] = field(default_factory=set)
+    rung_filled_qty: dict[int, Decimal] = field(default_factory=dict)
+    rung_attempts: dict[int, int] = field(default_factory=dict)
     stage: str = "ladder"
     stop_order_id: str | None = None
     reserved_qty: Decimal = Decimal("0")
@@ -153,14 +155,20 @@ class Lot:
         return self.held_qty - sum(self.tranche_qty(r)
                                    for r in range(1, len(self.plan.tranches) + 1))
 
-    def rung_client_order_id(self, rung: int) -> str:
+    def rung_client_order_id(self, rung: int, attempt: int = 0) -> str:
         """Deterministic, so a double-fire is impossible rather than unlikely.
 
         A crash between deciding to sell and hearing back leaves no local
         record. On restart the target still looks breached — and Alpaca rejects
         the duplicate id, so the retry is refused at the broker.
+
+        `attempt` exists only for a rung that filled partially and is being
+        topped up: that second order is genuinely a new order, and must not
+        collide with the first. Attempt 0 keeps the plain id so the common case
+        stays readable in the order log.
         """
-        return f"pine-exec-{self.event_id}-tp{rung}"
+        suffix = f"-tp{rung}" if not attempt else f"-tp{rung}r{attempt}"
+        return f"pine-exec-{self.event_id}{suffix}"
 
     @property
     def stop_client_order_id(self) -> str:
@@ -192,11 +200,21 @@ class Lot:
         if self.working_stop > self.initial_stop and price <= self.working_stop:
             self._exit_remainder("stop")
 
-    def on_bar(self, high: Decimal, low: Decimal, close: Decimal) -> None:
+    def on_bar(self, high: Decimal, low: Decimal, close: Decimal,
+               trade_count: int | None = None) -> None:
         """A COMPLETED bar. The forming candle is deliberately not an input:
         a stop that follows it ratchets up on every tick and exits on noise the
-        bar itself would have closed above."""
+        bar itself would have closed above.
+
+        Bars with no trades are ignored. Over twelve hours of BTC/USD, two
+        thirds of Alpaca's 1m bars had a trade count of zero — they are built
+        from quotes, and many have low == high. Trailing off those walks the
+        stop up to prices nothing ever traded at, and the next spread wobble
+        takes the position out.
+        """
         if self.is_closed or self.stage != "runner":
+            return
+        if trade_count == 0:
             return
         if low > self.working_stop:
             self.working_stop = low          # monotonic: never loosens
@@ -209,12 +227,24 @@ class Lot:
             self.working_stop = self.entry_price
 
     def on_fill(self, rung: int, filled_qty: Decimal) -> None:
+        """A fill against a rung, whole or partial.
+
+        "I want the whole tranche managed" — so a rung is not done when the
+        first fill lands, it is done when the fills add up to the tranche. A
+        market order for 3 QQQ may come back as 1 and then 2; treating the
+        first as completion strands the rest outside the ladder, with the stop
+        sized as though it had all sold.
+        """
         if rung in self.filled_rungs:
             return
-        self.filled_rungs.add(rung)
-        self.pending_rungs.discard(rung)
+        self.rung_filled_qty[rung] = self.rung_filled_qty.get(rung, Decimal("0")) + filled_qty
         self.remaining_qty -= filled_qty
+        self.pending_rungs.discard(rung)          # let the remainder re-fire
 
+        if self.rung_filled_qty[rung] < self.tranche_qty(rung):
+            return                                 # still working; stop stays put
+
+        self.filled_rungs.add(rung)
         if rung == self.plan.breakeven_after and self.working_stop < self.entry_price:
             self.working_stop = self.entry_price
         if len(self.filled_rungs) >= len(self.plan.tranches):
@@ -249,15 +279,18 @@ class Lot:
         leaves a single short gap, and leaves the stop already correctly sized
         if the sell never lands.
         """
-        qty = self._sellable(self.tranche_qty(rung))
+        outstanding = self.tranche_qty(rung) - self.rung_filled_qty.get(rung, Decimal("0"))
+        qty = self._sellable(outstanding)
         if qty < self.min_order_size:
             return
         self._reserve(self._sellable(self.remaining_qty) - qty)
         self.pending_rungs.add(rung)
+        attempt = self.rung_attempts.get(rung, 0)
+        self.rung_attempts[rung] = attempt + 1
         self._broker.submit_order(
             symbol=self.symbol, side="sell", qty=assets.format_qty(qty),
             type="market", time_in_force=assets.time_in_force(self.symbol),
-            client_order_id=self.rung_client_order_id(rung))
+            client_order_id=self.rung_client_order_id(rung, attempt))
 
     def _exit_remainder(self, reason: str) -> None:
         """The working stop was breached, or the runner's trail was hit."""
