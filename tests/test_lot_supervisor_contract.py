@@ -78,6 +78,9 @@ class _Broker:
     def open_orders(self, symbol):
         return [o for o in self.submitted if o["id"] in self._resting]
 
+    def recent_bars(self, symbol, timeframe, limit=30):
+        return list(getattr(self, "bars", []))
+
 
 class _Update:
     """Shaped like stream.OrderUpdate, only as far as the supervisor reads it."""
@@ -276,3 +279,98 @@ class _Bar:
         self.symbol, self.low, self.trade_count = symbol, low, trade_count
         self.high = low + Decimal("50")
         self.close = low + Decimal("25")
+
+
+# ═══════════════════════════════════════════════════ seeding the trail
+
+class _Bar2:
+    def __init__(self, low, trade_count=9):
+        self.low = low
+        self.high = low + Decimal("60")
+        self.close = low + Decimal("30")
+        self.trade_count = trade_count
+
+
+def _runner_lot(store, broker):
+    lot = manager.open_lot(_lot(), broker)
+    lot.advance_to_runner()
+    store.save_lot(lot.event_id, lot.symbol, lot.stage, manager.dump_lot(lot))
+    return lot
+
+
+def test_startup_seeds_the_trail_from_recent_bars(tmp_path):
+    """Without this a restarted runner trails from its stored stop until a live
+    bar arrives — a minute on 1m, and indefinitely if the single market-data
+    connection slot is held by another process. The lot looks managed and is
+    not."""
+    broker = _Broker()
+    store = EventStore(tmp_path / "s.sqlite3")
+    _runner_lot(store, broker)
+    broker.bars = [_Bar2(ENTRY + R), _Bar2(ENTRY + 2 * R)]
+
+    restored = supervisor.LotSupervisor(store, broker).start()
+
+    assert restored[0].working_stop == ENTRY + 2 * R, (
+        "the trail was not seeded from history")
+
+
+def test_seeding_obeys_the_no_trades_rule(tmp_path):
+    """Reused rather than reimplemented: a quote-only bar must not seed a stop
+    at a price nothing traded at, least of all at startup where nothing will
+    correct it before the next bar."""
+    broker = _Broker()
+    store = EventStore(tmp_path / "s.sqlite3")
+    _runner_lot(store, broker)
+    broker.bars = [_Bar2(ENTRY + R, trade_count=7),
+                   _Bar2(ENTRY + 3 * R, trade_count=0)]
+
+    restored = supervisor.LotSupervisor(store, broker).start()
+
+    assert restored[0].working_stop == ENTRY + R, "a quote-only bar seeded the trail"
+
+
+def test_seeding_never_lowers_a_stop(tmp_path):
+    """History replayed through on_bar keeps the monotonic rule, so an old bar
+    cannot walk a stop back down to where it was hours ago."""
+    broker = _Broker()
+    store = EventStore(tmp_path / "s.sqlite3")
+    lot = _runner_lot(store, broker)
+    lot.working_stop = ENTRY + 2 * R
+    store.save_lot(lot.event_id, lot.symbol, lot.stage, manager.dump_lot(lot))
+    broker.bars = [_Bar2(ENTRY)]
+
+    restored = supervisor.LotSupervisor(store, broker).start()
+
+    assert restored[0].working_stop == ENTRY + 2 * R, "seeding loosened the stop"
+
+
+def test_startup_survives_a_market_data_outage(tmp_path):
+    """A lot with a stale trail is worse than one with a fresh trail, and much
+    better than a gateway that will not start."""
+    broker = _Broker()
+    store = EventStore(tmp_path / "s.sqlite3")
+    _runner_lot(store, broker)
+
+    def _boom(*a, **k):
+        raise RuntimeError("market data unavailable")
+
+    broker.recent_bars = _boom
+
+    restored = supervisor.LotSupervisor(store, broker).start()
+
+    assert len(restored) == 1, "a data outage stopped the gateway re-arming"
+
+
+def test_a_lot_still_on_the_ladder_is_not_seeded(tmp_path):
+    """Before the runner stage the trail is not moving, so replaying bars would
+    only cost REST calls."""
+    broker = _Broker()
+    store = EventStore(tmp_path / "s.sqlite3")
+    lot = manager.open_lot(_lot(), broker)
+    store.save_lot(lot.event_id, lot.symbol, lot.stage, manager.dump_lot(lot))
+    asked = []
+    broker.recent_bars = lambda *a, **k: asked.append(a) or []
+
+    supervisor.LotSupervisor(store, broker).start()
+
+    assert not asked, "a laddering lot fetched history it cannot use"

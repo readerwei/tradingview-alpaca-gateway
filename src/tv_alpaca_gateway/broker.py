@@ -191,6 +191,54 @@ class AlpacaPaperClient:
             "filled_avg_price")
         return Decimal(str(price)) if price else None
 
+    def recent_bars(self, symbol: str, timeframe: str, limit: int = 30) -> list:
+        """Completed bars, newest last, for seeding a runner's trail at startup.
+
+        Without this a gateway that restarts mid-position trails nothing until
+        the first live bar arrives — up to a minute on 1m, and indefinitely if
+        the single market-data connection slot is held by another process. The
+        stop would sit at its last persisted value while price moved.
+
+        The forming bar is excluded by its own timestamp rather than by
+        dropping the newest row, because whether Alpaca includes it varies and
+        a positional rule would silently discard a completed bar on the runs
+        where it does not.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        amount, unit = _parse_timeframe(timeframe)
+        period = timedelta(**{{"Min": "minutes", "Hour": "hours",
+                               "Day": "days"}[unit.value]: amount})
+        start = datetime.now(timezone.utc) - period * (limit + 2)
+        frame = TimeFrame(amount, unit)
+
+        if is_crypto(symbol):
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+            client = CryptoHistoricalDataClient(self.settings.alpaca_key_id,
+                                                self.settings.alpaca_secret_key)
+            bars = client.get_crypto_bars(CryptoBarsRequest(
+                symbol_or_symbols=assets.normalise(symbol), timeframe=frame,
+                start=start))
+        else:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            client = StockHistoricalDataClient(self.settings.alpaca_key_id,
+                                               self.settings.alpaca_secret_key)
+            bars = client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=assets.normalise(symbol), timeframe=frame,
+                start=start))
+
+        now = datetime.now(timezone.utc)
+        out = []
+        for bar in bars.data.get(assets.normalise(symbol), []):
+            if bar.timestamp + period > now:
+                continue                      # still forming
+            out.append(bar)
+        return out[-limit:]
+
     def position_qty(self, symbol: str) -> Decimal:
         """How much of `symbol` is actually held.
 
@@ -253,6 +301,33 @@ class AlpacaPaperClient:
             raise RuntimeError(
                 f"Alpaca market-data returned no trade price for {symbol}")
         return price
+
+
+def _parse_timeframe(timeframe: str):
+    """TradingView's interval -> an Alpaca TimeFrame.
+
+    TradingView writes minutes as a bare number and coarser frames with a
+    suffix. An interval we cannot read raises rather than defaulting: a silent
+    fallback to 1m would seed a 1h runner with the wrong bars, and every stop
+    that followed would be several times tighter than the strategy was tested
+    with, with nothing looking wrong.
+    """
+    from alpaca.data.timeframe import TimeFrameUnit
+
+    text = (timeframe or "").strip()
+    if text.isdigit():
+        return int(text), TimeFrameUnit.Minute
+    if len(text) > 1 and text[:-1].isdigit():
+        suffix = text[-1].upper()
+        unit = {"S": None, "M": TimeFrameUnit.Minute, "H": TimeFrameUnit.Hour,
+                "D": TimeFrameUnit.Day}.get(suffix)
+        if unit is not None:
+            return int(text[:-1]), unit
+    unit = {"D": TimeFrameUnit.Day, "W": TimeFrameUnit.Week,
+            "M": TimeFrameUnit.Month}.get(text.upper())
+    if unit is not None:
+        return 1, unit
+    raise ValueError(f"cannot interpret {timeframe!r} as a bar size")
 
 
 def _is_not_found(exc: Exception) -> bool:
@@ -319,6 +394,9 @@ class FakeBroker:
         # floor the account enforces.
         return Decimal("0.000015417") if is_crypto(symbol) else Decimal("1")
 
+    def recent_bars(self, symbol: str, timeframe: str, limit: int = 30) -> list:
+        return list(getattr(self, "bars", []))
+
     def fill_price(self, order_id: str) -> Decimal | None:
         for order in self.orders:
             if order.get("id") == order_id:
@@ -357,6 +435,54 @@ class FakeBroker:
         if price <= 0:
             raise RuntimeError("Alpaca crypto market-data returned a non-positive price")
         return price
+
+    def recent_bars(self, symbol: str, timeframe: str, limit: int = 30) -> list:
+        """Completed bars, newest last, for seeding a runner's trail at startup.
+
+        Without this a gateway that restarts mid-position trails nothing until
+        the first live bar arrives — up to a minute on 1m, and indefinitely if
+        the single market-data connection slot is held by another process. The
+        stop would sit at its last persisted value while price moved.
+
+        The forming bar is excluded by its own timestamp rather than by
+        dropping the newest row, because whether Alpaca includes it varies and
+        a positional rule would silently discard a completed bar on the runs
+        where it does not.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        amount, unit = _parse_timeframe(timeframe)
+        period = timedelta(**{{"Min": "minutes", "Hour": "hours",
+                               "Day": "days"}[unit.value]: amount})
+        start = datetime.now(timezone.utc) - period * (limit + 2)
+        frame = TimeFrame(amount, unit)
+
+        if is_crypto(symbol):
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+            client = CryptoHistoricalDataClient(self.settings.alpaca_key_id,
+                                                self.settings.alpaca_secret_key)
+            bars = client.get_crypto_bars(CryptoBarsRequest(
+                symbol_or_symbols=assets.normalise(symbol), timeframe=frame,
+                start=start))
+        else:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            client = StockHistoricalDataClient(self.settings.alpaca_key_id,
+                                               self.settings.alpaca_secret_key)
+            bars = client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=assets.normalise(symbol), timeframe=frame,
+                start=start))
+
+        now = datetime.now(timezone.utc)
+        out = []
+        for bar in bars.data.get(assets.normalise(symbol), []):
+            if bar.timestamp + period > now:
+                continue                      # still forming
+            out.append(bar)
+        return out[-limit:]
 
     def position_qty(self, symbol: str) -> Decimal:
         """How much of `symbol` is actually held.

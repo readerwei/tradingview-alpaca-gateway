@@ -43,7 +43,7 @@ ENGINE_REQUIRES = ("submit_order", "cancel_order", "get_order",
                    # first ladder would have failed the way the first order
                    # did.
                    "get_order_by_client_id", "open_orders",
-                   "min_order_size", "fill_price")
+                   "min_order_size", "fill_price", "recent_bars")
 
 
 def _missing(cls) -> list[str]:
