@@ -33,7 +33,14 @@ from tv_alpaca_gateway.broker import AlpacaPaperClient, FakeBroker
 # execution.py; if the engine grows a call, this list must grow with it — and
 # the test below is what makes forgetting expensive rather than silent.
 ENGINE_REQUIRES = ("submit_order", "cancel_order", "get_order",
-                   "latest_trade_price", "position_qty")
+                   "latest_trade_price", "position_qty",
+                   # Added by the exit manager and its supervisor. The
+                   # guard below scans those modules too — without that it
+                   # kept passing while this exact gap reopened, and the
+                   # first ladder would have failed the way the first order
+                   # did.
+                   "get_order_by_client_id", "open_orders",
+                   "min_order_size", "fill_price")
 
 
 def _missing(cls) -> list[str]:
@@ -77,18 +84,77 @@ def test_the_engine_requirement_list_matches_what_the_engine_actually_calls():
     file would keep passing while the real gap reopened. Reading the engine's
     own source keeps the list honest.
     """
-    from tv_alpaca_gateway import execution
+    from tv_alpaca_gateway import execution, exit_manager, lot_supervisor
 
-    source = inspect.getsource(execution)
-    called = {line.split("broker.")[1].split("(")[0]
-              for line in source.splitlines() if "broker." in line
-              and "(" in line.split("broker.")[-1]}
-    called = {name for name in called if name.isidentifier()}
+    called = set()
+    for module in (execution, exit_manager, lot_supervisor):
+        source = inspect.getsource(module)
+        for line in source.splitlines():
+            for marker in ("broker.", "_broker."):
+                if marker in line and "(" in line.split(marker)[-1]:
+                    name = line.split(marker)[1].split("(")[0]
+                    if name.isidentifier():
+                        called.add(name)
 
     unlisted = called - set(ENGINE_REQUIRES)
     assert not unlisted, (
         f"the engine calls {sorted(unlisted)} but this file does not check for "
         f"it; add it to ENGINE_REQUIRES")
+
+
+def test_open_orders_keeps_the_slash_that_positions_drops():
+    """The two endpoints want opposite spellings, and both fail quietly.
+
+    Measured against the live paper account with one resting stop on BTC/USD:
+
+        /v2/orders?status=open&symbols=BTC%2FUSD  -> 1 order
+        /v2/orders?status=open&symbols=BTCUSD     -> 0 orders, HTTP 200
+
+    So the wrong spelling here reports no open orders rather than erroring —
+    and "no open orders" is what reconciliation reads as "the stop is gone",
+    which makes it cancel nothing and re-place a duplicate. `position_qty`
+    needs the slash *removed* for the same asset. Asserting on the URL because
+    neither mistake is visible in the response.
+    """
+    import urllib.request
+
+    from tv_alpaca_gateway.config import Settings
+
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _capture(request, *a, **k):
+        captured["url"] = request.full_url
+        raise _Stop
+
+    client = AlpacaPaperClient(Settings(alpaca_key_id="k", alpaca_secret_key="s"))
+    original = urllib.request.urlopen
+    urllib.request.urlopen = _capture
+    try:
+        client.open_orders("BTC/USD")
+    except _Stop:
+        pass
+    finally:
+        urllib.request.urlopen = original
+
+    assert "BTC%2FUSD" in captured["url"], (
+        f"open_orders used {captured['url']!r}; the slashless form returns an "
+        f"empty list with HTTP 200, which reads as 'the stop is gone'")
+
+
+def test_min_order_size_is_asked_for_rather_than_hardcoded():
+    """It moves. Alpaca recalculates the crypto minimum against price, and it
+    changed between two checks hours apart on the same night:
+
+        0.000015417  ->  0.000015437
+
+    A constant baked in at development time is therefore wrong by an unknown
+    amount whenever it matters, so the real client must ask.
+    """
+    source = inspect.getsource(AlpacaPaperClient.min_order_size)
+    assert "/v2/assets/" in source, "min_order_size does not consult the asset"
 
 
 def test_position_lookup_uses_the_spelling_that_endpoint_accepts():

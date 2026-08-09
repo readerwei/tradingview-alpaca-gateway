@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 
 from . import assets
+from .assets import is_crypto
 
 from .config import Settings
 from .risk import ApprovedOrder
@@ -190,6 +191,83 @@ class AlpacaPaperClient:
             raise RuntimeError(f"Alpaca order lookup failed: HTTP {exc.code}: {detail}") from exc
         return BrokerResult(order_id=raw.get("id", order_id), status=raw.get("status", "unknown"), raw=raw)
 
+    def _trading_get(self, path: str) -> Any:
+        """GET against the trading API. 404 comes back as None.
+
+        A 404 here is an answer — no such order — and the callers below all
+        need to tell "not found" apart from "the lookup failed", because
+        treating a failed lookup as "not found" is how a live order becomes
+        invisible to reconciliation.
+        """
+        request = urllib.request.Request(
+            f"{self.settings.alpaca_base_url.rstrip('/')}{path}",
+            headers={
+                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(
+                f"Alpaca GET {path} failed: HTTP {exc.code}: {detail}") from exc
+
+    def get_order_by_client_id(self, client_order_id: str) -> dict | None:
+        """One order by the id we chose for it.
+
+        Reconciliation identifies orders by client id rather than broker id
+        because the client id is the only one that survives a crash before the
+        response came back — which is exactly the case reconciliation exists
+        for.
+        """
+        return self._trading_get(
+            "/v2/orders:by_client_order_id?client_order_id="
+            + urllib.parse.quote(client_order_id, safe=""))
+
+    def open_orders(self, symbol: str) -> list[dict]:
+        """Live orders for one symbol.
+
+        The orders endpoint wants the SLASHED spelling for crypto, unlike
+        /v2/positions which wants it slashless. Both silently return something
+        plausible for the wrong form — an empty list here, a 404 there — so the
+        two are written out separately rather than sharing a helper that would
+        have to guess.
+        """
+        return self._trading_get(
+            "/v2/orders?status=open&symbols=" + urllib.parse.quote(symbol, safe="")
+        ) or []
+
+    def min_order_size(self, symbol: str) -> Decimal:
+        """The smallest quantity Alpaca will accept for this asset.
+
+        Checked when an exit plan is built, so a ladder whose smallest tranche
+        is unplaceable is refused before the first order rather than stalling
+        halfway down with a remainder it can never sell. BTC/USD is currently
+        0.000015417; equities are whole shares.
+        """
+        if not is_crypto(symbol):
+            return Decimal("1")
+        asset = self._trading_get(
+            "/v2/assets/" + urllib.parse.quote(symbol, safe="")) or {}
+        return Decimal(str(asset.get("min_order_size") or "0.000000001"))
+
+    def fill_price(self, order_id: str) -> Decimal | None:
+        """What an order actually filled at.
+
+        R is entry minus stop, and a market order into a fast tape does not
+        fill at the price the signal was generated from. Sizing a ladder off
+        the signal price puts every target at the wrong distance from the risk
+        actually taken.
+        """
+        raw = self._trading_get(f"/v2/orders/{urllib.parse.quote(order_id, safe='')}")
+        price = (raw or {}).get("filled_avg_price")
+        return Decimal(str(price)) if price else None
+
     def latest_trade_price(self, symbol: str) -> float:
         # Crypto lives on a different endpoint with a different response shape.
         # Asking the equity endpoint for BTC/USD does not fail loudly, it just
@@ -232,10 +310,11 @@ class FakeBroker:
         self.orders: list[dict] = []
         self.canceled: list[str] = []
         self.positions: dict[str, Decimal] = {}
+        self.resting: dict[str, dict] = {}
 
     def submit_order(self, **kwargs) -> dict:
-        self.orders.append(dict(kwargs))
-        order_id = f"fake-{len(self.orders)}"
+        order_id = f"fake-{len(self.orders) + 1}"
+        self.orders.append({**kwargs, "id": order_id})
         qty = Decimal(str(kwargs.get("qty", 0)))
         symbol = kwargs.get("symbol", "")
         resting = kwargs.get("type") in {"stop_limit", "stop", "trailing_stop"}
@@ -243,14 +322,38 @@ class FakeBroker:
             held = self.positions.get(symbol, Decimal("0"))
             sign = 1 if kwargs.get("side") == "buy" else -1
             self.positions[symbol] = held + sign * qty
+        if resting:
+            self.resting[order_id] = {**kwargs, "id": order_id}
         return {"id": order_id, "status": "new" if resting else "filled",
                 "filled_qty": "0" if resting else str(qty)}
 
     def cancel_order(self, order_id: str) -> None:
         self.canceled.append(order_id)
+        self.resting.pop(order_id, None)
 
     def position_qty(self, symbol: str) -> Decimal:
         return self.positions.get(symbol, Decimal("0"))
+
+    def get_order_by_client_id(self, client_order_id: str) -> dict | None:
+        for order in self.orders:
+            if order.get("client_order_id") == client_order_id:
+                return order
+        return None
+
+    def open_orders(self, symbol: str) -> list[dict]:
+        return [o for oid, o in self.resting.items() if o.get("symbol") == symbol]
+
+    def min_order_size(self, symbol: str) -> Decimal:
+        # The real BTC/USD figure, so a fake ladder is sized against the same
+        # floor the account enforces.
+        return Decimal("0.000015417") if is_crypto(symbol) else Decimal("1")
+
+    def fill_price(self, order_id: str) -> Decimal | None:
+        for order in self.orders:
+            if order.get("id") == order_id:
+                price = order.get("filled_avg_price")
+                return Decimal(str(price)) if price else None
+        return None
 
     def submit(self, order: ApprovedOrder, client_order_id: str) -> BrokerResult:
         raw = {"id": f"fake-{len(self.orders) + 1}", "client_order_id": client_order_id, **asdict(order)}
