@@ -20,6 +20,18 @@ class EventStore:
             # to be able to find all three. Recording them in events.detail as
             # text made them unqueryable: a resync could discover the entry and
             # miss a protective order that was live at the broker.
+            # Refusals live OUTSIDE the events table. `events` is the
+            # idempotency namespace, and writing a refusal there claims the id
+            # — which turns the kill switch into a one-shot ban: re-firing the
+            # same alert after arming would be rejected as a duplicate.
+            #
+            # An audit record and an execution claim are different things and
+            # conflating them makes one break the other.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS refusals ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL, "
+                "reason TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')"
+            )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS broker_orders ("
                 "order_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, "
@@ -91,6 +103,25 @@ class EventStore:
         "broker_filled", "broker_canceled", "broker_rejected",
         "broker_expired", "broker_done_for_day",
     )
+
+    def record_refusal(self, event_id: str, reason: str, detail: str = "") -> None:
+        """Record that an alert was refused, without claiming its identity.
+
+        Appended rather than upserted: an alert refused three times is three
+        facts, and collapsing them would hide how often the kill switch is
+        catching something.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO refusals(event_id, reason, detail) VALUES (?, ?, ?)",
+                (event_id, reason, detail[:2000]),
+            )
+
+    def refusals_for(self, event_id: str) -> list[tuple[str, str]]:
+        with self._connect() as conn:
+            return [tuple(r) for r in conn.execute(
+                "SELECT reason, detail FROM refusals WHERE event_id = ? "
+                "ORDER BY id", (event_id,))]
 
     def record_broker_order(self, order_id: str, event_id: str, role: str,
                             status: str = "new") -> None:
