@@ -512,7 +512,8 @@ class AlpacaStreamManager:
                  on_trade: Callback | None = None,
                  on_order_update: Callback | None = None,
                  on_error: Callback | None = None,
-                 on_order_stream_connected: Callable[[], Awaitable[None]] | None = None):
+                 on_order_stream_connected: Callable[[], Awaitable[None]] | None = None,
+                 on_bar: Callback | None = None):
         self.settings = settings
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
@@ -521,13 +522,14 @@ class AlpacaStreamManager:
         # would hold a socket open receiving nothing.
         self.market = (
             AlpacaMarketStream(settings, on_quote, on_trade, on_error,
-                               symbols=settings.market_symbols)
+                               symbols=settings.market_symbols, on_bar=on_bar)
             if settings.market_symbols else None
         )
         self.crypto = (
             AlpacaMarketStream(settings, on_quote, on_trade, on_error,
                                url=settings.crypto_stream_url,
-                               symbols=settings.crypto_symbols, label="crypto")
+                               symbols=settings.crypto_symbols, label="crypto",
+                               on_bar=on_bar)
             if settings.crypto_symbols else None
         )
         self.trade_updates = AlpacaTradeUpdateStream(

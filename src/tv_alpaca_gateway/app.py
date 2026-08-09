@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import pathlib
 import hmac
@@ -23,7 +24,9 @@ from .execution import ExecutionError, UnprotectedPositionError
 from .pine_alert_parser import AlertParseError as PineAlertParseError, PineOrderCommand, parse_pine_alert
 from .notifier import DiscordNotifier, NullNotifier
 from .risk import RiskError, approve
-from .stream import AlpacaStreamManager, MarketQuote, MarketTrade, OrderUpdate
+from .lot_supervisor import LotSupervisor
+from .stream import (AlpacaStreamManager, MarketBar, MarketQuote, MarketTrade,
+                     OrderUpdate)
 from .store import EventStore
 
 logger = logging.getLogger(__name__)
@@ -114,8 +117,16 @@ def create_app(
     async def on_quote(event: MarketQuote) -> None:
         logger.debug("market quote %s bid=%s ask=%s", event.symbol, event.bid_price, event.ask_price)
 
+    supervisor = LotSupervisor(store, broker)
+
     async def on_trade(event: MarketTrade) -> None:
         logger.debug("market trade %s price=%s size=%s", event.symbol, event.price, event.size)
+        # Off the event loop: firing a rung is a blocking urllib call, and
+        # blocking here stalls every other stream on the same loop.
+        await asyncio.to_thread(supervisor.on_trade, event)
+
+    async def on_bar(event: MarketBar) -> None:
+        await asyncio.to_thread(supervisor.on_bar, event)
 
     async def on_order_update(event: OrderUpdate) -> None:
         status = f"broker_{event.status or event.event}"
@@ -128,6 +139,7 @@ def create_app(
         )
         if not updated:
             logger.warning("received update for unknown order_id=%s", event.order_id)
+        await asyncio.to_thread(supervisor.on_order_update, event)
 
     async def on_stream_error(error: Exception) -> None:
         logger.warning("Alpaca stream error: %s", error)
@@ -161,18 +173,50 @@ def create_app(
 
     stream = stream or (
         AlpacaStreamManager(settings, on_quote, on_trade, on_order_update,
-                            on_stream_error, resync_orders_after_reconnect)
+                            on_stream_error, resync_orders_after_reconnect,
+                            on_bar=on_bar)
         if settings.stream_enabled
         else None
     )
 
+    async def reconcile_periodically() -> None:
+        """Alpaca does not replay trade_updates missed while the socket was down.
+
+        A stream that dropped and came back leaves state that looks fine and is
+        not, and nothing in the message flow will ever correct it. One REST call
+        per open lot per interval is the cheap side of that trade.
+        """
+        while True:
+            await asyncio.sleep(settings.lot_reconcile_seconds)
+            try:
+                await asyncio.to_thread(supervisor.reconcile_all)
+            except Exception:
+                logger.exception("periodic lot reconciliation failed")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # Before the socket, deliberately. A lot whose stop was cancelled while
+        # the process was down is unprotected right now, and the first tick may
+        # be a minute away — or, if the connection slot is taken, never.
+        try:
+            restored = await asyncio.to_thread(supervisor.start)
+            if restored:
+                logger.info("re-armed %d managed lot(s): %s", len(restored),
+                            ", ".join(lot.event_id for lot in restored))
+        except Exception:
+            logger.exception("could not re-arm managed lots at startup")
+
         if stream is not None and settings.stream_enabled:
             await stream.start()
+        timer = (asyncio.create_task(reconcile_periodically(), name="lot-reconcile")
+                 if settings.lot_reconcile_seconds > 0 else None)
         try:
             yield
         finally:
+            if timer is not None:
+                timer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await timer
             if stream is not None and settings.stream_enabled:
                 await stream.stop()
 
@@ -185,6 +229,7 @@ def create_app(
     app.state.stream = stream
     app.state.store = store
     app.state.broker = broker
+    app.state.supervisor = supervisor
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
