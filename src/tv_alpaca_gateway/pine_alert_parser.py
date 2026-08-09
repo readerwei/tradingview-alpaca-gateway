@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -20,7 +22,14 @@ _REQUIRED_FIELDS = frozenset({"SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FO
 _OPTIONAL_PROVENANCE_FIELDS = frozenset({"EVENT_ID", "BAR_TIME"})
 _EXECUTABLE_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_PROVENANCE_FIELDS | frozenset({
     "CANCEL_UNFILLED_AT_DEADLINE", "STOP_TRIGGER", "STOP_LIMIT", "TRAIL",
+    "EXIT_PLAN", "INTERVAL",
 })
+# TradingView renders {{interval}} as a bare number for minutes ("1", "5"),
+# and a suffixed form for anything coarser ("1H", "D", "W"). Both are
+# accepted; a value that is neither is refused rather than guessed at,
+# because the interval sets the bar size the runner trails on and a wrong
+# guess trails a 1h signal on 1m bars.
+_INTERVAL = re.compile(r"^(?:\d+[smhSMH]?|[DWMdwm])$")
 _IGNORABLE_FIELDS = frozenset({"REQUIRED_ACTIONS"})
 # Freshness, matching the 180s the JSON path has always used, with the same
 # 30s tolerance for a clock running slightly ahead.
@@ -48,6 +57,8 @@ class PineOrderCommand:
     stop_trigger: Decimal | None
     stop_limit: Decimal | None
     trail: Decimal | None
+    exit_plan: str | None = None
+    interval: str | None = None
 
 
 def parse_pine_alert(content: str) -> PineOrderCommand:
@@ -133,6 +144,17 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
             raise AlertParseError(
                 "protective SELL stop-limit requires STOP_LIMIT >= STOP_TRIGGER")
 
+    exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
+    interval = fields.get("INTERVAL") or None
+    if interval is not None and not _INTERVAL.match(interval):
+        raise AlertParseError(
+            f"INTERVAL {interval!r} is not a TradingView interval; the runner's "
+            "trail has no bar size without it")
+    if exit_plan and interval is None:
+        raise AlertParseError(
+            "EXIT_PLAN requires INTERVAL — \"previous completed bar low\" has no "
+            "meaning without a bar size. Send INTERVAL={{interval}}")
+
     trail_raw = fields.get("TRAIL", "NONE")
     trail = None if trail_raw.upper() == "NONE" else _positive_decimal(trail_raw, "trail")
     if crypto_symbol and trail is not None:
@@ -153,6 +175,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         stop_trigger=stop_trigger,
         stop_limit=stop_limit,
         trail=trail,
+        exit_plan=exit_plan,
+        interval=interval,
     )
 
 
