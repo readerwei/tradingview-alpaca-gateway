@@ -215,7 +215,7 @@ def execute_pine_command(
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     return _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
-                               event_id, broker, store, position_before)
+                               event_id, broker, store, position_before, settings)
 
 
 def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:
@@ -330,7 +330,8 @@ def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
 
 def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
                         event_id, broker, store,
-                        position_before: Decimal = Decimal("0")) -> ExecutionResult:
+                        position_before: Decimal = Decimal("0"),
+                        settings=None) -> ExecutionResult:
     """Protect what THIS entry added, not the whole position.
 
     Sizing from the total position was wrong twice over.
@@ -360,7 +361,7 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
 
     if command.exit_plan:
         managed = _open_managed_lot(command, symbol, entry_id, entry_status,
-                                    event_id, broker, store, held_qty)
+                                    event_id, broker, store, held_qty, settings)
         if managed is not None:
             return managed
         # Falling through is deliberate. A ladder that cannot be built is a
@@ -397,7 +398,7 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
 
 
 def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
-                      broker, store, held_qty) -> ExecutionResult | None:
+                      broker, store, held_qty, settings=None) -> ExecutionResult | None:
     """Hand this entry to the exit manager. None means it could not be armed.
 
     The disaster stop is placed by `open_lot`, so this REPLACES the ordinary
@@ -409,6 +410,27 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
     signal: R is entry minus stop, and a market order into a fast tape does not
     fill where the alert fired.
     """
+    # A lot on a symbol nobody subscribed to is the quietest failure in this
+    # system. ALLOWED_SYMBOLS says what may be traded; MARKET_SYMBOLS and
+    # CRYPTO_SYMBOLS say what the sockets listen to, and nothing reconciled
+    # them. The ladder would arm, the disaster stop would rest, every order
+    # would look right — and no bar would ever arrive, so the runner would
+    # never trail. Falling back to an ordinary stop is honest about that;
+    # pretending to manage a lot we cannot see is not.
+    if settings is not None:
+        streamed = {assets.normalise(t) for t in
+                    (*settings.market_symbols, *settings.crypto_symbols)}
+        if assets.normalise(symbol) not in streamed:
+            store.record_refusal(
+                command.event_id or "", "symbol_not_streamed",
+                f"{symbol} is tradable but not subscribed; add it to "
+                f"{'CRYPTO_SYMBOLS' if assets.is_crypto(symbol) else 'MARKET_SYMBOLS'}")
+            logger.error(
+                "%s is in ALLOWED_SYMBOLS but not in the stream subscription, so "
+                "no bars will arrive and the runner could never trail; placing an "
+                "ordinary protective stop instead of an exit plan", symbol)
+            return None
+
     try:
         entry_price = broker.fill_price(entry_id)
         if not entry_price:

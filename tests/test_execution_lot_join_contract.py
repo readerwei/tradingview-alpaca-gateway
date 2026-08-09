@@ -35,12 +35,12 @@ FILL = Decimal("64960.58")
 HELD = Decimal("0.00149625")
 
 
-def _settings(tmp_path):
-    return Settings(
+def _settings(tmp_path, **kw):
+    return Settings(**{**dict(
         paper_trading=True, trading_enabled=True, webhook_secret="s",
         allowed_symbols=frozenset({"BTC/USD"}), max_qty=3,
         crypto_max_qty=Decimal("0.05"), max_notional=3500.0,
-        db_path=tmp_path / "join.sqlite3")
+        db_path=tmp_path / "join.sqlite3"), **kw})
 
 
 class _Broker:
@@ -91,7 +91,7 @@ class _Broker:
 
 def _run(tmp_path, alert=ALERT, broker=None, store=None):
     broker = broker or _Broker()
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
     store = store or EventStore(settings.db_path)
     result = execution.execute_pine_command(
         parse_pine_alert(alert), settings, broker, store, delivery_id="d-1")
@@ -182,7 +182,7 @@ def test_a_second_plan_alert_is_refused_while_a_lot_is_open(tmp_path):
     order record at all** — which is how the last one of these took ten
     messages to diagnose. Refusing here produces a reason instead of silence.
     """
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
     store = EventStore(settings.db_path)
     broker = _Broker()
     _run(tmp_path, _with_plan(), broker, store)
@@ -196,7 +196,7 @@ def test_a_second_plan_alert_is_refused_while_a_lot_is_open(tmp_path):
 def test_the_refusal_is_recorded_so_it_can_be_audited(tmp_path):
     """A refusal that leaves no trace is indistinguishable from an alert that
     never arrived — both look like a quiet log and an empty database."""
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
     store = EventStore(settings.db_path)
     broker = _Broker()
     _run(tmp_path, _with_plan(), broker, store)
@@ -211,7 +211,7 @@ def test_the_refusal_is_recorded_so_it_can_be_audited(tmp_path):
 
 
 def test_a_refused_second_alert_places_no_order(tmp_path):
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
     store = EventStore(settings.db_path)
     broker = _Broker()
     _run(tmp_path, _with_plan(), broker, store)
@@ -223,3 +223,41 @@ def test_a_refused_second_alert_places_no_order(tmp_path):
             delivery_id="d-2")
 
     assert len(broker.submitted) == before, "a refused alert still traded"
+
+
+# ═════════════════════════════ a lot nobody is listening to
+
+def test_a_lot_is_refused_on_a_symbol_the_sockets_do_not_subscribe_to(tmp_path):
+    """The quietest failure in the system, found by reading alpaca-py's stream.
+
+    ALLOWED_SYMBOLS says what may be traded. MARKET_SYMBOLS and CRYPTO_SYMBOLS
+    say what the sockets listen to. Nothing reconciled them — so a ladder could
+    arm on a symbol that never delivers a bar. The disaster stop rests, every
+    order looks right, `/healthz` is green, and the runner never trails as long
+    as the position is open.
+    """
+    settings = _settings(tmp_path)
+    assert "BTC/USD" not in settings.crypto_symbols        # the default
+    store = EventStore(settings.db_path)
+    broker = _Broker()
+
+    result = execution.execute_pine_command(
+        parse_pine_alert(_with_plan()), settings, broker, store, delivery_id="d-1")
+
+    assert result.protection_status == "submitted", "the fill was left unprotected"
+    assert store.open_lots() == [], "a lot was opened on a symbol with no feed"
+    assert any("symbol_not_streamed" in reason
+               for reason, _ in store.refusals_for("")), "the reason was not recorded"
+
+
+def test_a_lot_opens_normally_once_the_symbol_is_subscribed(tmp_path):
+    """Paired with the refusal above: a guard that never admits the good case
+    is an outage, not a check."""
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
+    store = EventStore(settings.db_path)
+
+    result = execution.execute_pine_command(
+        parse_pine_alert(_with_plan()), settings, _Broker(), store, delivery_id="d-1")
+
+    assert result.protection_status == "lot_opened"
+    assert store.open_lot_for("BTC/USD") is not None
