@@ -47,8 +47,11 @@ _PLANS: dict[str, dict] = {
     # is lost while we are down is the take-profit, which is the side that
     # costs upside rather than capital.
     #
-    # take_profit_r is a guess pending Wei's number. One tranche, whole
-    # position, no runner, no trail.
+    # The target comes from the alert, not from here. Wei: "I will provide
+    # explicit stop and take profit prices on the OCO plan." The R-multiple
+    # below is never consulted when TAKE_PROFIT is supplied — and TAKE_PROFIT
+    # is required for this plan — so it exists only to keep the tranche shape
+    # uniform with every other plan. One tranche, whole position, no runner.
     "OCO_AFTER_FILL": dict(
         tranches=((Decimal("1.00"), Decimal("2.0")),),
         runner_fraction=Decimal("0"),

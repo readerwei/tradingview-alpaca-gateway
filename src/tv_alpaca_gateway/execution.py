@@ -485,6 +485,11 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
             initial_stop=command.stop_trigger, held_qty=held_qty,
             timeframe=command.interval, plan=exit_plans.resolve(command.exit_plan),
             min_order_size=broker.min_order_size(symbol))
+        if command.take_profit is not None:
+            # The alert priced the target itself, so the plan's R-multiple is
+            # not consulted. One explicit price covers the single-rung OCO
+            # plan; a multi-rung plan still derives the rest from R.
+            lot.explicit_targets = (command.take_profit,)
         exit_manager.open_lot(lot, broker)
     except Exception as exc:
         logger.warning("could not arm exit plan %s on %s: %s",

@@ -232,9 +232,9 @@ def test_oco_after_fill_is_accepted_on_crypto():
     Alpaca having no native crypto OCO is a property of Alpaca's API. It should
     not become a property of the strategy's vocabulary.
     """
-    command = parse_pine_alert(CRYPTO_OCO)
+    command = parse_pine_alert(CRYPTO_OCO + " | TAKE_PROFIT=66000")
     assert command.exit_plan == "OCO_AFTER_FILL"
-    assert command.take_profit is None, "crypto prices its target from config"
+    assert command.take_profit == Decimal("66000")
 
 
 def test_an_equity_oco_still_requires_an_absolute_take_profit():
@@ -258,7 +258,7 @@ def test_the_crypto_path_goes_to_the_managed_plan_not_the_native_one(monkeypatch
     monkeypatch.setattr(execution, "_open_managed_lot",
                         lambda *a, **k: called.append("managed") or None)
 
-    command = parse_pine_alert(CRYPTO_OCO)
+    command = parse_pine_alert(CRYPTO_OCO + " | TAKE_PROFIT=66000")
     execution._protect_or_flatten(
         command, "BTC/USD", True, "ord-1", "filled", "evt-1",
         _OcoBroker(), _OcoStore(), Decimal("0"), None, None)
@@ -288,3 +288,59 @@ class _OcoStore:
 
     def save_lot(self, *a, **k):
         pass
+
+
+# ══════════════════════════ explicit prices, not R, for the OCO plan
+
+def test_the_oco_plan_requires_an_explicit_take_profit_on_crypto_too():
+    """Wei: "I will provide explicit stop and take profit prices on the OCO
+    plan." So TAKE_PROFIT is required on both asset classes, not only where
+    the native leg forced it."""
+    with pytest.raises(AlertParseError, match=r"(?i)TAKE_PROFIT"):
+        parse_pine_alert(CRYPTO_OCO)          # no TAKE_PROFIT
+
+    priced = parse_pine_alert(CRYPTO_OCO + " | TAKE_PROFIT=66000")
+    assert priced.take_profit == Decimal("66000")
+
+
+def test_an_explicit_target_overrides_the_plans_r_multiple():
+    """The number the strategy computed wins. Deriving from R when the alert
+    already said where to exit would quietly trade a different plan than the
+    one that was backtested."""
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import exit_manager as m
+    from tv_alpaca_gateway.broker import FakeBroker
+
+    broker = FakeBroker()
+    broker.positions["BTC/USD"] = D("0.0015")
+    lot = m.Lot.opened(event_id="e", symbol="BTC/USD", entry_price=D("65000"),
+                       initial_stop=D("64900"), held_qty=D("0.0015"),
+                       timeframe="1m", plan=exit_plans.resolve("OCO_AFTER_FILL"),
+                       min_order_size=D("0.000015437"))
+    derived = lot.target_price(1)
+    lot.explicit_targets = (D("66000"),)
+
+    assert lot.target_price(1) == D("66000")
+    assert derived != D("66000"), "the test would prove nothing if they matched"
+
+
+def test_an_inverted_exit_pair_is_refused():
+    """A take-profit below the stop is not a tight target — it is the pair the
+    wrong way round, and it would arm, rest, and never make sense."""
+    with pytest.raises(AlertParseError, match=r"(?i)inverted|TAKE_PROFIT"):
+        parse_pine_alert(CRYPTO_OCO + " | TAKE_PROFIT=63000")
+
+
+def test_an_explicit_target_survives_the_store():
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import exit_manager as m
+
+    lot = m.Lot.opened(event_id="e", symbol="BTC/USD", entry_price=D("65000"),
+                       initial_stop=D("64900"), held_qty=D("0.0015"),
+                       timeframe="1m", plan=exit_plans.resolve("OCO_AFTER_FILL"),
+                       min_order_size=D("0.000015437"))
+    lot.explicit_targets = (D("66000"),)
+
+    assert m.load_lot(m.dump_lot(lot)).target_price(1) == D("66000")
