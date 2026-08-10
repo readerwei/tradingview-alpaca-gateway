@@ -107,3 +107,67 @@ def test_resolving_a_plan_twice_gives_independent_objects():
     first, second = exit_plans.resolve("DYNAMIC_TRAIL"), exit_plans.resolve("DYNAMIC_TRAIL")
     assert first == second
     assert first is not second
+
+
+# ═══════════════════════════════════════════════════ the OCO-shaped plan
+
+def test_oco_after_fill_is_one_target_for_the_whole_position():
+    """A take-profit and a stop, whichever comes first."""
+    plan = exit_plans.resolve("OCO_AFTER_FILL")
+    assert len(plan.tranches) == 1
+    assert plan.tranches[0][0] == Decimal("1.00"), "it should exit the whole position"
+    assert plan.runner_fraction == Decimal("0"), "an OCO leaves no runner"
+    plan.validate()
+
+
+def test_a_plan_with_no_runner_needs_no_trail_source():
+    """Demanding one would force every take-profit-and-stop plan to name a
+    mechanism it never uses."""
+    exit_plans.resolve("OCO_AFTER_FILL").validate()
+
+
+def test_a_plan_with_a_runner_still_requires_a_real_trail_source():
+    """The relaxation above must not weaken the plan that does trail."""
+    from tv_alpaca_gateway.exit_manager import ExitPlan, ExitPlanError
+
+    with pytest.raises(ExitPlanError, match=r"(?i)trail"):
+        ExitPlan(name="X", tranches=((Decimal("0.5"), Decimal("1")),),
+                 runner_fraction=Decimal("0.5"), trail_source="none",
+                 breakeven_after=1).validate()
+
+
+def test_an_oco_lot_closes_when_its_single_target_fills():
+    """No runner means the position is gone, so the lot must not linger and
+    hold the symbol against the one-lot rule."""
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import exit_manager as m
+
+    from tv_alpaca_gateway.broker import FakeBroker
+
+    broker = FakeBroker()
+    broker.positions["BTC/USD"] = D("0.0015")
+    lot = m.open_lot(m.Lot.opened(
+        event_id="e", symbol="BTC/USD", entry_price=D("65000"),
+        initial_stop=D("64900"), held_qty=D("0.0015"), timeframe="1m",
+        plan=exit_plans.resolve("OCO_AFTER_FILL"),
+        min_order_size=D("0.000015437")), broker)
+    assert lot.runner_qty() == 0
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="f1")
+    assert lot.is_closed
+
+
+def test_using_a_lot_before_it_is_armed_says_so():
+    """It used to fail with AttributeError from three frames down, which sends
+    whoever hits it looking at the wrong thing entirely."""
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import exit_manager as m
+
+    lot = m.Lot.opened(event_id="e", symbol="BTC/USD", entry_price=D("65000"),
+                       initial_stop=D("64900"), held_qty=D("0.0015"),
+                       timeframe="1m", plan=exit_plans.resolve("OCO_AFTER_FILL"),
+                       min_order_size=D("0.000015437"))
+
+    with pytest.raises(m.ExitPlanError, match=r"(?i)not armed|open_lot"):
+        lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="f")

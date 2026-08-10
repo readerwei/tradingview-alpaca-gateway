@@ -357,6 +357,8 @@ class FakeBroker:
         self.canceled: list[str] = []
         self.positions: dict[str, Decimal] = {}
         self.resting: dict[str, dict] = {}
+        self.prices: dict[str, float] = {}
+        self.bars: list = []
 
     def submit_order(self, **kwargs) -> dict:
         order_id = f"fake-{len(self.orders) + 1}"
@@ -409,127 +411,6 @@ class FakeBroker:
         self.orders.append(raw)
         return BrokerResult(order_id=raw["id"], status="accepted", raw=raw)
 
-    def _latest_crypto_price(self, symbol: str) -> float:
-        url = ("https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols="
-               + urllib.parse.quote(symbol, safe=""))
-        request = urllib.request.Request(
-            url,
-            headers={
-                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
-                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                raw = json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise RuntimeError(
-                f"Alpaca crypto market-data lookup failed: HTTP {exc.code}: {detail}") from exc
-        try:
-            price = float(raw["trades"][symbol]["p"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"Alpaca crypto market-data response had no trade price for {symbol}") from exc
-        if price <= 0:
-            raise RuntimeError("Alpaca crypto market-data returned a non-positive price")
-        return price
-
-    def recent_bars(self, symbol: str, timeframe: str, limit: int = 30) -> list:
-        """Completed bars, newest last, for seeding a runner's trail at startup.
-
-        Without this a gateway that restarts mid-position trails nothing until
-        the first live bar arrives — up to a minute on 1m, and indefinitely if
-        the single market-data connection slot is held by another process. The
-        stop would sit at its last persisted value while price moved.
-
-        The forming bar is excluded by its own timestamp rather than by
-        dropping the newest row, because whether Alpaca includes it varies and
-        a positional rule would silently discard a completed bar on the runs
-        where it does not.
-        """
-        from datetime import datetime, timedelta, timezone
-
-        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-
-        amount, unit = _parse_timeframe(timeframe)
-        period = timedelta(**{{"Min": "minutes", "Hour": "hours",
-                               "Day": "days"}[unit.value]: amount})
-        start = datetime.now(timezone.utc) - period * (limit + 2)
-        frame = TimeFrame(amount, unit)
-
-        if is_crypto(symbol):
-            from alpaca.data.historical import CryptoHistoricalDataClient
-            from alpaca.data.requests import CryptoBarsRequest
-            client = CryptoHistoricalDataClient(self.settings.alpaca_key_id,
-                                                self.settings.alpaca_secret_key)
-            bars = client.get_crypto_bars(CryptoBarsRequest(
-                symbol_or_symbols=assets.normalise(symbol), timeframe=frame,
-                start=start))
-        else:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockBarsRequest
-            client = StockHistoricalDataClient(self.settings.alpaca_key_id,
-                                               self.settings.alpaca_secret_key)
-            bars = client.get_stock_bars(StockBarsRequest(
-                symbol_or_symbols=assets.normalise(symbol), timeframe=frame,
-                start=start))
-
-        now = datetime.now(timezone.utc)
-        out = []
-        for bar in bars.data.get(assets.normalise(symbol), []):
-            if bar.timestamp + period > now:
-                continue                      # still forming
-            out.append(bar)
-        return out[-limit:]
-
-    def position_qty(self, symbol: str) -> Decimal:
-        """How much of `symbol` is actually held.
-
-        The execution engine sizes protection from this, never from the fill,
-        because Alpaca charges the crypto fee in kind: a filled 0.001 BTC
-        leaves a position of 0.0009975, and a stop sized to the fill asks to
-        sell more than is held and is refused.
-
-        A symbol with no position returns 0 rather than raising — Alpaca
-        answers 404 for a flat symbol, which is an answer, not a failure.
-
-        The positions endpoint wants the SLASHLESS spelling, unlike the crypto
-        data endpoints which require the slash:
-
-            /v2/positions/BTC%2FUSD  -> 404
-            /v2/positions/BTCUSD     -> 200, qty 0.00348875
-
-        Sending the slash returns 404, and 404 means flat — so a held position
-        reads as zero, the engine concludes there is nothing to protect, and a
-        filled position is left without a stop. The wrong URL does not fail; it
-        produces a plausible answer, which is worse.
-        """
-        url = (f"{self.settings.alpaca_base_url.rstrip('/')}/v2/positions/"
-               + urllib.parse.quote(symbol.replace("/", ""), safe=""))
-        request = urllib.request.Request(
-            url,
-            headers={
-                "APCA-API-KEY-ID": self.settings.alpaca_key_id,
-                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                raw = json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return Decimal("0")
-            detail = exc.read().decode(errors="replace")
-            raise RuntimeError(
-                f"Alpaca position lookup failed: HTTP {exc.code}: {detail}") from exc
-        try:
-            return Decimal(str(raw["qty"]))
-        except (KeyError, TypeError, InvalidOperation) as exc:
-            raise RuntimeError(
-                f"Alpaca position response had no usable qty for {symbol}") from exc
 
     def get_order(self, order_id: str) -> BrokerResult:
         for raw in self.orders:

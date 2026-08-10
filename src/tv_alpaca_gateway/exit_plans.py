@@ -33,6 +33,29 @@ _PLANS: dict[str, dict] = {
         # future plan are unaffected.
         rungs_on_bar_high=True,
     ),
+    # A take-profit and a stop, whichever comes first — the shape people mean
+    # by "OCO".
+    #
+    # It is managed HERE, not by Alpaca's order_class="oco". Alpaca's native
+    # OCO is equities-only; crypto takes simple orders only, and BTC/USD is
+    # what this is being tested on. Managing it ourselves also means one
+    # mechanism for both asset classes instead of two that drift.
+    #
+    # The trade-off against a broker-side OCO is real and worth stating: a
+    # native pair survives our process dying, and this does not. The disaster
+    # stop still rests at the broker, so the FLOOR survives regardless — what
+    # is lost while we are down is the take-profit, which is the side that
+    # costs upside rather than capital.
+    #
+    # take_profit_r is a guess pending Wei's number. One tranche, whole
+    # position, no runner, no trail.
+    "OCO_AFTER_FILL": dict(
+        tranches=((Decimal("1.00"), Decimal("2.0")),),
+        runner_fraction=Decimal("0"),
+        trail_source="none",
+        breakeven_after=0,          # nothing survives the fill to move a stop for
+        rungs_on_bar_high=True,     # same thin-feed reasoning as DYNAMIC_TRAIL
+    ),
 }
 
 
