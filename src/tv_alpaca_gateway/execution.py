@@ -363,7 +363,18 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     if command.exit_plan:
-        if command.exit_plan == "OCO_AFTER_FILL":
+        # One plan name, best available mechanism for the asset class.
+        #
+        #   equity  -> Alpaca's native OCO. The broker holds both legs, so the
+        #              pair survives this process dying, which software
+        #              management never can.
+        #   crypto  -> managed here. Alpaca has no native OCO for crypto at
+        #              all, so the alternative is not a worse OCO, it is none.
+        #
+        # Dispatching on the asset rather than refusing keeps the API's
+        # limitation out of the strategy: Wei writes one plan name and gets
+        # the strongest thing available for the symbol he wrote it on.
+        if command.exit_plan == "OCO_AFTER_FILL" and not crypto:
             return _submit_oco_exit(command, symbol, entry_id, entry_status,
                                     event_id, broker, store, held_qty)
         managed = _open_managed_lot(command, symbol, entry_id, entry_status,
@@ -474,6 +485,11 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
             initial_stop=command.stop_trigger, held_qty=held_qty,
             timeframe=command.interval, plan=exit_plans.resolve(command.exit_plan),
             min_order_size=broker.min_order_size(symbol))
+        if command.take_profit is not None:
+            # The alert priced the target itself, so the plan's R-multiple is
+            # not consulted. One explicit price covers the single-rung OCO
+            # plan; a multi-rung plan still derives the rest from R.
+            lot.explicit_targets = (command.take_profit,)
         exit_manager.open_lot(lot, broker)
     except Exception as exc:
         logger.warning("could not arm exit plan %s on %s: %s",

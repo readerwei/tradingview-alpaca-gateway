@@ -133,12 +133,23 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
     if exit_plan == "OCO_AFTER_FILL":
-        if crypto_symbol:
-            raise AlertParseError("OCO_AFTER_FILL is unsupported for crypto orders")
         if protective_stop:
             raise AlertParseError("OCO_AFTER_FILL cannot be combined with protective stop")
+        # Not refused for crypto. Alpaca has no native OCO there, but the plan
+        # is still available — the gateway manages the pair itself, the same
+        # way DYNAMIC_TRAIL already does. Rejecting at the parser would have
+        # made one plan name mean "works" on QQQ and "refused" on BTC/USD,
+        # which is a property of Alpaca's API leaking into the strategy.
+        #
+        # TAKE_PROFIT is therefore required only where it is the ONLY way to
+        # price the target: a native OCO leg is an absolute price. The managed
+        # path derives it from the plan's R-multiple in config, which is where
+        # Wei asked the numbers to live, and an absolute price in an alert goes
+        # stale — a four-hour-old stop level inverted on us last night.
         if not take_profit_raw:
-            raise AlertParseError("OCO_AFTER_FILL requires TAKE_PROFIT")
+            raise AlertParseError(
+                "OCO_AFTER_FILL requires TAKE_PROFIT: this plan takes explicit "
+                "stop and take-profit prices, not an R-multiple")
         if not fields.get("STOP_TRIGGER"):
             raise AlertParseError("OCO_AFTER_FILL requires STOP_TRIGGER")
     elif take_profit_raw:
@@ -152,6 +163,15 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     stop_limit = (None if (not limit_raw or limit_raw.upper() == "NONE")
                   else _positive_decimal(limit_raw, "STOP_LIMIT"))
     take_profit = _positive_decimal(take_profit_raw, "TAKE_PROFIT") if take_profit_raw else None
+    if take_profit is not None and trigger_raw:
+        stop_for_check = _positive_decimal(trigger_raw, "STOP_TRIGGER")
+        # The only direction check available before a fill price exists. A
+        # take-profit below the stop is not a tight target, it is the pair
+        # inverted — and it would arm, sit there, and never make sense.
+        if side == "buy" and take_profit <= stop_for_check:
+            raise AlertParseError(
+                f"TAKE_PROFIT {take_profit} is at or below STOP_TRIGGER "
+                f"{stop_for_check} on a BUY; the exit pair is inverted")
     if protective_stop and stop_limit is None:
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires a numeric STOP_LIMIT")
     if (exit_plan == "OCO_AFTER_FILL" and stop_limit is not None

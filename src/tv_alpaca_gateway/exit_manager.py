@@ -97,6 +97,13 @@ class Lot:
     seen_fills: set[str] = field(default_factory=set)
     stage: str = "ladder"
     stop_order_id: str | None = None
+    # Prices supplied by the alert, one per rung, instead of derived from R.
+    # Wei: "I will provide explicit stop and take profit prices on the OCO
+    # plan." An absolute price cannot go stale between the alert firing and
+    # the fill the way an R-multiple cannot go wrong — but it is what the
+    # strategy actually computed, and for a single-target plan there is no
+    # ladder geometry for R to express anyway.
+    explicit_targets: tuple[Decimal, ...] = ()
     reserved_qty: Decimal = Decimal("0")
     stop_generation: int = 0
     _broker: object | None = field(default=None, repr=False, compare=False)
@@ -160,6 +167,8 @@ class Lot:
         return self.entry_price - self.initial_stop
 
     def target_price(self, rung: int) -> Decimal:
+        if rung <= len(self.explicit_targets):
+            return self.explicit_targets[rung - 1]
         _fraction, multiple = self.plan.tranches[rung - 1]
         return self.entry_price + multiple * self.risk_per_unit
 
@@ -433,6 +442,7 @@ def dump_lot(lot: Lot) -> str:
         "event_id": lot.event_id, "symbol": lot.symbol, "timeframe": lot.timeframe,
         "stage": lot.stage, "stop_order_id": lot.stop_order_id,
         "stop_generation": lot.stop_generation,
+        "explicit_targets": [str(t) for t in lot.explicit_targets],
         "filled_rungs": sorted(lot.filled_rungs),
         "pending_rungs": sorted(lot.pending_rungs),
         "rung_filled_qty": {str(k): str(v) for k, v in lot.rung_filled_qty.items()},
@@ -468,6 +478,7 @@ def load_lot(state: str) -> Lot:
         ),
         **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
     )
+    lot.explicit_targets = tuple(Decimal(t) for t in raw.get("explicit_targets", []))
     lot.stage = raw["stage"]
     lot.stop_order_id = raw["stop_order_id"]
     lot.stop_generation = raw["stop_generation"]
