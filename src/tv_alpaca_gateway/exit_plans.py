@@ -28,6 +28,10 @@ _PLANS: dict[str, dict] = {
         runner_fraction=Decimal("0.50"),
         trail_source="previous_completed_bar_low",
         breakeven_after=1,
+        # Wei: "only for the part of dynamic_trail exit plan." Scoped here
+        # rather than made global, so the simple protective-stop path and any
+        # future plan are unaffected.
+        rungs_on_bar_high=True,
     ),
 }
 
