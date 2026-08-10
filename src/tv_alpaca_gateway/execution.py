@@ -363,7 +363,18 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     if command.exit_plan:
-        if command.exit_plan == "OCO_AFTER_FILL":
+        # One plan name, best available mechanism for the asset class.
+        #
+        #   equity  -> Alpaca's native OCO. The broker holds both legs, so the
+        #              pair survives this process dying, which software
+        #              management never can.
+        #   crypto  -> managed here. Alpaca has no native OCO for crypto at
+        #              all, so the alternative is not a worse OCO, it is none.
+        #
+        # Dispatching on the asset rather than refusing keeps the API's
+        # limitation out of the strategy: Wei writes one plan name and gets
+        # the strongest thing available for the symbol he wrote it on.
+        if command.exit_plan == "OCO_AFTER_FILL" and not crypto:
             return _submit_oco_exit(command, symbol, entry_id, entry_status,
                                     event_id, broker, store, held_qty)
         managed = _open_managed_lot(command, symbol, entry_id, entry_status,

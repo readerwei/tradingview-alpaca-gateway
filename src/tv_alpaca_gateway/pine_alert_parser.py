@@ -133,12 +133,23 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
     if exit_plan == "OCO_AFTER_FILL":
-        if crypto_symbol:
-            raise AlertParseError("OCO_AFTER_FILL is unsupported for crypto orders")
         if protective_stop:
             raise AlertParseError("OCO_AFTER_FILL cannot be combined with protective stop")
-        if not take_profit_raw:
-            raise AlertParseError("OCO_AFTER_FILL requires TAKE_PROFIT")
+        # Not refused for crypto. Alpaca has no native OCO there, but the plan
+        # is still available — the gateway manages the pair itself, the same
+        # way DYNAMIC_TRAIL already does. Rejecting at the parser would have
+        # made one plan name mean "works" on QQQ and "refused" on BTC/USD,
+        # which is a property of Alpaca's API leaking into the strategy.
+        #
+        # TAKE_PROFIT is therefore required only where it is the ONLY way to
+        # price the target: a native OCO leg is an absolute price. The managed
+        # path derives it from the plan's R-multiple in config, which is where
+        # Wei asked the numbers to live, and an absolute price in an alert goes
+        # stale — a four-hour-old stop level inverted on us last night.
+        if not crypto_symbol and not take_profit_raw:
+            raise AlertParseError(
+                "OCO_AFTER_FILL on an equity requires TAKE_PROFIT: the native "
+                "Alpaca OCO leg takes an absolute limit price")
         if not fields.get("STOP_TRIGGER"):
             raise AlertParseError("OCO_AFTER_FILL requires STOP_TRIGGER")
     elif take_profit_raw:
