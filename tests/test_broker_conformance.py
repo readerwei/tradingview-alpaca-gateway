@@ -248,3 +248,60 @@ def test_sdk_enums_are_unwrapped_to_the_strings_the_engine_compares_against():
 
     assert out["side"] == "sell", f"side came back as {out['side']!r}"
     assert out["type"] == "stop_limit", f"type came back as {out['type']!r}"
+
+
+def test_the_fake_broker_methods_actually_run():
+    """Presence is not conformance, part two.
+
+    `test_the_fake_broker_implements_it_too` checks the attributes exist and
+    are callable. That passed while `FakeBroker.position_qty` was **defined
+    twice** — a second definition, left behind by the SDK migration, silently
+    overrode the working one with a copy of the real client's urllib version.
+    Calling it raised `AttributeError: 'FakeBroker' object has no attribute
+    'settings'`, and 291 tests stayed green because none of them called it.
+
+    A double that cannot be run is not a double. This calls every method the
+    engine uses, with no network available.
+    """
+    from decimal import Decimal
+
+    broker = FakeBroker()
+    broker.positions["BTC/USD"] = Decimal("0.0015")
+    broker.prices["BTC/USD"] = 65000.0
+
+    placed = broker.submit_order(symbol="BTC/USD", side="buy", qty="0.0015",
+                                 type="market", time_in_force="gtc",
+                                 client_order_id="c-1")
+    assert placed["id"]
+    assert broker.position_qty("BTC/USD") >= 0
+    assert broker.min_order_size("BTC/USD") > 0
+    assert broker.min_order_size("QQQ") == Decimal("1")
+    assert broker.open_orders("BTC/USD") == [] or isinstance(broker.open_orders("BTC/USD"), list)
+    assert broker.get_order_by_client_id("c-1") is not None
+    assert broker.get_order_by_client_id("nope") is None
+    broker.fill_price(placed["id"])
+    broker.recent_bars("BTC/USD", "1")
+    broker.latest_trade_price("BTC/USD")
+    broker.cancel_order(placed["id"])
+
+
+def test_no_class_in_broker_defines_a_method_twice():
+    """The mechanical version of the rule above.
+
+    Python silently keeps the last definition, so a duplicate is invisible
+    until something calls it — and the SDK migration produced three of them
+    (`position_qty` and `recent_bars` in FakeBroker, `_latest_crypto_price` in
+    the real client) without a single test noticing.
+    """
+    import ast
+
+    from tv_alpaca_gateway import broker as module
+
+    tree = ast.parse(inspect.getsource(module))
+    for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+        seen: dict[str, int] = {}
+        for node in cls.body:
+            if isinstance(node, ast.FunctionDef):
+                seen[node.name] = seen.get(node.name, 0) + 1
+        dupes = sorted(name for name, count in seen.items() if count > 1)
+        assert not dupes, f"{cls.name} defines {dupes} more than once"

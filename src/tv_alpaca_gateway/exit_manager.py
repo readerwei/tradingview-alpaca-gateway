@@ -60,7 +60,13 @@ class ExitPlan:
             raise ExitPlanError(
                 f"tranche fractions sum to {total}, not 1 — the position would be "
                 "left partly unmanaged")
-        if self.trail_source != "previous_completed_bar_low":
+        if self.runner_fraction == 0:
+            # No runner means nothing to trail. Demanding a trail source anyway
+            # would force every take-profit-and-stop plan to name a mechanism it
+            # never uses.
+            if self.trail_source not in ("none", "previous_completed_bar_low"):
+                raise ExitPlanError(f"unsupported trail source: {self.trail_source!r}")
+        elif self.trail_source != "previous_completed_bar_low":
             raise ExitPlanError(f"unsupported trail source: {self.trail_source!r}")
 
 
@@ -312,10 +318,20 @@ class Lot:
 
     # ── broker effects ──────────────────────────────────────────────────────
 
+    def _require_broker(self) -> None:
+        """A lot that has not been through `open_lot` has no broker and no
+        resting stop. Saying so beats an AttributeError from three frames
+        down, which is what it used to give."""
+        if self._broker is None:
+            raise ExitPlanError(
+                f"lot {self.event_id} is not armed — open_lot() was never called, "
+                "so it has no broker and no resting stop")
+
     def _sellable(self, wanted: Decimal) -> Decimal:
         """Independent lots are our fiction; the broker has one position per
         symbol. Clamping to what is really held turns a silent accounting drift
         into a small visible one instead of an order for coins we do not own."""
+        self._require_broker()
         held = Decimal(str(self._broker.position_qty(self.symbol)))
         return min(wanted, held, self.remaining_qty)
 
