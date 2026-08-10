@@ -328,7 +328,7 @@ def create_app(
             # unreachable through the only path that can supply it.
             result = await asyncio.to_thread(
                 execution.execute_pine_command, command, settings, broker, store,
-                delivery_id=x_discord_message_id)
+                delivery_id=x_discord_message_id, supervisor=supervisor)
         except ExecutionError as exc:
             # Refused before anything reached the broker.
             raise HTTPException(status_code=403, detail=str(exc)) from exc

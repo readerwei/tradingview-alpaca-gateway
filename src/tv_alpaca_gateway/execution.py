@@ -133,6 +133,7 @@ def execute_pine_command(
     deadline_seconds: float = 60.0,
     poll_interval: float = 1.0,
     delivery_id: str | None = None,
+    supervisor: Any = None,
 ) -> ExecutionResult:
     settings.validate()
     if not settings.trading_enabled:
@@ -215,7 +216,8 @@ def execute_pine_command(
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     return _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
-                               event_id, broker, store, position_before, settings)
+                               event_id, broker, store, position_before, settings,
+                               supervisor)
 
 
 def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:
@@ -331,7 +333,7 @@ def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
 def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
                         event_id, broker, store,
                         position_before: Decimal = Decimal("0"),
-                        settings=None) -> ExecutionResult:
+                        settings=None, supervisor=None) -> ExecutionResult:
     """Protect what THIS entry added, not the whole position.
 
     Sizing from the total position was wrong twice over.
@@ -361,7 +363,8 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
 
     if command.exit_plan:
         managed = _open_managed_lot(command, symbol, entry_id, entry_status,
-                                    event_id, broker, store, held_qty, settings)
+                                    event_id, broker, store, held_qty, settings,
+                                    supervisor)
         if managed is not None:
             return managed
         # Falling through is deliberate. A ladder that cannot be built is a
@@ -398,7 +401,8 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
 
 
 def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
-                      broker, store, held_qty, settings=None) -> ExecutionResult | None:
+                      broker, store, held_qty, settings=None,
+                      supervisor=None) -> ExecutionResult | None:
     """Hand this entry to the exit manager. None means it could not be armed.
 
     The disaster stop is placed by `open_lot`, so this REPLACES the ordinary
@@ -448,7 +452,23 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
                        command.exit_plan, symbol, exc)
         return None
 
-    store.save_lot(event_id, symbol, lot.stage, exit_manager.dump_lot(lot))
+    # Hand it to the RUNNING supervisor, not just to the database.
+    #
+    # Without this the lot is armed at the broker and recorded on disk, and the
+    # live process has never heard of it: every price tick looks the symbol up,
+    # finds nothing, and does nothing. The ladder only came alive after a
+    # restart, when start() reloaded it from the store — so a take-profit that
+    # was already breached simply never fired.
+    #
+    # Observed in production before it was found in a test, which is the part
+    # worth remembering: the contract tests called supervisor.adopt() in their
+    # own setup, so they performed the exact wiring step the real path omits.
+    # A fixture that does the work under test cannot fail when the work is
+    # missing.
+    if supervisor is not None:
+        supervisor.adopt(lot)          # persists as part of remembering it
+    else:
+        store.save_lot(event_id, symbol, lot.stage, exit_manager.dump_lot(lot))
     store.update(event_id, "lot_opened",
                  f"plan={command.exit_plan} stop={lot.stop_order_id}",
                  broker_order_id=entry_id)

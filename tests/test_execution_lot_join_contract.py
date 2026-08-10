@@ -261,3 +261,69 @@ def test_a_lot_opens_normally_once_the_symbol_is_subscribed(tmp_path):
 
     assert result.protection_status == "lot_opened"
     assert store.open_lot_for("BTC/USD") is not None
+
+
+# ═══════════════════ the lot has to reach the RUNNING process, not just disk
+
+def test_a_new_lot_is_handed_to_the_running_supervisor(tmp_path):
+    """The bug that reached production, and the reason the tests missed it.
+
+    `execution` armed the disaster stop and wrote the lot to the database, and
+    the live supervisor never heard of it. Every price tick looked the symbol
+    up, found nothing and did nothing, so the ladder only came alive after a
+    restart reloaded it from the store. On the live paper account both rungs
+    were already breached and neither fired.
+
+    Every other test in this file passes `sup.adopt(lot)` in its own setup —
+    performing, in the fixture, the exact step production omits. A fixture that
+    does the work under test cannot fail when the work is missing. So this test
+    goes through `execute_pine_command` and then asks the supervisor, rather
+    than arranging the answer first.
+    """
+    from tv_alpaca_gateway.lot_supervisor import LotSupervisor
+
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
+    store = EventStore(settings.db_path)
+    broker = _Broker()
+    supervisor = LotSupervisor(store, broker)
+
+    execution.execute_pine_command(
+        parse_pine_alert(_with_plan()), settings, broker, store,
+        delivery_id="d-1", supervisor=supervisor)
+
+    assert supervisor._for("BTC/USD") is not None, (
+        "the lot was armed and persisted but the running supervisor never "
+        "learned of it; no price tick would ever reach it")
+
+
+def test_a_breached_target_fires_from_a_live_price_tick(tmp_path):
+    """End to end, the way it failed in production.
+
+    Entry, then a trade print above the first target, and the rung must sell.
+    Nothing is adopted by hand: if the wiring is missing this stays silent
+    exactly as the live account did.
+    """
+    from tv_alpaca_gateway.lot_supervisor import LotSupervisor
+
+    settings = _settings(tmp_path, crypto_symbols=("BTC/USD",))
+    store = EventStore(settings.db_path)
+    broker = _Broker()
+    supervisor = LotSupervisor(store, broker)
+
+    execution.execute_pine_command(
+        parse_pine_alert(_with_plan()), settings, broker, store,
+        delivery_id="d-1", supervisor=supervisor)
+
+    lot = supervisor._for("BTC/USD")
+    supervisor.on_trade(_Trade("BTC/USD", lot.target_price(1) + Decimal("1")))
+
+    sold = [o for o in broker.submitted
+            if o["type"] == "market" and o["side"] == "sell"
+            and "-tp1" in o.get("client_order_id", "")]
+    assert sold, "a trade print past TP1 did not fire the rung"
+    assert Decimal(str(sold[0]["qty"])) == lot.tranche_qty(1)
+
+
+class _Trade:
+    def __init__(self, symbol, price):
+        self.symbol, self.price = symbol, float(price)
