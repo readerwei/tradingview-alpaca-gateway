@@ -773,3 +773,64 @@ class _RecordingBroker:
                        if f"ord-{i + 1}" in self._resting}
         return [o for i, o in enumerate(self.submitted)
                 if f"ord-{i + 1}" in resting_ids]
+
+
+# ═══════════════════════════ a target the feed crossed without printing there
+
+def test_a_bar_high_past_a_target_fires_the_rung():
+    """The live miss this exists for.
+
+    TP1 sat at 65,139.84. The minute that crossed it:
+
+        05:59  h=65,095.98  trades=0
+        06:00  h=65,153.21  trades=1   <- the entire breach, one print
+        06:01  h=65,116.90  trades=0
+
+    Only 34% of Alpaca's BTC/USD 1m bars contain any trade, so firing purely
+    on prints gives a target one chance and sometimes none. The bar high is
+    proof the price was reached.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(plan=manager.ExitPlan(**{**PLAN, "rungs_on_bar_high": True})),
+                           broker)
+
+    lot.on_bar(high=TP1_PRICE + Decimal("10"), low=ENTRY,
+               close=ENTRY + Decimal("5"), trade_count=1)
+
+    sold = [o for o in broker.submitted
+            if o["type"] == "market" and "-tp1" in o.get("client_order_id", "")]
+    assert sold, "a bar whose high passed TP1 did not fire the rung"
+    assert Decimal(str(sold[0]["qty"])) == lot.tranche_qty(1)
+
+
+def test_a_quote_only_bar_high_does_not_fire_a_rung():
+    """Same rule the trail obeys, for the same reason: a bar with no trades is
+    built from quotes, and selling into a price nothing traded at is worse than
+    waiting for one that did."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(plan=manager.ExitPlan(**{**PLAN, "rungs_on_bar_high": True})),
+                           broker)
+
+    lot.on_bar(high=TP2_PRICE, low=ENTRY, close=ENTRY, trade_count=0)
+
+    assert not [o for o in broker.submitted if o["type"] == "market"], (
+        "a quote-only bar fired a rung")
+
+
+def test_a_plan_without_the_flag_still_needs_a_trade_print():
+    """Wei scoped this to DYNAMIC_TRAIL. A plan that has not opted in must
+    behave exactly as before — the flag is a plan property, not a global change
+    of when profit is taken."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)          # PLAN, no flag
+    assert lot.plan.rungs_on_bar_high is False
+
+    lot.on_bar(high=TP2_PRICE, low=ENTRY, close=ENTRY, trade_count=9)
+
+    assert not [o for o in broker.submitted if o["type"] == "market"]
+
+
+def test_the_shipped_dynamic_trail_plan_has_it_on():
+    from tv_alpaca_gateway import exit_plans
+
+    assert exit_plans.resolve("DYNAMIC_TRAIL").rungs_on_bar_high is True

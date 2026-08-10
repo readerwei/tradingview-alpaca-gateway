@@ -47,6 +47,10 @@ class ExitPlan:
     runner_fraction: Decimal
     trail_source: str
     breakeven_after: int
+    # Whether a completed bar's HIGH can trigger a rung, not just a trade print.
+    # Per-plan rather than global: it changes when a strategy takes profit, so
+    # it belongs with the tranches and the R-multiples, not in the engine.
+    rungs_on_bar_high: bool = False
 
     def validate(self) -> None:
         if not self.tranches:
@@ -226,9 +230,37 @@ class Lot:
         stop up to prices nothing ever traded at, and the next spread wobble
         takes the position out.
         """
-        if self.is_closed or self.stage != "runner":
+        if self.is_closed:
             return
         if trade_count == 0:
+            # No trades: the bar is built from quotes, and neither a stop nor a
+            # take-profit should act on a price nothing traded at.
+            return
+
+        # A target crossed by the bar's HIGH was genuinely reached, whether or
+        # not a trade printed there in the instant we were listening.
+        #
+        # Alpaca's crypto feed made this necessary rather than merely nice:
+        # measured over twelve hours, only 34% of BTC/USD 1m bars contain any
+        # trade at all. A live example — TP1 at 65,139.84, and the minute that
+        # crossed it looked like this:
+        #
+        #     05:59  h=65,095.98  trades=0
+        #     06:00  h=65,153.21  trades=1   <- the whole breach, one print
+        #     06:01  h=65,116.90  trades=0
+        #
+        # Firing only on trade prints gives the ladder one chance per target,
+        # and sometimes none. Checking the bar high turns "we must catch the
+        # tick" into "we cannot miss the minute", at a cost of up to one bar of
+        # latency on a strategy whose runner already trails on bar closes.
+        if self.stage == "ladder" and self.plan.rungs_on_bar_high:
+            for rung in range(1, len(self.plan.tranches) + 1):
+                if rung in self.filled_rungs or rung in self.pending_rungs:
+                    continue
+                if high >= self.target_price(rung):
+                    self._fire_rung(rung)
+
+        if self.stage != "runner":
             return
         if low > self.working_stop:
             self.working_stop = low          # monotonic: never loosens
