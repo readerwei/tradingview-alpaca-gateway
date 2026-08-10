@@ -31,6 +31,32 @@ Health check:
 curl http://127.0.0.1:8000/healthz
 ```
 
+## Direct parsed-alert runner
+
+For paper testing, the same parsed Pine command can be run without TradingView,
+Discord, or webhook HTTP. The runner uses the real parser, risk checks,
+execution engine, broker adapter, SQLite store, supervisor, and streams.
+Without `--execute` it is parse-only; `--execute` is required to submit an
+order and still requires `PAPER_TRADING=true`. It stays alive after setup so
+managed exits continue to receive stream events; use `--once` for a
+broker-held native equity OCO test.
+
+```bash
+# Parse only (safe default)
+cat alert.txt | uv run tv-alpaca-run-alert
+
+# Execute and keep managing the paper position
+cat alert.txt | uv run tv-alpaca-run-alert --execute
+
+# Execute a native equity OCO and exit after the broker accepts it
+uv run tv-alpaca-run-alert --alert-file qqq-oco.txt --execute --once
+```
+
+Do not run this against a live environment. Before `--execute`, verify
+`/healthz`, `PAPER_TRADING=true`, the merged commit, the account position, and
+open orders. Do not start a new managed lot while another lot for that symbol
+is open.
+
 Send a **fresh, non-executing** test alert (the default `TRADING_ENABLED=false` kill switch remains in force):
 
 ```bash

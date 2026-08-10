@@ -25,6 +25,7 @@ test = [
 
 [project.scripts]
 tv-alpaca-gateway = "tv_alpaca_gateway.main:run"
+tv-alpaca-run-alert = "tv_alpaca_gateway.direct_runner:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
