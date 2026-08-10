@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from tv_alpaca_gateway.alpaca_exit_broker import AlpacaPaperExitBroker
 from tv_alpaca_gateway.config import Settings
+from tv_alpaca_gateway.broker import AlpacaPaperClient
 
 
 class CapturingBroker(AlpacaPaperExitBroker):
@@ -47,3 +48,17 @@ def test_paper_exit_broker_uses_limit_and_trailing_stop_payloads():
             },
         ),
     ]
+
+
+def test_alpaca_client_builds_native_oco_request_with_optional_stop_limit():
+    client = object.__new__(AlpacaPaperClient)
+    request = client._order_request(
+        symbol="QQQ", qty=302, side="sell", type="limit", time_in_force="gtc",
+        order_class="oco", take_profit_limit_price=724.89,
+        stop_loss_stop_price=723.65, stop_loss_limit_price=None,
+        client_order_id="event-oco")
+
+    assert request.order_class.value == "oco"
+    assert request.take_profit.limit_price == 724.89
+    assert request.stop_loss.stop_price == 723.65
+    assert request.stop_loss.limit_price is None

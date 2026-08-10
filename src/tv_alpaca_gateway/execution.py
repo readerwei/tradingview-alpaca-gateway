@@ -212,7 +212,7 @@ def execute_pine_command(
     if entry_status != "filled":
         return ExecutionResult(entry_id, entry_status=entry_status)
 
-    if not command.place_protective_stop_after_fill:
+    if not command.place_protective_stop_after_fill and command.exit_plan != "OCO_AFTER_FILL":
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     return _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
@@ -269,7 +269,8 @@ def _await_fill_or_cancel(command, entry_id, entry_status, event_id, broker,
     #
     # So: wait whenever the outcome depends on knowing the fill happened.
     # Cancel only when the alert asked for it.
-    needs_fill = command.place_protective_stop_after_fill
+    needs_fill = (command.place_protective_stop_after_fill
+                  or command.exit_plan == "OCO_AFTER_FILL")
     if not (command.cancel_unfilled_at_deadline or needs_fill):
         return entry_status
 
@@ -362,6 +363,9 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     if command.exit_plan:
+        if command.exit_plan == "OCO_AFTER_FILL":
+            return _submit_oco_exit(command, symbol, entry_id, entry_status,
+                                    event_id, broker, store, held_qty)
         managed = _open_managed_lot(command, symbol, entry_id, entry_status,
                                     event_id, broker, store, held_qty, settings,
                                     supervisor)
@@ -398,6 +402,30 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
 
     return _flatten(command, symbol, entry_id, entry_status, event_id, broker,
                     store, last_error, held_qty)
+
+
+def _submit_oco_exit(command, symbol, entry_id, entry_status, event_id, broker,
+                     store, held_qty) -> ExecutionResult:
+    """Submit one native Alpaca OCO exit for the delta filled by this entry."""
+    try:
+        order = broker.submit_order(
+            symbol=symbol, qty=held_qty,
+            side="sell" if command.side == "buy" else "buy",
+            type="limit", time_in_force=PROTECTION_TIME_IN_FORCE,
+            order_class="oco",
+            take_profit_limit_price=command.take_profit,
+            stop_loss_stop_price=command.stop_trigger,
+            stop_loss_limit_price=command.stop_limit,
+            client_order_id=f"{event_id}-oco")
+    except Exception as exc:
+        return _flatten(command, symbol, entry_id, entry_status, event_id, broker,
+                        store, exc, held_qty)
+    protection_id = str(order["id"])
+    store.update(event_id, "protection_submitted",
+                 f"protection_order_id={protection_id}", broker_order_id=entry_id)
+    store.record_broker_order(protection_id, event_id, "protection",
+                              str(order.get("status", "new")))
+    return ExecutionResult(entry_id, protection_id, entry_status, "submitted")
 
 
 def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
