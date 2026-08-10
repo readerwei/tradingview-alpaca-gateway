@@ -75,7 +75,7 @@ The repository includes `parse_pine_alert()` for the current pipe-delimited Pine
 EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | CANCEL_UNFILLED_AT_DEADLINE=YES | PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=65000 | STOP_LIMIT=64950 | TRAIL=NONE
 ```
 
-It parses and validates `SYMBOL`, `SIDE`, `QTY`, `ORDER_TYPE`, `TIME_IN_FORCE`, `CANCEL_UNFILLED_AT_DEADLINE`, the protective-stop flag, `STOP_TRIGGER`, `STOP_LIMIT`, and `TRAIL`. The current parser accepts only `ORDER_TYPE=MARKET`; it will not represent a non-market entry until the contract gains explicit entry-price fields. `BTCUSD` is normalized to `BTC/USD`; `TRAIL=NONE` becomes no trail, while `TRAIL=250` means a $250 trail distance. The parser deliberately ignores non-executable instruction fields such as `REQUIRED_ACTIONS` and `DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL`.
+It parses and validates `SYMBOL`, `SIDE`, `QTY`, `ORDER_TYPE`, `TIME_IN_FORCE`, `CANCEL_UNFILLED_AT_DEADLINE`, the protective-stop flag, `STOP_TRIGGER`, `STOP_LIMIT`, `TAKE_PROFIT`, and `TRAIL`. The current parser accepts only `ORDER_TYPE=MARKET`; it will not represent a non-market entry until the contract gains explicit entry-price fields. `BTCUSD` is normalized to `BTC/USD`; `TRAIL=NONE` becomes no trail, while `TRAIL=250` means a $250 trail distance. The parser deliberately ignores non-executable instruction fields such as `REQUIRED_ACTIONS` and `DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL`.
 
 The parser is wired into the authenticated execution route, `POST /webhooks/tradingview/pine/submit`. That route delegates to the single `execute_pine_command()` engine, which performs risk checks, idempotency claiming, entry submission, fill monitoring, protection, and optional managed-exit setup. The dry-run endpoint remains available for parse-only validation and never calls risk approval, an Alpaca client, order submission, fill monitoring, cancellation, or protection logic.
 
@@ -161,6 +161,22 @@ background-task lifecycle replaces the in-request wait. The follow-up should
 return the entry id immediately and reconcile the fill out of band.
 
 ## Dynamic managed exits
+
+### Native equity OCO after fill
+
+For equities, `EXIT_PLAN=OCO_AFTER_FILL` arms one native Alpaca OCO exit after
+the entry fills. The exit is sized from the measured position delta (not the
+requested entry quantity), uses a sell limit take-profit plus a stop-market
+stop-loss, and is submitted with client ID `<event-id>-oco`:
+
+```text
+EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=302 | ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EVENT_ID=qqq-oco-1 | EXIT_PLAN=OCO_AFTER_FILL | STOP_TRIGGER=723.65 | STOP_LIMIT=NONE | TAKE_PROFIT=724.89
+```
+
+`TAKE_PROFIT` and `STOP_TRIGGER` are required. `STOP_LIMIT=NONE` means a
+stop-market leg; a numeric `STOP_LIMIT` creates a stop-limit leg. This plan
+does not use `INTERVAL` and is rejected for crypto. `DYNAMIC_TRAIL` remains
+unchanged and still requires `INTERVAL`.
 
 The named `DYNAMIC_TRAIL` plan is paper-only and must be requested explicitly in
 the Pine alert:

@@ -22,7 +22,7 @@ _REQUIRED_FIELDS = frozenset({"SYMBOL", "SIDE", "QTY", "ORDER_TYPE", "TIME_IN_FO
 _OPTIONAL_PROVENANCE_FIELDS = frozenset({"EVENT_ID", "BAR_TIME"})
 _EXECUTABLE_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_PROVENANCE_FIELDS | frozenset({
     "CANCEL_UNFILLED_AT_DEADLINE", "STOP_TRIGGER", "STOP_LIMIT", "TRAIL",
-    "EXIT_PLAN", "INTERVAL",
+    "EXIT_PLAN", "INTERVAL", "TAKE_PROFIT",
 })
 # TradingView renders {{interval}} as a bare number for minutes ("1", "5"),
 # and a suffixed form for anything coarser ("1H", "D", "W"). Both are
@@ -57,6 +57,7 @@ class PineOrderCommand:
     stop_trigger: Decimal | None
     stop_limit: Decimal | None
     trail: Decimal | None
+    take_profit: Decimal | None = None
     exit_plan: str | None = None
     interval: str | None = None
 
@@ -129,13 +130,33 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError("TIME_IN_FORCE is not supported")
 
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
+    exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
+    take_profit_raw = fields.get("TAKE_PROFIT")
+    if exit_plan == "OCO_AFTER_FILL":
+        if crypto_symbol:
+            raise AlertParseError("OCO_AFTER_FILL is unsupported for crypto orders")
+        if protective_stop:
+            raise AlertParseError("OCO_AFTER_FILL cannot be combined with protective stop")
+        if not take_profit_raw:
+            raise AlertParseError("OCO_AFTER_FILL requires TAKE_PROFIT")
+        if not fields.get("STOP_TRIGGER"):
+            raise AlertParseError("OCO_AFTER_FILL requires STOP_TRIGGER")
+    elif take_profit_raw:
+        raise AlertParseError("TAKE_PROFIT requires EXIT_PLAN=OCO_AFTER_FILL")
     trigger_raw, limit_raw = fields.get("STOP_TRIGGER"), fields.get("STOP_LIMIT")
     if protective_stop and (not trigger_raw or not limit_raw):
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires STOP_TRIGGER and STOP_LIMIT")
-    if not protective_stop and (trigger_raw or limit_raw):
+    if not protective_stop and exit_plan != "OCO_AFTER_FILL" and (trigger_raw or limit_raw):
         raise AlertParseError("STOP_TRIGGER and STOP_LIMIT require PLACE_PROTECTIVE_STOP_AFTER_FILL")
     stop_trigger = _positive_decimal(trigger_raw, "STOP_TRIGGER") if trigger_raw else None
-    stop_limit = _positive_decimal(limit_raw, "STOP_LIMIT") if limit_raw else None
+    stop_limit = (None if (not limit_raw or limit_raw.upper() == "NONE")
+                  else _positive_decimal(limit_raw, "STOP_LIMIT"))
+    take_profit = _positive_decimal(take_profit_raw, "TAKE_PROFIT") if take_profit_raw else None
+    if protective_stop and stop_limit is None:
+        raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires a numeric STOP_LIMIT")
+    if (exit_plan == "OCO_AFTER_FILL" and stop_limit is not None
+            and stop_trigger is not None and stop_limit > stop_trigger):
+        raise AlertParseError("OCO_AFTER_FILL requires STOP_LIMIT <= STOP_TRIGGER")
     if stop_trigger is not None and stop_limit is not None:
         if side == "buy" and stop_limit > stop_trigger:
             raise AlertParseError(
@@ -144,13 +165,12 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
             raise AlertParseError(
                 "protective SELL stop-limit requires STOP_LIMIT >= STOP_TRIGGER")
 
-    exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     interval = fields.get("INTERVAL") or None
     if interval is not None and not _INTERVAL.match(interval):
         raise AlertParseError(
             f"INTERVAL {interval!r} is not a TradingView interval; the runner's "
             "trail has no bar size without it")
-    if exit_plan and interval is None:
+    if exit_plan and exit_plan != "OCO_AFTER_FILL" and interval is None:
         raise AlertParseError(
             "EXIT_PLAN requires INTERVAL — \"previous completed bar low\" has no "
             "meaning without a bar size. Send INTERVAL={{interval}}")
@@ -175,6 +195,7 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         stop_trigger=stop_trigger,
         stop_limit=stop_limit,
         trail=trail,
+        take_profit=take_profit,
         exit_plan=exit_plan,
         interval=interval,
     )

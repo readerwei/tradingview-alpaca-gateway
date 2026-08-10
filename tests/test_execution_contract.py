@@ -373,6 +373,30 @@ def test_an_equity_entry_keeps_its_day_time_in_force(tmp_path):
     assert entry["time_in_force"] == "day"
 
 
+def test_oco_after_fill_submits_one_native_exit_for_the_position_delta(tmp_path):
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=302 | "
+             "EVENT_ID=qqq-oco-1 | BAR_TIME=" + _now() + " | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | "
+             "EXIT_PLAN=OCO_AFTER_FILL | STOP_TRIGGER=723.65 | "
+             "STOP_LIMIT=NONE | TAKE_PROFIT=724.89")
+    broker = RecordingBroker()
+    result = _run(alert, _settings(tmp_path, max_qty=1000, max_notional=30_000_000), broker)
+
+    assert result.protection_status == "submitted"
+    exits = [o for o in broker.submitted if o.get("order_class") == "oco"]
+    assert len(exits) == 1
+    exit_order = exits[0]
+    assert exit_order["side"] == "sell"
+    assert Decimal(str(exit_order["qty"])) == broker.position_qty("QQQ")
+    assert exit_order["type"] == "limit"
+    assert exit_order["time_in_force"] == "gtc"
+    assert exit_order["client_order_id"] == "pine-exec-qqq-oco-1-oco"
+    assert exit_order["take_profit_limit_price"] == Decimal("724.89")
+    assert exit_order["stop_loss_stop_price"] == Decimal("723.65")
+    assert exit_order["stop_loss_limit_price"] is None
+    assert len([o for o in broker.submitted if o.get("side") == "sell"]) == 1
+
+
 class _ProtectionFails(RecordingBroker):
     """Refuses the first `fail_times` protective orders, then behaves."""
 

@@ -26,6 +26,11 @@ from tv_alpaca_gateway.pine_alert_parser import AlertParseError, parse_pine_aler
 BASE = ("EXECUTE_ALPACA_ORDER | SYMBOL=BTC/USD | SIDE=BUY | QTY=0.0015 | "
         "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC")
 
+OCO_BASE = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=302 | "
+            "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EVENT_ID=qqq-oco-1 | "
+            "EXIT_PLAN=OCO_AFTER_FILL | STOP_TRIGGER=723.65 | "
+            "STOP_LIMIT=NONE | TAKE_PROFIT=724.89")
+
 
 def _alert(**fields):
     extra = "".join(f" | {k}={v}" for k, v in fields.items() if v is not None)
@@ -51,6 +56,27 @@ def test_an_exit_plan_without_an_interval_is_refused():
     and every order would still look legitimate."""
     with pytest.raises(AlertParseError, match=r"(?i)INTERVAL"):
         parse_pine_alert(_alert(EXIT_PLAN="DYNAMIC_TRAIL"))
+
+
+def test_oco_after_fill_does_not_require_an_interval():
+    command = parse_pine_alert(OCO_BASE)
+    assert command.exit_plan == "OCO_AFTER_FILL"
+    assert command.interval is None
+    assert command.stop_trigger == Decimal("723.65")
+    assert command.stop_limit is None
+    assert command.take_profit == Decimal("724.89")
+
+
+def test_oco_after_fill_requires_both_exit_prices():
+    with pytest.raises(AlertParseError, match=r"(?i)TAKE_PROFIT"):
+        parse_pine_alert(OCO_BASE.replace(" | TAKE_PROFIT=724.89", ""))
+    with pytest.raises(AlertParseError, match=r"(?i)STOP_TRIGGER"):
+        parse_pine_alert(OCO_BASE.replace("STOP_TRIGGER=723.65 | ", ""))
+
+
+def test_oco_after_fill_is_rejected_for_crypto():
+    with pytest.raises(AlertParseError, match=r"(?i)crypto|OCO_AFTER_FILL"):
+        parse_pine_alert(OCO_BASE.replace("SYMBOL=QQQ", "SYMBOL=BTCUSD"))
 
 
 @pytest.mark.parametrize("interval", ["1", "5", "15", "60", "1H", "D", "W"])

@@ -90,7 +90,7 @@ class AlpacaPaperClient:
 
     def _order_request(self, **kwargs: Any) -> Any:
         from alpaca.trading import requests as rq
-        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 
         shared = dict(
             symbol=kwargs["symbol"],
@@ -100,6 +100,17 @@ class AlpacaPaperClient:
             client_order_id=kwargs.get("client_order_id"),
         )
         order_type = str(kwargs.get("type", "market")).lower()
+        if str(kwargs.get("order_class", "")).lower() == "oco":
+            return rq.LimitOrderRequest(
+                **shared,
+                order_class=OrderClass.OCO,
+                take_profit=rq.TakeProfitRequest(
+                    limit_price=float(kwargs["take_profit_limit_price"])),
+                stop_loss=rq.StopLossRequest(
+                    stop_price=float(kwargs["stop_loss_stop_price"]),
+                    limit_price=(float(kwargs["stop_loss_limit_price"])
+                                 if kwargs.get("stop_loss_limit_price") is not None else None)),
+            )
         if order_type == "market":
             return rq.MarketOrderRequest(**shared)
         if order_type == "limit":
