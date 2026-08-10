@@ -77,7 +77,7 @@ EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | ORDER_TYPE=MARKET 
 
 It parses and validates `SYMBOL`, `SIDE`, `QTY`, `ORDER_TYPE`, `TIME_IN_FORCE`, `CANCEL_UNFILLED_AT_DEADLINE`, the protective-stop flag, `STOP_TRIGGER`, `STOP_LIMIT`, and `TRAIL`. The current parser accepts only `ORDER_TYPE=MARKET`; it will not represent a non-market entry until the contract gains explicit entry-price fields. `BTCUSD` is normalized to `BTC/USD`; `TRAIL=NONE` becomes no trail, while `TRAIL=250` means a $250 trail distance. The parser deliberately ignores non-executable instruction fields such as `REQUIRED_ACTIONS` and `DO_NOT_SUMMARIZE_OR_REPOST_BEFORE_BROKER_CALL`.
 
-This parser is not wired into the order-submission route. It is exposed only through an authenticated dry-run endpoint, `POST /webhooks/tradingview/pine/dry-run`, which parses and records the normalized command but never calls risk approval, an Alpaca client, order submission, fill monitoring, cancellation, or protection logic.
+The parser is wired into the authenticated execution route, `POST /webhooks/tradingview/pine/submit`. That route delegates to the single `execute_pine_command()` engine, which performs risk checks, idempotency claiming, entry submission, fill monitoring, protection, and optional managed-exit setup. The dry-run endpoint remains available for parse-only validation and never calls risk approval, an Alpaca client, order submission, fill monitoring, cancellation, or protection logic.
 
 ```bash
 curl --data-binary @alert.txt \
@@ -86,7 +86,7 @@ curl --data-binary @alert.txt \
   http://127.0.0.1:8000/webhooks/tradingview/pine/dry-run
 ```
 
-The endpoint accepts raw request bytes (the example sends `text/plain`) and rejects bodies over 4,096 bytes with HTTP 413 before decoding or parsing. A successful response contains `dry_run: true`, an audit ID, and the normalized command. This is the safe way to verify that an actual Pine alert reaches the parser before any execution wiring exists.
+The endpoint accepts raw request bytes (the example sends `text/plain`) and rejects bodies over 4,096 bytes with HTTP 413 before decoding or parsing. A successful response contains `dry_run: true`, an audit ID, and the normalized command. This is the safe way to verify that an actual Pine alert reaches the parser without placing an order.
 
 ## JSON webhook payload (existing FastAPI route)
 
@@ -159,6 +159,76 @@ Treat this as a reviewed, paper-only integration milestone. **Do not connect a
 live TradingView alert to it**, and do not treat it as production-safe, until the
 background-task lifecycle replaces the in-request wait. The follow-up should
 return the entry id immediately and reconcile the fill out of band.
+
+## Dynamic managed exits
+
+The named `DYNAMIC_TRAIL` plan is paper-only and must be requested explicitly in
+the Pine alert:
+
+```text
+EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m | EVENT_ID={{ticker}}-{{interval}}-{{time}}
+```
+
+The plan is deterministic and anchored to the actual entry fill and original
+disaster stop:
+
+```text
+TP1:       +1.2R, sell 20%
+TP2:       +2.5R, sell 30%
+Runner:    remaining 50%
+After TP1: move the software stop to the exact entry fill (breakeven)
+```
+
+Take-profit levels are software triggers, not resting Alpaca orders. A TP order
+is submitted only when an incoming trade crosses its level. The runner trail is
+based on the previous completed eligible 1-minute crypto bar low; missing,
+forming, zero-trade, or synthetic bars do not advance it. The long trail is
+monotonic and never moves downward.
+
+Alpaca crypto supports simple `stop_limit` protection, but not native crypto
+brackets, OCO, or trailing-stop orders. The gateway therefore owns the ladder
+state and persists lots, rung attempts, fills, and stop generations in SQLite.
+Because a resting protection order reserves the position quantity, stop changes
+use this sequence:
+
+```text
+cancel old protection → place resized replacement → confirm replacement →
+submit the TP tranche
+```
+
+The live `LotSupervisor` must receive each newly opened lot immediately. Startup
+recovery also reloads open lots from SQLite, but a restart is not required for a
+new alert to become active. This handoff is covered by production-path
+regression tests; tests must not call `supervisor.adopt()` before exercising the
+execution path under test.
+
+For a safe paper-only arming session:
+
+```bash
+set -a; . ./.env; set +a
+export PAPER_TRADING=true
+export TRADING_ENABLED=true
+export ALPACA_STREAM_ENABLED=true
+export ALPACA_MARKET_DATA_FEED=iex
+export MARKET_SYMBOLS=QQQ
+export CRYPTO_SYMBOLS='BTC/USD,ETH/USD,ETH/BTC'
+export GATEWAY_DB_PATH=/tmp/tv-master-paper.sqlite3
+
+uv run uvicorn tv_alpaca_gateway.app:app \
+  --host 127.0.0.1 --port 8000 --log-level info
+```
+
+In another shell, verify the process before sending an alert:
+
+```bash
+curl -s http://127.0.0.1:8000/healthz | python3 -m json.tool
+```
+
+Confirm `paper_trading` and `trading_enabled` are both `true`, the reported
+commit is the intended checkout, and `market`, `crypto`, and `trade_updates`
+are all `connected`. Stop with `Ctrl-C` when finished. Set
+`TRADING_ENABLED=false` to keep the gateway running but disarmed. Never print or
+commit `.env` or broker credentials.
 
 ## Crypto
 
@@ -275,22 +345,15 @@ uv run python -c 'from tv_alpaca_gateway.relay import run_relay; run_relay()'
 
 For production, put the service behind a managed HTTPS reverse proxy, add a durable queue/worker, rotate secrets, monitor failures, and keep the kill switch accessible outside the request process. Receipt-notification failures are deliberately isolated from broker submission state.
 
-## Managed exits (paper-only core)
+## Test and deployment boundaries
 
-`tv_alpaca_gateway.order_manager.ExitManager` coordinates multiple fixed take-profit limit orders with one trailing-stop order. It is intentionally broker-agnostic and deterministic:
+The repository is paper-only by design. Keep disposable review checkouts,
+clones, and test databases outside the canonical project directory; for this
+environment use `/home/wzhao/sandbox`. Do not create project worktrees directly
+under the user's home directory.
 
-```python
-from decimal import Decimal
-from tv_alpaca_gateway.order_manager import ExitManager, ExitPlan
-from tv_alpaca_gateway.alpaca_exit_broker import AlpacaPaperExitBroker
-
-plan = ExitPlan(
-    symbol="QQQ",
-    take_profits=((Decimal("725"), 3), (Decimal("730"), 3)),
-    trail_percent=Decimal("2"),
-)
-manager = ExitManager(AlpacaPaperExitBroker(settings), plan)
-manager.start(position_qty=10)  # 3 + 3 at targets, 4 under trailing stop
-```
-
-When a take-profit fill arrives from Alpaca trade updates, call `on_fill(FillEvent(...))`; the manager reduces the trailing-stop quantity. If the trailing stop fills, it cancels the unfilled take-profit orders. This is not a native Alpaca OCO relationship, so the controller must persist state, reconcile after restarts, and fail closed before any live use. The current implementation remains paper-only and is not wired to the gateway kill switch or a live WebSocket worker.
+The current implementation remains a reviewed paper integration, not a live
+trading system. Before any unattended use, add a durable background execution
+queue, explicit operator controls, stronger restart reconciliation, monitoring,
+and a live-environment design review. No live credentials or live Alpaca URL
+are accepted by `Settings.validate()`.
