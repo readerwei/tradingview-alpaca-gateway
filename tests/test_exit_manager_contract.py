@@ -834,3 +834,29 @@ def test_the_shipped_dynamic_trail_plan_has_it_on():
     from tv_alpaca_gateway import exit_plans
 
     assert exit_plans.resolve("DYNAMIC_TRAIL").rungs_on_bar_high is True
+
+
+def test_client_order_ids_do_not_double_the_prefix():
+    """Live orders carried it for two days:
+
+        pine-exec-pine-exec-btc-direct-20260811-001-protection-0
+
+    `_command_id` already returns `pine-exec-<identity>` and that is what a lot
+    receives as its event_id. Harmless — every generator and matcher doubled
+    identically — but wrong in every audit trail, and it spends the
+    128-character client-order-id budget twice as fast as it should.
+    """
+    lot = _lot(event_id="pine-exec-btc-001")
+
+    assert lot.stop_client_order_id == "pine-exec-btc-001-protection"
+    assert lot.rung_client_order_id(1) == "pine-exec-btc-001-tp1"
+    assert "pine-exec-pine-exec" not in lot.stop_client_order_id
+
+
+def test_an_event_id_without_the_prefix_still_gets_one():
+    """The helper must not simply strip: a lot created with a bare id still
+    needs the namespace, or its orders stop being identifiable as ours."""
+    lot = _lot(event_id="btc-001")
+
+    assert lot.stop_client_order_id == "pine-exec-btc-001-protection"
+    assert lot.rung_client_order_id(2) == "pine-exec-btc-001-tp2"
