@@ -152,8 +152,20 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
                 "stop and take-profit prices, not an R-multiple")
         if not fields.get("STOP_TRIGGER"):
             raise AlertParseError("OCO_AFTER_FILL requires STOP_TRIGGER")
-    elif take_profit_raw:
-        raise AlertParseError("TAKE_PROFIT requires EXIT_PLAN=OCO_AFTER_FILL")
+    elif take_profit_raw and not exit_plan:
+        # Allowed with ANY plan, not just OCO_AFTER_FILL. On a ladder it prices
+        # the first rung explicitly and the rest still derive from R.
+        #
+        # This exists for testability as much as for trading. Six live runs
+        # produced six correct arms and not one rung, because every one of them
+        # needed the market to travel a set distance inside a window nobody
+        # controlled. A target the strategy names outright can be placed where
+        # it will fire, which turns "wait and hope" into an actual experiment —
+        # and the sequence it exercises (reserve, resize the stop BEFORE
+        # selling, sell, route the fill, move to breakeven) is the same one
+        # that runs in production.
+        raise AlertParseError(
+            "TAKE_PROFIT requires an EXIT_PLAN; there is nothing to apply it to")
     trigger_raw, limit_raw = fields.get("STOP_TRIGGER"), fields.get("STOP_LIMIT")
     if protective_stop and (not trigger_raw or not limit_raw):
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires STOP_TRIGGER and STOP_LIMIT")
