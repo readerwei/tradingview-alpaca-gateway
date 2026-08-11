@@ -344,3 +344,48 @@ def test_an_explicit_target_survives_the_store():
     lot.explicit_targets = (D("66000"),)
 
     assert m.load_lot(m.dump_lot(lot)).target_price(1) == D("66000")
+
+
+# ═══════════════ an explicit first target, so a rung can be made to fire
+
+def test_take_profit_prices_the_first_rung_of_a_ladder():
+    """Testability, and the reason it matters.
+
+    Six live runs produced six correct arms and not one rung, because every one
+    needed the market to travel a set distance inside a window nobody
+    controlled. A target the strategy names outright can be placed where it
+    will fire — turning a vigil into an experiment — and the sequence it
+    exercises is the production one: reserve, resize the stop BEFORE selling,
+    sell, route the fill, move to breakeven.
+    """
+    alert = (_alert(EXIT_PLAN="DYNAMIC_TRAIL", INTERVAL="1") +
+             " | TAKE_PROFIT=66000")
+    command = parse_pine_alert(alert)
+
+    assert command.exit_plan == "DYNAMIC_TRAIL"
+    assert command.take_profit == Decimal("66000")
+
+
+def test_the_later_rungs_still_come_from_r():
+    """Explicit prices the FIRST rung only. A ladder's later targets are
+    geometry, and one alert field cannot express three of them."""
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import exit_manager as m
+
+    lot = m.Lot.opened(event_id="e", symbol="BTC/USD", entry_price=D("65000"),
+                       initial_stop=D("64000"), held_qty=D("0.0015"),
+                       timeframe="1m", plan=exit_plans.resolve("DYNAMIC_TRAIL"),
+                       min_order_size=D("0.000015437"))
+    lot.explicit_targets = (D("65500"),)
+
+    assert lot.target_price(1) == D("65500"), "rung 1 should use the alert's price"
+    assert lot.target_price(2) == D("65000") + Decimal("2.5") * D("1000"), (
+        "rung 2 should still derive from R")
+
+
+def test_take_profit_without_any_plan_is_still_refused():
+    """It has nothing to apply to, and silently ignoring a price the strategy
+    sent is how an instruction disappears."""
+    with pytest.raises(AlertParseError, match=r"(?i)EXIT_PLAN"):
+        parse_pine_alert(_alert() + " | TAKE_PROFIT=66000")
