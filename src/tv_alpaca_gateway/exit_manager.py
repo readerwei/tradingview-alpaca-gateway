@@ -29,6 +29,25 @@ from . import assets
 STOP_LIMIT_OFFSET = Decimal("0.0005")
 
 
+def _prefixed(event_id: str) -> str:
+    """`pine-exec-<id>`, without doubling it.
+
+    `_command_id` already returns `pine-exec-<identity>`, and that value is what
+    reaches a lot as its `event_id`. Prefixing again produced live orders like
+
+        pine-exec-pine-exec-btc-direct-20260811-001-protection-0
+
+    which is harmless — every generator and matcher doubled identically, so
+    routing and reconciliation agreed — but it is wrong, it doubles the prefix
+    in every audit trail, and it eats the 128-character client-order-id budget
+    twice as fast as it should.
+
+    Safe to change only because no lot is open. An id format change would
+    otherwise leave a resting stop unfindable by the code that placed it.
+    """
+    return event_id if event_id.startswith("pine-exec-") else f"pine-exec-{event_id}"
+
+
 class ExitPlanError(ValueError):
     """The plan cannot be executed as written — raised before any order."""
 
@@ -201,11 +220,11 @@ class Lot:
         stays readable in the order log.
         """
         suffix = f"-tp{rung}" if not attempt else f"-tp{rung}r{attempt}"
-        return f"pine-exec-{self.event_id}{suffix}"
+        return f"{_prefixed(self.event_id)}{suffix}"
 
     @property
     def stop_client_order_id(self) -> str:
-        return f"pine-exec-{self.event_id}-protection"
+        return f"{_prefixed(self.event_id)}-protection"
 
     @property
     def is_closed(self) -> bool:
@@ -393,7 +412,7 @@ class Lot:
             self._broker.submit_order(
                 symbol=self.symbol, side="sell", qty=assets.format_qty(qty),
                 type="market", time_in_force=assets.time_in_force(self.symbol),
-                client_order_id=f"pine-exec-{self.event_id}-{reason}")
+                client_order_id=f"{_prefixed(self.event_id)}-{reason}")
         self.stage = "closed"
         self.remaining_qty = Decimal("0")
 
