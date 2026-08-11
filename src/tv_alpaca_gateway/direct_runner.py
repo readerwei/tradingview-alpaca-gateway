@@ -97,6 +97,33 @@ async def run(args: argparse.Namespace) -> int:
         print(json.dumps(parsed, sort_keys=True))
         return 0
 
+    # --once and an EXIT_PLAN are a contradiction, and an expensive one.
+    #
+    # --once returns as soon as the entry is done, which closes the lifespan
+    # and takes the supervisor, the market-data sockets and the reconcile timer
+    # with it. A managed plan needs all three to stay alive: the entry fills,
+    # the disaster stop is armed, the lot is written to the store — and then
+    # nothing is left listening, so no rung ever fires.
+    #
+    # That combination cost two days. The ladder armed correctly four times and
+    # never once ran, and every symptom pointed at the ladder: a take-profit
+    # breached at 06:00 with no order, a stop cancelled mid-resize and never
+    # replaced, /healthz refusing connections, the market-data slot flickering
+    # between held and free. All of it was this flag.
+    #
+    # Refused rather than silently downgraded to a plain stop: someone asking
+    # for a managed exit should be told they cannot have one here, not handed
+    # something quieter that looks similar.
+    if args.once and command.exit_plan:
+        print(json.dumps({
+            "ok": False,
+            "error": (f"--once cannot run EXIT_PLAN={command.exit_plan}: it exits "
+                      f"as soon as the entry fills, which stops the supervisor "
+                      f"that manages the exits. Drop --once to stay alive, or "
+                      f"run the gateway under uvicorn and submit through the relay."),
+        }), file=sys.stderr)
+        return 2
+
     settings = Settings.from_env()
     if not settings.paper_trading:
         print(json.dumps({"ok": False, "error": "direct runner requires PAPER_TRADING=true"}),
