@@ -18,6 +18,7 @@ from decimal import Decimal
 
 from . import assets
 from .exit_manager import Lot, dump_lot, load_lot, reconcile_lot
+from .market_log import logger as market_logger
 
 logger = logging.getLogger(__name__)
 
@@ -135,20 +136,28 @@ class LotSupervisor:
     def on_bar(self, bar) -> None:
         lot = self._for(bar.symbol)
         if lot is None:
-            logger.debug("lot state=none event=bar symbol=%s timestamp=%s",
-                         bar.symbol, getattr(bar, "timestamp", None))
+            # Market data, not a state transition — and it fires for every bar
+            # on every symbol with no lot, so it is loudest when nothing is
+            # happening. Same reasoning #51 applied to the trade path.
+            market_logger.debug("lot state=none event=bar symbol=%s timestamp=%s",
+                                bar.symbol, getattr(bar, "timestamp", None))
             return
         before = (lot.stage, lot.working_stop, lot.remaining_qty,
                   tuple(sorted(lot.filled_rungs)))
         lot.on_bar(high=bar.high, low=bar.low, close=bar.close,
                    trade_count=bar.trade_count)
         self._remember(lot)
-        logger.debug("lot state=after_bar event_id=%s symbol=%s stage=%s->%s "
-                     "working_stop=%s->%s remaining=%s->%s filled_rungs=%s "
-                     "bar_trades=%s", lot.event_id, lot.symbol, before[0],
-                     lot.stage, before[1], lot.working_stop, before[2],
-                     lot.remaining_qty, sorted(lot.filled_rungs),
-                     bar.trade_count)
+        after = (lot.stage, lot.working_stop, lot.remaining_qty,
+                 tuple(sorted(lot.filled_rungs)))
+        # Only when the bar actually changed something. A bar that moves
+        # nothing is market data, and on this feed most of them move nothing.
+        if after != before:
+            logger.debug("lot state=after_bar event_id=%s symbol=%s stage=%s->%s "
+                         "working_stop=%s->%s remaining=%s->%s filled_rungs=%s "
+                         "bar_trades=%s", lot.event_id, lot.symbol, before[0],
+                         lot.stage, before[1], lot.working_stop, before[2],
+                         lot.remaining_qty, sorted(lot.filled_rungs),
+                         bar.trade_count)
 
     def on_trade(self, trade) -> None:
         lot = self._for(trade.symbol)
