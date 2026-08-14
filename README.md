@@ -45,7 +45,12 @@ broker-held native equity OCO test.
 # Parse only (safe default)
 cat alert.txt | uv run tv-alpaca-run-alert
 
-# Execute and keep managing the paper position
+# Execute and keep managing the paper position.
+# NOTE: --once returns as soon as the entry fills, which closes the lifespan
+# and takes the supervisor, the sockets and the reconcile timer with it. An
+# alert carrying an EXIT_PLAN is refused with --once for that reason: it would
+# arm the disaster stop, write the lot, and leave nothing listening. That
+# combination cost two days of runs that armed correctly and never fired.
 cat alert.txt | uv run tv-alpaca-run-alert --execute
 
 # Execute a native equity OCO and exit after the broker accepts it
@@ -241,6 +246,39 @@ SIDE=SELL | QTY=10.5 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
 The named `DYNAMIC_TRAIL` plan is paper-only and must be requested explicitly in
 the Pine alert:
 
+The rules in one place, so the algebra can be checked rather than trusted:
+
+```text
+R              sign * (entry - stop)          positive both ways
+target(n)      entry + sign * multiple * R    above entry long, below it short
+reached        sign * (price - level) >= 0
+breached       sign * (price - stop)  <= 0
+trail          long ratchets UP on bar LOWS
+               short ratchets DOWN on bar HIGHS
+exit side      long sells, short buys
+stop order     long: sell below entry, limit under the trigger
+               short: buy above entry, limit over it
+```
+
+The same code runs both ways, so a mistake appears in both directions rather
+than hiding in the one nobody exercised. The contract tests run every rule
+twice for the same reason.
+
+### The plans
+
+| plan | tranches | use |
+|---|---|---|
+| `DYNAMIC_TRAIL` | 20% @ 1.2R, 30% @ 2.5R, 50% runner | the strategy |
+| `DYNAMIC_TRAIL_FAST` | same splits at 0.2R / 0.4R | testing — targets reachable in minutes |
+| `OCO_AFTER_FILL` | one target, whole position | take-profit and stop, whichever comes first |
+
+`DYNAMIC_TRAIL_FAST` exists so that testing is an alert field rather than an
+edit to `exit_plans.py`. Editing the real plan's multiples in place left the
+repository saying 1.2R/2.5R while the gateway ran 0.2R/0.4R — a divergence
+`/healthz` could not report, because an uncommitted edit carries the same commit
+hash as the code it changes. `/healthz` now also reports `worktree_dirty`.
+
+The named `DYNAMIC_TRAIL` plan must be requested explicitly in the Pine alert:
 ```text
 EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m | EVENT_ID={{ticker}}-{{interval}}-{{time}}
 ```
@@ -261,6 +299,14 @@ based on the previous completed eligible 1-minute bar: the long trail ratchets
 on bar lows, while the short trail ratchets on bar highs. Missing, forming,
 zero-trade, or synthetic bars do not advance it. Each trail is monotonic in its
 profitable direction and never moves back toward greater risk.
+
+Quotes never fire a rung: they are counted and logged, and never reach the
+supervisor.
+
+The bar path exists because of the feed, not for elegance. Measured over twelve
+hours of Alpaca's BTC/USD 1-minute bars, 479 of 719 minutes produced a bar at
+all and only 167 of those contained a trade. A target can be crossed and
+abandoned between prints, so a rung would get one chance and sometimes none.
 
 Alpaca crypto supports simple `stop_limit` protection, but not native crypto
 brackets, OCO, or trailing-stop orders. The gateway therefore owns the ladder
@@ -306,6 +352,90 @@ commit is the intended checkout, and `market`, `crypto`, and `trade_updates`
 are all `connected`. Stop with `Ctrl-C` when finished. Set
 `TRADING_ENABLED=false` to keep the gateway running but disarmed. Never print or
 commit `.env` or broker credentials.
+
+## Observability
+
+The gateway spent a week being unable to say why nothing was happening. Six live
+runs armed correctly and did nothing, and no log said how far the target was or
+why a bar had been skipped. What was missing was never the data — it was the
+reasoning.
+
+```bash
+LOG_LEVEL=DEBUG        # decisions: why a rung did not fire, why a bar was skipped
+LOG_MARKET_DATA=true   # the per-message firehose, separately and rarely
+HEARTBEAT_SECONDS=60   # lot state on a timer even when nothing changes; 0 disables
+```
+
+`LOG_LEVEL=DEBUG` gives roughly three lines a minute plus whatever actually
+happened:
+
+```text
+INFO  market BTC/USD: 412 trades, 30 bars (15 traded), 0 quotes
+INFO  market QQQ: 0 trades, 0 bars (0 traded), 0 quotes
+INFO  heartbeat: lot demo BTC/USD stage=ladder remaining=0.0015 working_stop=63800
+      reserved=0.0015 filled=[] pending=tp1@64240.0 last_price=63900.0
+```
+
+Two of those lines earn their place specifically:
+
+- **`QQQ: 0 trades, 0 bars`** — a stream that is connected and delivering
+  nothing looks exactly like a quiet market. Telling them apart took two days
+  the first time.
+- **the heartbeat** — a process with nothing to do and one that has silently
+  stopped are identical in an event-driven log, by construction: no events, no
+  lines.
+
+Per-message logging lives on `tv_alpaca_gateway.marketdata`, muted explicitly
+rather than by omission — it is a child of the package logger and would
+otherwise inherit `DEBUG` and drown everything else.
+
+`/healthz` reports the running commit, whether the worktree is dirty, and the
+connection state of each stream:
+
+```json
+{"ok": false, "commit": "cfdae66…", "worktree_dirty": false,
+ "streams": {"market": "connected", "crypto": "connected",
+             "trade_updates": "down: InvalidStatus: HTTP 403"}}
+```
+
+`ok` means the sockets are connected, not merely that the process answers HTTP.
+
+Note the distinction, because conflating the two is how a green check reassures
+you about something it never examined: **`/healthz` reports whether a socket is
+connected. The periodic market summary reports whether data is arriving.** A
+stream can be connected and silent, which is exactly the state that took two
+days to recognise — `market QQQ: 0 trades, 0 bars` is the line that shows it,
+and it comes from the heartbeat, not from `/healthz`.
+
+## One connection per account
+
+Alpaca allows **one market-data connection per feed and one trade-update
+connection, per account**. Two processes on the same credentials contend: each
+connect evicts the other.
+
+If another system of yours streams the same account, the gateway cannot get the
+feed at all, and its subscription line simply never appears. A second paper
+account is the fix; more API keys on the same account are not, because the limit
+is per account.
+
+A related failure is worth recording because it cost a day and looked exactly
+like contention. Every order update was followed ~150ms later by:
+
+```text
+WARNING Alpaca trade_updates stream disconnected: HTTP Error 403: Forbidden
+```
+
+That was not eviction. `on_order_update` called the Discord notifier, Discord
+returned 403, `urllib.error.HTTPError` is a subclass of `OSError`, and the
+reconnect handler caught it as a stream failure — tearing down a healthy socket
+on every order update. Worse, the notification came *before* the line routing
+the fill to the lot, so the exception skipped it: the primary fill path was dead
+and only the reconcile timer kept the ladder correct.
+
+The error text was the tell. `HTTP Error 403: Forbidden` is a urllib error; a
+websocket eviction raises `ConnectionClosed` with a close code. Notifications
+now never raise at their caller, fills are routed before notifying, and handler
+exceptions can no longer masquerade as disconnects.
 
 ## Crypto
 
