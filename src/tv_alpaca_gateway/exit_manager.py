@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
 
 from . import assets
+from .market_log import logger as market_logger
 
 # Crypto has no plain stop order, only stop_limit, so a gap straight through the
 # limit leaves the position held with its protection unfilled. Wei's number:
@@ -278,8 +279,13 @@ class Lot:
         if self.is_closed:
             return
         if trade_count == 0:
-            logger.debug("bar %s ignored: no trades, so its low is a quote and "
-                         "not a price anything changed hands at", self.symbol)
+            # Market data, not a decision. On Alpaca's crypto feed 59% of bars
+            # are quote-only, so this is the most frequent bar line there is —
+            # 50 such bars produced 50 lines on master, which is the flood
+            # everything else was moved to stop.
+            market_logger.debug(
+                "bar %s ignored: no trades, so its low is a quote and not a "
+                "price anything changed hands at", self.symbol)
             # No trades: the bar is built from quotes, and neither a stop nor a
             # take-profit should act on a price nothing traded at.
             return

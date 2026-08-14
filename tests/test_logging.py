@@ -166,3 +166,107 @@ def test_third_party_warnings_are_still_visible():
         assert root.level <= logging.INFO, "third-party INFO and above were suppressed"
     finally:
         root.setLevel(before)
+
+
+def test_quote_only_bars_do_not_flood_the_package_logger(tmp_path, caplog):
+    """Measured on master before this change: 50 quote-only bars produced 50
+    package-logger lines.
+
+    #51 fixed the trade paths and left this one. It matters more than it looks:
+    59% of Alpaca's BTC/USD 1m bars contain no trade, so this is the most
+    frequent bar line there is.
+    """
+    import logging
+    from decimal import Decimal
+
+    from tv_alpaca_gateway import exit_manager as m
+    from tv_alpaca_gateway.broker import FakeBroker
+    from tv_alpaca_gateway.config import configure_logging
+
+    configure_logging("DEBUG", log_market_data=False)
+    broker = FakeBroker()
+    broker.positions["BTC/USD"] = Decimal("0.0015")
+    lot = m.open_lot(m.Lot.opened(
+        event_id="q", symbol="BTC/USD", entry_price=Decimal("64000"),
+        initial_stop=Decimal("63800"), held_qty=Decimal("0.0015"), timeframe="1m",
+        plan=m.ExitPlan(name="P", tranches=((Decimal("0.2"), Decimal("1.2")),),
+                        runner_fraction=Decimal("0.8"),
+                        trail_source="previous_completed_bar_low", breakeven_after=1),
+        min_order_size=Decimal("0.000015437")), broker)
+
+    with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
+        for _ in range(50):
+            lot.on_bar(high=Decimal("64100"), low=Decimal("64050"),
+                       close=Decimal("64080"), trade_count=0)
+
+    noisy = [r for r in caplog.records
+             if not r.name.startswith("tv_alpaca_gateway.marketdata")]
+    assert not noisy, f"50 quote-only bars produced {len(noisy)} package-logger lines"
+
+
+
+
+def test_no_message_type_floods_the_package_logger(tmp_path, caplog):
+    """Every inbound message type, measured rather than inferred.
+
+    I first wrote this as a static scan of the handler source and it produced
+    false positives twice — it cannot see that a line is guarded by a
+    state-change check, so it flagged precisely the lines #51 had already
+    fixed correctly. Two rounds of that is enough. The property is "a quiet
+    feed produces quiet logs", so measure that instead of guessing at it from
+    syntax.
+
+    Measured on master before this change:
+
+        60 traded bars, no state change  ->  60 lines
+        60 quote-only bars               -> 120 lines
+        60 bars on an unwatched symbol   ->  60 lines
+    """
+    import logging
+    from decimal import Decimal
+
+    from tv_alpaca_gateway import exit_manager as m
+    from tv_alpaca_gateway.broker import FakeBroker
+    from tv_alpaca_gateway.config import configure_logging
+    from tv_alpaca_gateway.lot_supervisor import LotSupervisor
+    from tv_alpaca_gateway.store import EventStore
+
+    configure_logging("DEBUG", log_market_data=False)
+    broker = FakeBroker()
+    broker.positions["BTC/USD"] = Decimal("0.0015")
+    sup = LotSupervisor(EventStore(tmp_path / "f.sqlite3"), broker)
+    sup.adopt(m.open_lot(m.Lot.opened(
+        event_id="f", symbol="BTC/USD", entry_price=Decimal("64000"),
+        initial_stop=Decimal("63800"), held_qty=Decimal("0.0015"), timeframe="1m",
+        plan=m.ExitPlan(name="P", tranches=((Decimal("0.2"), Decimal("1.2")),),
+                        runner_fraction=Decimal("0.8"),
+                        trail_source="previous_completed_bar_low", breakeven_after=1),
+        min_order_size=Decimal("0.000015437")), broker))
+
+    def _bar(symbol="BTC/USD", trades=3):
+        return type("B", (), {"symbol": symbol, "high": Decimal("64100"),
+                              "low": Decimal("64050"), "close": Decimal("64080"),
+                              "trade_count": trades, "timestamp": "t"})()
+
+    def _trade(symbol="BTC/USD", price=63900.0):
+        return type("T", (), {"symbol": symbol, "price": price, "timestamp": "t"})()
+
+    cases = {
+        "traded bars, no state change": lambda: sup.on_bar(_bar()),
+        "quote-only bars": lambda: sup.on_bar(_bar(trades=0)),
+        "bars on an unwatched symbol": lambda: sup.on_bar(_bar(symbol="ETH/USD")),
+        "trades at one price": lambda: sup.on_trade(_trade()),
+        "trades on an unwatched symbol": lambda: sup.on_trade(_trade(symbol="ETH/USD")),
+    }
+    noisy = {}
+    for name, send in cases.items():
+        with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
+            caplog.clear()
+            for _ in range(60):
+                send()
+            count = len([r for r in caplog.records
+                         if not r.name.startswith("tv_alpaca_gateway.marketdata")])
+        if count:
+            noisy[name] = count
+
+    assert not noisy, f"60 messages each produced package-logger lines: {noisy}"
