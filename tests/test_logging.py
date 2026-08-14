@@ -18,13 +18,24 @@ def test_invalid_log_level_is_refused():
 
 
 def test_configure_logging_enables_debug(monkeypatch):
+    """UPDATED: DEBUG now applies to this package, not to the root logger.
+
+    The original asserted `root.level == DEBUG`, which was the behaviour when
+    written. Scoping it changed that deliberately — root at DEBUG turns on every
+    websockets frame and all of asyncio, burying the one line you turned DEBUG on
+    to read. The intent this test protects is unchanged: LOG_LEVEL=DEBUG must
+    actually produce our debug output.
+    """
     root = logging.getLogger()
-    previous = root.level
+    ours = logging.getLogger("tv_alpaca_gateway")
+    previous = (root.level, ours.level)
     try:
         configure_logging("DEBUG")
-        assert root.level == logging.DEBUG
+        assert ours.level == logging.DEBUG
+        assert ours.isEnabledFor(logging.DEBUG), "our debug records would be dropped"
     finally:
-        root.setLevel(previous)
+        root.setLevel(previous[0])
+        ours.setLevel(previous[1])
 
 
 # ═══════════════════ gaps left after the first observability pass
@@ -109,3 +120,42 @@ def test_debug_says_how_far_the_next_target_is(tmp_path, caplog):
         lot.on_price(Decimal("64050"))
 
     assert "tp1" in caplog.text, "no distance to the next target was logged"
+
+
+def test_debug_is_scoped_to_this_package_not_the_whole_process():
+    """LOG_LEVEL=DEBUG is asked for when OUR decisions are unclear.
+
+    Setting the root logger turns on every websockets frame, every urllib3
+    connection and the whole of asyncio alongside them. The line explaining why
+    a rung did not fire is then present but unfindable — which is the same
+    failure as not logging it at all.
+    """
+    import logging
+
+    from tv_alpaca_gateway.config import configure_logging
+
+    root, ours = logging.getLogger(), logging.getLogger("tv_alpaca_gateway")
+    before = (root.level, ours.level)
+    try:
+        configure_logging("DEBUG")
+        assert ours.level == logging.DEBUG, "our own logger was not turned up"
+        assert root.level > logging.DEBUG, (
+            "the root logger was set to DEBUG; third-party frames will bury ours")
+    finally:
+        root.setLevel(before[0])
+        ours.setLevel(before[1])
+
+
+def test_third_party_warnings_are_still_visible():
+    """Quieter, not deafened — a websockets error still has to reach the log."""
+    import logging
+
+    from tv_alpaca_gateway.config import configure_logging
+
+    root = logging.getLogger()
+    before = root.level
+    try:
+        configure_logging("DEBUG")
+        assert root.level <= logging.INFO, "third-party INFO and above were suppressed"
+    finally:
+        root.setLevel(before)

@@ -173,9 +173,19 @@ def configure_logging(level: str) -> None:
     if not isinstance(numeric, int):
         raise ValueError(f"unsupported log level {level!r}")
     logging.basicConfig(
-        level=numeric,
+        level=max(numeric, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     # basicConfig is a no-op when uvicorn or a test runner already installed a
-    # handler. In that case still make LOG_LEVEL effective for this process.
-    logging.getLogger().setLevel(numeric)
+    # handler, so the level is set explicitly as well.
+    #
+    # Scoped to THIS package rather than the root logger. LOG_LEVEL=DEBUG is
+    # asked for when our own decisions are unclear, and setting root turns on
+    # every frame of websockets, every connection of urllib3 and the whole of
+    # asyncio alongside them. The line explaining why a rung did not fire is
+    # then real but unfindable, which is the same failure as not logging it.
+    #
+    # The root handler still admits INFO so third-party warnings and errors are
+    # not suppressed — quieter, not deafened.
+    logging.getLogger().setLevel(max(numeric, logging.INFO))
+    logging.getLogger("tv_alpaca_gateway").setLevel(numeric)
