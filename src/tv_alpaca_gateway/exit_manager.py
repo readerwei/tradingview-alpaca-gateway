@@ -596,12 +596,21 @@ def dump_lot(lot: Lot) -> str:
         "rung_attempts": {str(k): v for k, v in lot.rung_attempts.items()},
         "rung_order_ids": {str(k): list(v) for k, v in lot.rung_order_ids.items()},
         "seen_fills": sorted(lot.seen_fills),
+        # Every field on ExitPlan, and the round-trip test in
+        # test_lot_persistence_contract.py compares the whole dataclass so that
+        # stays true. This list was maintained by hand and fell behind:
+        # `rungs_on_bar_high` was added to the plan and never added here, so it
+        # was written by nobody and read back as the dataclass default. A lot
+        # that had been through a restart silently stopped firing rungs on a
+        # bar's high — on a feed where only a third of bars carry a trade at
+        # all, which is the case the flag was added for.
         "plan": {
             "name": lot.plan.name,
             "tranches": [[str(f), str(m)] for f, m in lot.plan.tranches],
             "runner_fraction": str(lot.plan.runner_fraction),
             "trail_source": lot.plan.trail_source,
             "breakeven_after": lot.plan.breakeven_after,
+            "rungs_on_bar_high": lot.plan.rungs_on_bar_high,
         },
     }
     state |= {name: str(getattr(lot, name)) for name in _DECIMAL_FIELDS}
@@ -622,6 +631,13 @@ def load_lot(state: str) -> Lot:
             runner_fraction=Decimal(plan["runner_fraction"]),
             trail_source=plan["trail_source"],
             breakeven_after=plan["breakeven_after"],
+            # `.get` because rows written before this field was persisted have
+            # no such key. They take the dataclass default rather than being
+            # re-resolved from the plan name: a lot snapshots its plan at fill
+            # time precisely so that editing a plan cannot re-price a position
+            # already in the market, and reaching back into the config on load
+            # would defeat that from the other direction.
+            rungs_on_bar_high=plan.get("rungs_on_bar_high", False),
         ),
         direction=int(raw.get("direction", 1)),
         **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
