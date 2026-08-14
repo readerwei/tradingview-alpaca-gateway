@@ -387,6 +387,8 @@ class Lot:
         if self.last_price is not None and self._breached(self.last_price, self.entry_price):
             self.breakeven_pending = True
             return
+        logger.info("lot %s %s: breakeven — working stop %s -> %s",
+                    self.event_id, self.symbol, self.working_stop, self.entry_price)
         self.working_stop = self.entry_price
         self.breakeven_pending = False
 
@@ -427,6 +429,10 @@ class Lot:
             return                                 # still working; stop stays put
 
         self.filled_rungs.add(rung)
+        logger.info("lot %s %s: rung %d complete (%s filled), %s remaining",
+                    self.event_id, self.symbol, rung,
+                    assets.format_qty(self.rung_filled_qty[rung]),
+                    assets.format_qty(self.remaining_qty))
         if (rung == self.plan.breakeven_after
                 and self.sign * (self.working_stop - self.entry_price) < 0):
             self._apply_breakeven()
@@ -479,7 +485,13 @@ class Lot:
         qty = self._sellable(outstanding)
         if qty < self.min_order_size:
             return
-        self._reserve(self._sellable(self.remaining_qty) - qty)
+        keeping = self._sellable(self.remaining_qty) - qty
+        logger.info("lot %s %s: rung %d reached %s — freeing %s from the stop "
+                    "(reserve %s -> %s), then exiting it",
+                    self.event_id, self.symbol, rung, self.target_price(rung),
+                    assets.format_qty(qty), assets.format_qty(self.reserved_qty),
+                    assets.format_qty(keeping))
+        self._reserve(keeping)
         self.pending_rungs.add(rung)
         attempt = self.rung_attempts.get(rung, 0)
         self.rung_attempts[rung] = attempt + 1
@@ -488,6 +500,9 @@ class Lot:
             type="market", time_in_force=assets.time_in_force(self.symbol),
             client_order_id=self.rung_client_order_id(rung, attempt))
         self.rung_order_ids.setdefault(rung, []).append(placed["id"])
+        logger.info("lot %s %s: rung %d %s %s submitted (order %s)",
+                    self.event_id, self.symbol, rung, self.exit_side,
+                    assets.format_qty(qty), str(placed.get("id"))[:8])
 
     def _exit_remainder(self, reason: str) -> None:
         """The working stop was breached, or the runner's trail was hit.
@@ -502,6 +517,11 @@ class Lot:
             for order_id in self.rung_order_ids.get(rung, []):
                 self._broker.cancel_order(order_id)
         self.pending_rungs.clear()
+        logger.info("lot %s %s: exiting the remainder (%s) — %s; cancelling the "
+                    "stop that reserves it",
+                    self.event_id, self.symbol,
+                    assets.format_qty(self.remaining_qty),
+                    "working stop breached" if reason == "stop" else reason)
         self._reserve(Decimal("0"))       # the stop holds the coins we must sell
         qty = self._sellable(self.remaining_qty)
         if qty >= self.min_order_size:
@@ -509,6 +529,7 @@ class Lot:
                 symbol=self.symbol, side=self.exit_side, qty=assets.format_qty(qty),
                 type="market", time_in_force=assets.time_in_force(self.symbol),
                 client_order_id=f"{_prefixed(self.event_id)}-{reason}")
+        logger.info("lot %s %s: closed", self.event_id, self.symbol)
         self.stage = "closed"
         self.remaining_qty = Decimal("0")
 
@@ -525,6 +546,10 @@ class Lot:
         """
         if qty == self.reserved_qty and self.stop_order_id:
             return
+        logger.info("lot %s %s: protection %s -> %s at %s",
+                    self.event_id, self.symbol,
+                    assets.format_qty(self.reserved_qty), assets.format_qty(qty),
+                    self.initial_stop)
         if self.stop_order_id:
             self._broker.cancel_order(self.stop_order_id)
             self.stop_order_id = None
@@ -533,6 +558,9 @@ class Lot:
             return
         self.stop_order_id = self._place_stop(qty)
         self.reserved_qty = qty
+        logger.info("lot %s %s: protection resting, %s reserved (order %s)",
+                    self.event_id, self.symbol, assets.format_qty(qty),
+                    str(self.stop_order_id)[:8])
 
     def _place_stop(self, qty: Decimal) -> str:
         order = build_stop_order(self.symbol, qty, self.initial_stop,

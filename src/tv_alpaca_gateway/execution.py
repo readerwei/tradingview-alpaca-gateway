@@ -168,11 +168,18 @@ def execute_pine_command(
             f"no order size configured for {symbol} "
             f"({'CRYPTO_MAX_QTY' if crypto else 'MAX_QTY'} is not set)")
     if command.qty > configured_max:
+        logger.warning("refusing %s %s %s: quantity exceeds the configured "
+                       "maximum %s", command.side, command.qty, symbol,
+                       configured_max)
         raise ExecutionError(
             f"requested {command.qty} exceeds the configured maximum {configured_max}")
 
     reference_price = _decimal(broker.latest_trade_price(symbol))
     if command.qty * reference_price > _decimal(settings.max_notional):
+        logger.warning("refusing %s %s %s: notional %s exceeds the configured "
+                       "limit %s (reference price %s)", command.side, command.qty,
+                       symbol, command.qty * reference_price,
+                       settings.max_notional, reference_price)
         raise ExecutionError("notional exceeds configured limit")
 
     # One lot at a time per symbol — Wei's rule, and on crypto it is also
@@ -535,6 +542,12 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
         supervisor.adopt(lot)          # persists as part of remembering it
     else:
         store.save_lot(event_id, symbol, lot.stage, exit_manager.dump_lot(lot))
+    logger.info("lot %s opened on %s: %s %s at %s, stop %s, plan %s, targets %s",
+                event_id, symbol, "short" if lot.is_short else "long",
+                assets.format_qty(held_qty), entry_price, command.stop_trigger,
+                command.exit_plan,
+                ", ".join(str(lot.target_price(r))
+                          for r in range(1, len(lot.plan.tranches) + 1)))
     store.update(event_id, "lot_opened",
                  f"plan={command.exit_plan} stop={lot.stop_order_id}",
                  broker_order_id=entry_id)
