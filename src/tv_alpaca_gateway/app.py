@@ -174,13 +174,16 @@ def create_app(
         logger.debug("order state symbol=%s side=%s qty=%s filled_qty=%s "
                      "client_order_id=%s", event.symbol, event.side, event.qty,
                      event.filled_qty, event.client_order_id)
+        if not updated:
+            logger.warning("received update for unknown order_id=%s", event.order_id)
+        # Route the fill FIRST. Notifying used to come before this line, so a
+        # Discord 403 raised past it and the lot never heard about the fill —
+        # the primary fill path was dead and it looked like a network problem.
+        await asyncio.to_thread(supervisor.on_order_update, event)
         notifier.send(
             f"Alpaca paper order update: {event.side.upper()} {event.qty} {event.symbol}; "
             f"event={event.event}; status={event.status}; filled={event.filled_qty}"
         )
-        if not updated:
-            logger.warning("received update for unknown order_id=%s", event.order_id)
-        await asyncio.to_thread(supervisor.on_order_update, event)
 
     async def on_stream_error(error: Exception) -> None:
         logger.warning("Alpaca stream error: %s", error)
