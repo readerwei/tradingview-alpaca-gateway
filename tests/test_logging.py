@@ -4,6 +4,8 @@ import logging
 
 import pytest
 
+import pytest
+
 from tv_alpaca_gateway.config import Settings, configure_logging
 
 
@@ -195,6 +197,11 @@ def test_quote_only_bars_do_not_flood_the_package_logger(tmp_path, caplog):
         min_order_size=Decimal("0.000015437")), broker)
 
     with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
+        # Arming the lot legitimately logs one action line per broker call.
+        # This test is about what the MESSAGES produce, so the setup noise is
+        # discarded rather than counted — otherwise it would fail for the one
+        # kind of logging we do want.
+        caplog.clear()
         for _ in range(50):
             lot.on_bar(high=Decimal("64100"), low=Decimal("64050"),
                        close=Decimal("64080"), trade_count=0)
@@ -270,3 +277,104 @@ def test_no_message_type_floods_the_package_logger(tmp_path, caplog):
             noisy[name] = count
 
     assert not noisy, f"60 messages each produced package-logger lines: {noisy}"
+
+
+# ═══════════════ what the gateway DID, not only what the broker said
+
+def test_the_ladder_narrates_its_own_actions(tmp_path, caplog):
+    """Wei: "things that should be logged but were not."
+
+    Every order line in the 2026-08-14 log came from Alpaca's trade_updates
+    stream, so it showed what the broker happened to tell us rather than what
+    the gateway decided to do. Three cancels appeared and one placement,
+    because the stream was being torn down after each message — and the
+    resize-before-sell ordering, the single decision this design rests on,
+    produced no line of its own at all.
+
+    A reader must be able to reconstruct the sequence from our log alone,
+    without the broker and without arithmetic on timestamps.
+    """
+    import logging
+    from decimal import Decimal
+
+    from tv_alpaca_gateway import exit_manager as m
+    from tv_alpaca_gateway.broker import FakeBroker
+
+    broker = FakeBroker()
+    broker.positions["TSLA"] = Decimal("10")
+    plan = m.ExitPlan(name="P", tranches=((Decimal("0.2"), Decimal("0.2")),),
+                      runner_fraction=Decimal("0.8"),
+                      trail_source="previous_completed_bar_low", breakeven_after=1)
+
+    with caplog.at_level(logging.INFO, logger="tv_alpaca_gateway"):
+        lot = m.open_lot(m.Lot.opened(
+            event_id="evt", symbol="TSLA", entry_price=Decimal("340.76"),
+            initial_stop=Decimal("340.50"), held_qty=Decimal("10"),
+            timeframe="1m", plan=plan, min_order_size=Decimal("1")), broker)
+        lot.on_price(Decimal("340.83"))
+        lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="a")
+
+    text = caplog.text
+    for expected in ("protection", "reserved", "rung 1", "submitted",
+                     "complete", "breakeven"):
+        assert expected in text, f"the log never mentions {expected!r}"
+
+
+def test_the_resize_is_narrated_before_the_exit(caplog):
+    """The ordering itself has to be readable, not just correct — otherwise a
+    future inversion looks exactly like today's log."""
+    import logging
+    from decimal import Decimal
+
+    from tv_alpaca_gateway import exit_manager as m
+    from tv_alpaca_gateway.broker import FakeBroker
+
+    broker = FakeBroker()
+    broker.positions["TSLA"] = Decimal("10")
+    plan = m.ExitPlan(name="P", tranches=((Decimal("0.2"), Decimal("0.2")),),
+                      runner_fraction=Decimal("0.8"),
+                      trail_source="previous_completed_bar_low", breakeven_after=1)
+    lot = m.open_lot(m.Lot.opened(
+        event_id="evt", symbol="TSLA", entry_price=Decimal("340.76"),
+        initial_stop=Decimal("340.50"), held_qty=Decimal("10"),
+        timeframe="1m", plan=plan, min_order_size=Decimal("1")), broker)
+
+    with caplog.at_level(logging.INFO, logger="tv_alpaca_gateway"):
+        caplog.clear()
+        lot.on_price(Decimal("340.83"))
+
+    lines = [r.getMessage() for r in caplog.records]
+    resize = next(i for i, m_ in enumerate(lines) if "protection 10 -> 8" in m_)
+    exit_ = next(i for i, m_ in enumerate(lines) if "submitted" in m_)
+    assert resize < exit_, f"the log shows the exit before the resize: {lines}"
+
+
+def test_a_risk_refusal_says_why(caplog):
+    """A refusal that only raises tells the caller; a refusal that logs tells
+    whoever reads the log afterwards, which is usually who needs it."""
+    import logging
+    from decimal import Decimal
+
+    from tv_alpaca_gateway import execution
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+    from tv_alpaca_gateway.store import EventStore
+
+    import tempfile, pathlib as _p
+    tmp = _p.Path(tempfile.mkdtemp())
+    settings = Settings(paper_trading=True, trading_enabled=True, webhook_secret="s",
+                        allowed_symbols=frozenset({"QQQ"}), max_qty=1,
+                        crypto_max_qty=Decimal("0.05"), max_notional=100000.0,
+                        market_symbols=("QQQ",), db_path=tmp / "r.sqlite3")
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=999 | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+
+    class _B:
+        def latest_trade_price(self, _s): return 700.0
+
+    with caplog.at_level(logging.WARNING, logger="tv_alpaca_gateway"):
+        with pytest.raises(execution.ExecutionError):
+            execution.execute_pine_command(parse_pine_alert(alert), settings, _B(),
+                                           EventStore(settings.db_path), delivery_id="d")
+
+    assert "quantity exceeds" in caplog.text
