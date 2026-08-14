@@ -117,7 +117,7 @@ def _command_id(command: PineOrderCommand, delivery_id: str | None = None) -> st
             "so two firings could not be told apart; add "
             "EVENT_ID={{ticker}}-{{interval}}-{{time}} to the alert or pass a "
             "durable delivery id")
-    return f"pine-exec-{identity}"
+    return f"{exit_manager.NAMESPACE}{identity}"
 
 
 def _decimal(value: Any) -> Decimal:
