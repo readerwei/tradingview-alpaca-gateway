@@ -251,15 +251,6 @@ class Lot:
             self.working_stop = max(self.working_stop, self.entry_price)
             self.breakeven_pending = False
         if self.stage == "ladder":
-            if logger.isEnabledFor(logging.DEBUG):
-                # The distance, not just the state. "Nothing fired" and "the
-                # target is 190 away" look the same in a state dump, and it was
-                # the second one we needed for three days.
-                gaps = " ".join(f"tp{r}{self.target_price(r) - price:+.2f}"
-                                for r in range(1, len(self.plan.tranches) + 1)
-                                if r not in self.filled_rungs)
-                logger.debug("rungs %s at %s: %s | stop %+.2f", self.symbol, price,
-                             gaps or "all filled", self.working_stop - price)
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
                     continue

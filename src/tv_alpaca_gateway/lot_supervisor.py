@@ -153,18 +153,26 @@ class LotSupervisor:
     def on_trade(self, trade) -> None:
         lot = self._for(trade.symbol)
         if lot is None:
-            logger.debug("lot state=none event=trade symbol=%s timestamp=%s",
-                         trade.symbol, getattr(trade, "timestamp", None))
             return
         before = (lot.stage, lot.working_stop, lot.remaining_qty,
-                  tuple(sorted(lot.filled_rungs)))
+                  tuple(sorted(lot.filled_rungs)),
+                  tuple(sorted(lot.pending_rungs)), lot.breakeven_pending)
         lot.on_price(Decimal(str(trade.price)))
         self._remember(lot)
-        logger.debug("lot state=after_trade event_id=%s symbol=%s price=%s "
-                     "stage=%s->%s working_stop=%s->%s remaining=%s->%s "
-                     "filled_rungs=%s", lot.event_id, lot.symbol, trade.price,
-                     before[0], lot.stage, before[1], lot.working_stop,
-                     before[2], lot.remaining_qty, sorted(lot.filled_rungs))
+        after = (lot.stage, lot.working_stop, lot.remaining_qty,
+                 tuple(sorted(lot.filled_rungs)),
+                 tuple(sorted(lot.pending_rungs)), lot.breakeven_pending)
+        # A raw trade is market data, not a state transition. The market logger
+        # owns optional raw-data output; this logger only reports a meaningful
+        # decision/change so DEBUG remains readable during a busy tape.
+        if after != before:
+            logger.debug("lot state=after_trade event_id=%s symbol=%s price=%s "
+                         "stage=%s->%s working_stop=%s->%s remaining=%s->%s "
+                         "filled_rungs=%s pending_rungs=%s breakeven_pending=%s",
+                         lot.event_id, lot.symbol, trade.price, before[0],
+                         lot.stage, before[1], lot.working_stop, before[2],
+                         lot.remaining_qty, sorted(lot.filled_rungs),
+                         sorted(lot.pending_rungs), lot.breakeven_pending)
 
     # ── order events ────────────────────────────────────────────────────────
 
@@ -222,11 +230,19 @@ class LotSupervisor:
             logger.info("heartbeat: no open lots")
             return
         for lot in self.lots.values():
+            gaps = ""
+            if lot.last_price is not None and lot.stage == "ladder":
+                gaps = " ".join(
+                    f"tp{r}{lot.target_price(r) - lot.last_price:+.2f}"
+                    for r in range(1, len(lot.plan.tranches) + 1)
+                    if r not in lot.filled_rungs
+                )
             logger.info("heartbeat: lot %s %s stage=%s remaining=%s working_stop=%s "
-                        "reserved=%s filled=%s",
+                        "reserved=%s filled=%s last_price=%s %s",
                         lot.event_id, lot.symbol, lot.stage,
                         assets.format_qty(lot.remaining_qty), lot.working_stop,
-                        assets.format_qty(lot.reserved_qty), sorted(lot.filled_rungs))
+                        assets.format_qty(lot.reserved_qty), sorted(lot.filled_rungs),
+                        lot.last_price, gaps)
 
     def reconcile_all(self) -> None:
         """Re-check every open lot against the broker.

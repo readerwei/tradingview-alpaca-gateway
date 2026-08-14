@@ -116,8 +116,15 @@ def test_debug_says_how_far_the_next_target_is(tmp_path, caplog):
                         trail_source="previous_completed_bar_low", breakeven_after=1),
         min_order_size=Decimal("0.000015437")), broker)
 
-    with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
-        lot.on_price(Decimal("64050"))
+    lot.on_price(Decimal("64050"))
+    from tv_alpaca_gateway.lot_supervisor import LotSupervisor
+    from tv_alpaca_gateway.store import EventStore
+
+    supervisor = LotSupervisor(EventStore(tmp_path / "h3.sqlite3"), broker)
+    supervisor.adopt(lot)
+    with caplog.at_level(logging.INFO, logger="tv_alpaca_gateway"):
+        # The distance is intentionally heartbeat output, not a per-trade dump.
+        supervisor.heartbeat()
 
     assert "tp1" in caplog.text, "no distance to the next target was logged"
 
