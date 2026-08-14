@@ -38,6 +38,7 @@ class Settings:
     discord_webhook_url: str = ""
     # INFO keeps ordinary runs concise. DEBUG enables per-event stream and
     # managed-lot state diagnostics for paper-test operators.
+    heartbeat_seconds: float = 60.0
     log_level: str = "INFO"
 
     @classmethod
@@ -77,6 +78,7 @@ class Settings:
             stream_enabled=_bool_env("ALPACA_STREAM_ENABLED", False),
             lot_reconcile_seconds=float(os.getenv("LOT_RECONCILE_SECONDS", "60")),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
+            heartbeat_seconds=float(os.getenv("HEARTBEAT_SECONDS", "60")),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         )
 
