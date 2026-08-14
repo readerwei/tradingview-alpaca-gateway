@@ -117,6 +117,8 @@ def create_app(
     async def on_quote(event: MarketQuote) -> None:
         logger.debug("market quote %s bid=%s ask=%s", event.symbol, event.bid_price, event.ask_price)
 
+    logging.getLogger("tv_alpaca_gateway").setLevel(
+        getattr(logging, settings.log_level, logging.INFO))
     supervisor = LotSupervisor(store, broker)
 
     async def on_trade(event: MarketTrade) -> None:
@@ -179,6 +181,14 @@ def create_app(
         else None
     )
 
+    async def heartbeat_periodically() -> None:
+        while True:
+            await asyncio.sleep(settings.heartbeat_seconds)
+            try:
+                await asyncio.to_thread(supervisor.heartbeat)
+            except Exception:
+                logger.exception("heartbeat failed")
+
     async def reconcile_periodically() -> None:
         """Alpaca does not replay trade_updates missed while the socket was down.
 
@@ -210,13 +220,16 @@ def create_app(
             await stream.start()
         timer = (asyncio.create_task(reconcile_periodically(), name="lot-reconcile")
                  if settings.lot_reconcile_seconds > 0 else None)
+        beat = (asyncio.create_task(heartbeat_periodically(), name="lot-heartbeat")
+                if settings.heartbeat_seconds > 0 else None)
         try:
             yield
         finally:
-            if timer is not None:
-                timer.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await timer
+            for task in (timer, beat):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
             if stream is not None and settings.stream_enabled:
                 await stream.stop()
 
@@ -224,8 +237,11 @@ def create_app(
     # Exposed so the streams can be inspected and exercised from outside —
     # an end-to-end test needs to trigger a resync without reaching into a
     # closure, and an operator needs a way to see whether a socket is up.
-    logger.info("gateway starting: commit=%s paper_trading=%s trading_enabled=%s",
-                RUNNING_COMMIT, settings.paper_trading, settings.trading_enabled)
+    logger.info("gateway starting: commit=%s paper_trading=%s trading_enabled=%s "
+                "log_level=%s allowed=%s equity_stream=%s crypto_stream=%s",
+                RUNNING_COMMIT, settings.paper_trading, settings.trading_enabled,
+                settings.log_level, sorted(settings.allowed_symbols),
+                list(settings.market_symbols), list(settings.crypto_symbols))
     app.state.stream = stream
     app.state.store = store
     app.state.broker = broker

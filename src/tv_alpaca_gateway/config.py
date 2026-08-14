@@ -34,6 +34,14 @@ class Settings:
     # does not replay trade_updates missed while the socket was down, so
     # without this a lot keeps its pre-outage state forever. 0 disables.
     lot_reconcile_seconds: float = 60.0
+    # DEBUG prints every tick and every decision behind it. Off by default so
+    # production stays quiet; LOG_LEVEL=DEBUG when you need to see why nothing
+    # is happening, which is the question this system has been bad at
+    # answering.
+    log_level: str = "INFO"
+    # How often to print each open lot's full state even when nothing changes.
+    # A silent process and a stuck one look identical without it.
+    heartbeat_seconds: float = 60.0
     discord_webhook_url: str = ""
 
     @classmethod
@@ -72,6 +80,8 @@ class Settings:
             ),
             stream_enabled=_bool_env("ALPACA_STREAM_ENABLED", False),
             lot_reconcile_seconds=float(os.getenv("LOT_RECONCILE_SECONDS", "60")),
+            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            heartbeat_seconds=float(os.getenv("HEARTBEAT_SECONDS", "60")),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
         )
 

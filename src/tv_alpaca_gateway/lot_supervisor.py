@@ -132,9 +132,23 @@ class LotSupervisor:
 
     # ── market events ───────────────────────────────────────────────────────
 
+    def heartbeat(self) -> None:
+        """Print what every open lot believes, whether or not anything changed.
+
+        A process with nothing to do and a process that has silently stopped
+        working look identical in a quiet log. This makes them different.
+        """
+        if not self.lots:
+            logger.info("heartbeat: no open lots")
+            return
+        for lot in self.lots.values():
+            logger.info("heartbeat: %s", lot.describe())
+
     def on_bar(self, bar) -> None:
         lot = self._for(bar.symbol)
         if lot is None:
+            logger.debug("bar for %s ignored: no open lot on that symbol (watching %s)",
+                         bar.symbol, sorted(self.lots) or "nothing")
             return
         lot.on_bar(high=bar.high, low=bar.low, close=bar.close,
                    trade_count=bar.trade_count)
@@ -143,6 +157,8 @@ class LotSupervisor:
     def on_trade(self, trade) -> None:
         lot = self._for(trade.symbol)
         if lot is None:
+            logger.debug("trade for %s ignored: no open lot on that symbol (watching %s)",
+                         trade.symbol, sorted(self.lots) or "nothing")
             return
         lot.on_price(Decimal(str(trade.price)))
         self._remember(lot)

@@ -17,6 +17,8 @@ teach it a rule that belongs here.
 
 from __future__ import annotations
 
+import logging
+
 import json
 from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
@@ -26,6 +28,8 @@ from . import assets
 # Crypto has no plain stop order, only stop_limit, so a gap straight through the
 # limit leaves the position held with its protection unfilled. Wei's number:
 # 0.05% below the trigger. Tighter fills better and misses more often.
+logger = logging.getLogger(__name__)
+
 STOP_LIMIT_OFFSET = Decimal("0.0005")
 
 
@@ -238,14 +242,45 @@ class Lot:
 
     # ── price and bar input ─────────────────────────────────────────────────
 
+    def describe(self) -> str:
+        """One line of everything this lot currently believes.
+
+        Written because the opposite cost three days. The system was silent
+        about its DECISIONS, not just its data — six live runs armed correctly
+        and did nothing, and no log said "TP1 is 63.74 away" or "the trail did
+        not move because that bar had no trades". Received-message logging
+        would not have shown any of it; only the reasoning does.
+        """
+        rungs = ",".join(
+            f"tp{r}{'=filled' if r in self.filled_rungs else ('=pending' if r in self.pending_rungs else f'@{self.target_price(r):.2f}')}"
+            for r in range(1, len(self.plan.tranches) + 1))
+        return (f"lot {self.event_id} {self.symbol} stage={self.stage} "
+                f"remaining={assets.format_qty(self.remaining_qty)} "
+                f"entry={self.entry_price} stop={self.initial_stop} "
+                f"working_stop={self.working_stop}"
+                f"{' breakeven_pending' if self.breakeven_pending else ''} "
+                f"reserved={assets.format_qty(self.reserved_qty)} {rungs}")
+
     def on_price(self, price: Decimal) -> None:
         """A trade print. Fires any breached rung, then checks the working stop."""
         if self.is_closed:
             return
         self.last_price = price
         if self.breakeven_pending and price > self.entry_price:
+            logger.info("breakeven now reachable on %s: stop -> %s",
+                        self.symbol, self.entry_price)
             self.working_stop = max(self.working_stop, self.entry_price)
             self.breakeven_pending = False
+        # Logged after the update so the line reflects what the lot believes
+        # having seen this price, not what it believed before.
+        if logger.isEnabledFor(logging.DEBUG):
+            gaps = " ".join(
+                f"tp{r} {self.target_price(r) - price:+.2f}"
+                for r in range(1, len(self.plan.tranches) + 1)
+                if r not in self.filled_rungs)
+            logger.debug("price %s %s | %s | stop %+.2f | %s", self.symbol, price,
+                         gaps or "no rungs left",
+                         self.working_stop - price, self.describe())
         if self.stage == "ladder":
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
@@ -273,7 +308,13 @@ class Lot:
         """
         if self.is_closed:
             return
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("bar %s h=%s l=%s c=%s trades=%s | stage=%s working_stop=%s",
+                         self.symbol, high, low, close, trade_count,
+                         self.stage, self.working_stop)
         if trade_count == 0:
+            logger.debug("bar ignored: no trades in it, so its low is a quote "
+                         "and not a price anything changed hands at")
             # No trades: the bar is built from quotes, and neither a stop nor a
             # take-profit should act on a price nothing traded at.
             return
@@ -304,7 +345,12 @@ class Lot:
         if self.stage != "runner":
             return
         if low > self.working_stop:
+            logger.info("trail %s: stop %s -> %s (bar low, %s trades)",
+                        self.symbol, self.working_stop, low, trade_count)
             self.working_stop = low          # monotonic: never loosens
+        elif self.stage == "runner":
+            logger.debug("trail unchanged: bar low %s is not above the stop %s",
+                         low, self.working_stop)
 
     def _apply_breakeven(self) -> None:
         """Move the working stop to entry — but never above the market.

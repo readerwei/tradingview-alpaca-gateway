@@ -69,6 +69,9 @@ class _Broker:
     def fill_price(self, order_id):
         return ENTRY
 
+    def recent_bars(self, symbol, timeframe, limit=30):
+        return []
+
     def get_order(self, order_id):
         raise AssertionError("not used here")
 
@@ -311,3 +314,76 @@ def test_healthz_still_hides_the_secrets(tmp_path):
 
     for secret in ("s3cret", "PK-real", "sh-h-h", str(settings.db_path)):
         assert secret not in body, f"{secret!r} leaked into /healthz"
+
+
+# ══════════════════════════════ saying what it is doing, and why
+
+def test_debug_logging_explains_why_a_rung_did_not_fire(tmp_path, caplog):
+    """The line that would have saved three days.
+
+    Six live runs armed correctly and did nothing, and nothing in the log said
+    how far the target was or why the trail had not moved. Logging received
+    messages would not have shown it — only the reasoning does.
+    """
+    import logging
+
+    broker = _Broker()
+    app = _streaming_app(tmp_path, broker)
+    lot = app.state.supervisor._for("BTC/USD")
+
+    with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
+        lot.on_price(ENTRY - Decimal("100"))
+
+    text = caplog.text
+    assert "tp1" in text, "the log did not say where the next target is"
+    assert "stop" in text, "the log did not say where the stop is"
+
+
+def test_a_quote_only_bar_says_why_it_was_ignored(tmp_path, caplog):
+    """Silently skipping input is indistinguishable from not receiving it."""
+    import logging
+
+    app = _streaming_app(tmp_path, _Broker())
+    lot = app.state.supervisor._for("BTC/USD")
+    lot.advance_to_runner()
+
+    with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
+        lot.on_bar(high=ENTRY + 3 * R, low=ENTRY + 2 * R, close=ENTRY, trade_count=0)
+
+    assert "no trades" in caplog.text
+
+
+def test_an_event_for_an_unwatched_symbol_says_what_is_watched(tmp_path, caplog):
+    """"Nothing happened" and "that symbol was never being watched" are
+    different problems with the same silence."""
+    import logging
+
+    app = _streaming_app(tmp_path, _Broker())
+
+    with caplog.at_level(logging.DEBUG, logger="tv_alpaca_gateway"):
+        app.state.supervisor.on_trade(_UnwatchedTrade())
+
+    assert "no open lot" in caplog.text and "BTC/USD" in caplog.text
+
+
+def test_the_heartbeat_prints_state_when_nothing_is_happening(tmp_path, caplog):
+    """A quiet process and a stuck one look identical without this."""
+    import logging
+
+    app = _streaming_app(tmp_path, _Broker())
+
+    with caplog.at_level(logging.INFO, logger="tv_alpaca_gateway"):
+        app.state.supervisor.heartbeat()
+
+    assert "heartbeat" in caplog.text
+    assert "working_stop" in caplog.text, "the heartbeat said nothing useful"
+
+
+def test_debug_is_off_unless_asked_for(tmp_path):
+    """Wei: "so i can turn it off during true production run." """
+    assert _settings(tmp_path).log_level == "INFO"
+
+
+class _UnwatchedTrade:
+    symbol = "ETH/USD"
+    price = 1900.0

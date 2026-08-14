@@ -368,8 +368,14 @@ class _MarketDataSocket(_AlpacaSocket):
             "action": "subscribe", "quotes": symbols, "trades": symbols,
             "bars": symbols,
         }))
-        await self._await_frame(
+        confirmation = await self._await_frame(
             websocket, lambda m: m.get("T") == "subscription", "subscription")
+        # At INFO, not DEBUG: "which symbols am I actually watching" is the
+        # first question asked whenever nothing happens, and it is cheap —
+        # one line per connection, not per message.
+        logger.info("subscribed on %s: quotes=%s trades=%s bars=%s",
+                    self.url, (confirmation or {}).get("quotes"),
+                    (confirmation or {}).get("trades"), (confirmation or {}).get("bars"))
 
 
 class _TradingSocket(_AlpacaSocket):
@@ -434,6 +440,8 @@ class AlpacaMarketStream(_MarketDataSocket):
             async for raw in websocket:
                 for message in _frames(raw):
                     event = parse_market_message(message)
+                    if event is not None:
+                        logger.debug("%s %s", self.label, event)
                     if isinstance(event, MarketQuote):
                         await _invoke(self.on_quote, event)
                     elif isinstance(event, MarketTrade):
