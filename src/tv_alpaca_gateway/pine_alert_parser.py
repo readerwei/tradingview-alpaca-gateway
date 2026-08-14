@@ -132,6 +132,25 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
+    if exit_plan and side == "sell" and not crypto_symbol \
+            and qty != qty.to_integral_value():
+        # Alpaca: "We do not support short sales in fractional orders. All
+        # fractional sell orders are marked long."
+        #
+        # So a fractional sell does not open a short — it is silently treated
+        # as a long sale. Nothing errors; the position that comes back is not
+        # the one the alert asked for. A lot created for it would carry
+        # direction=-1 while the account holds no short, and every decision
+        # after that would be inverted against reality.
+        #
+        # Scoped to alerts carrying an EXIT_PLAN, because a fractional sell
+        # WITHOUT one is the ordinary way to close a fractional long, and
+        # refusing that would break the common case to guard an unusual one.
+        raise AlertParseError(
+            f"cannot short a fractional quantity ({qty}): Alpaca marks all "
+            f"fractional sell orders long, so this would not open a short. "
+            f"Use a whole number of shares")
+
     if exit_plan and side == "sell" and crypto_symbol:
         # NARROWED from "no shorts at all".
         #

@@ -298,3 +298,72 @@ def test_a_shortable_equity_still_goes_through(tmp_path):
     broker = FakeBroker()
     assert broker.shortable("TSLA") is True
     assert broker.shortable("BTC/USD") is False
+
+
+# ══════════════════ a fractional sell is not a short, whatever it looks like
+
+FRACTIONAL_SHORT = ("EXECUTE_ALPACA_ORDER | SYMBOL=TSLA | SIDE=SELL | QTY=10.5 | "
+                    "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | "
+                    "PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=350 | "
+                    "STOP_LIMIT=350.5")
+
+
+def test_a_fractional_sell_cannot_open_a_short():
+    """Wei's catch, and the reason it matters more than it looks.
+
+    Alpaca: "We do not support short sales in fractional orders. All fractional
+    sell orders are marked long."
+
+    So the order is ACCEPTED and quietly means something else. Nothing errors.
+    A lot created for it would carry direction=-1 while the account holds no
+    short, and every decision after that — targets, trail, breach tests, exit
+    side — would be inverted against reality. The asset-level `shortable` check
+    does not catch it, because TSLA genuinely is shortable; the quantity is
+    what makes this one not a short.
+    """
+    from tv_alpaca_gateway.pine_alert_parser import AlertParseError, parse_pine_alert
+
+    with pytest.raises(AlertParseError, match=r"(?i)fractional"):
+        parse_pine_alert(FRACTIONAL_SHORT + " | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1")
+
+
+def test_a_fractional_sell_WITHOUT_a_plan_is_still_allowed():
+    """CORRECTED from my first attempt, which refused every fractional sell.
+
+    That broke the ordinary case to guard an unusual one: selling 10.5 shares
+    is the normal way to CLOSE a fractional long, and Alpaca marking it long is
+    exactly right there. The suite caught it immediately — an existing parser
+    test started failing on a crypto close.
+
+    The refusal belongs where the alert means to OPEN a managed short.
+    """
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+
+    command = parse_pine_alert(FRACTIONAL_SHORT)
+    assert command.side == "sell" and command.qty == Decimal("10.5")
+
+
+def test_a_fractional_short_WITH_a_plan_is_refused():
+    from tv_alpaca_gateway.pine_alert_parser import AlertParseError, parse_pine_alert
+
+    with pytest.raises(AlertParseError, match=r"(?i)fractional"):
+        parse_pine_alert(FRACTIONAL_SHORT + " | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1")
+
+
+def test_a_whole_share_short_is_unaffected():
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+
+    command = parse_pine_alert(FRACTIONAL_SHORT.replace("QTY=10.5", "QTY=10"))
+    assert command.side == "sell" and command.qty == Decimal("10")
+
+
+def test_a_fractional_BUY_is_still_fine():
+    """Fractional longs are supported and common. The restriction is on short
+    sales only, and a guard that refused fractional buys would break the
+    ordinary case to fix an unusual one."""
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+
+    command = parse_pine_alert(FRACTIONAL_SHORT.replace("SIDE=SELL", "SIDE=BUY")
+                               .replace("STOP_TRIGGER=350 | STOP_LIMIT=350.5",
+                                        "STOP_TRIGGER=330 | STOP_LIMIT=329.5"))
+    assert command.side == "buy" and command.qty == Decimal("10.5")
