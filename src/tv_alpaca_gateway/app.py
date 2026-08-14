@@ -24,6 +24,7 @@ from .execution import ExecutionError, UnprotectedPositionError
 from .pine_alert_parser import AlertParseError as PineAlertParseError, PineOrderCommand, parse_pine_alert
 from .notifier import DiscordNotifier, NullNotifier
 from .risk import RiskError, approve
+from .exit_manager import is_ours
 from .lot_supervisor import LotSupervisor
 from .market_log import MarketDataCounters
 from .market_log import logger as market_logger
@@ -32,6 +33,10 @@ from .stream import (AlpacaStreamManager, MarketBar, MarketQuote, MarketTrade,
 from .store import EventStore
 
 logger = logging.getLogger(__name__)
+
+# How many distinct foreign order ids to remember before starting over. Only a
+# leak guard: forgetting costs one repeated warning, which is the cheap side.
+FOREIGN_ORDER_MEMORY = 2048
 
 
 def _running_commit() -> str:
@@ -147,6 +152,10 @@ def create_app(
 
     supervisor = LotSupervisor(store, broker)
     counters = MarketDataCounters()
+    # Order ids already reported as foreign, so one order is one line rather
+    # than one per event. Bounded because this process runs for days against an
+    # account another system also trades.
+    foreign_orders_seen: set[str] = set()
 
     async def on_trade(event: MarketTrade) -> None:
         counters.record_trade(event.symbol)
@@ -175,7 +184,29 @@ def create_app(
                      "client_order_id=%s", event.symbol, event.side, event.qty,
                      event.filled_qty, event.client_order_id)
         if not updated:
-            logger.warning("received update for unknown order_id=%s", event.order_id)
+            # The store holds what DIRECT EXECUTION placed — entry, protection
+            # generation 0, flatten. Every order the supervisor places after the
+            # handoff is absent from it by design, so "not in the store" was
+            # never the same question as "not ours". Warning on it fired seven
+            # times in one five-minute lot and taught the reader to skip the
+            # level, which matters because this account is shared: an order from
+            # Wei's other system, or placed by hand, lands here too and is the
+            # one thing on this line worth waking up for.
+            if is_ours(event.client_order_id):
+                logger.debug("supervisor-owned order update client_order_id=%s "
+                             "order_id=%s", event.client_order_id, event.order_id)
+            elif event.order_id not in foreign_orders_seen:
+                # Per order, not per event: one order emits new, partial_fill and
+                # fill, which is precisely how a single rung produced three of
+                # the old warnings.
+                if len(foreign_orders_seen) >= FOREIGN_ORDER_MEMORY:
+                    foreign_orders_seen.clear()     # bounded; re-warning is cheap
+                foreign_orders_seen.add(event.order_id)
+                logger.warning(
+                    "FOREIGN order on this account, not placed by this gateway: "
+                    "%s %s qty=%s status=%s client_order_id=%s order_id=%s",
+                    event.symbol, event.side, event.qty, event.status,
+                    event.client_order_id, event.order_id)
         # Route the fill FIRST. Notifying used to come before this line, so a
         # Discord 403 raised past it and the lot never heard about the fill —
         # the primary fill path was dead and it looked like a network problem.

@@ -33,6 +33,28 @@ logger = logging.getLogger(__name__)
 
 STOP_LIMIT_OFFSET = Decimal("0.0005")
 
+# Every client order id this gateway places opens with this, because they are
+# all `event_id + suffix` and `execution._command_id` builds the event id from
+# it. That single fact is what `is_ours` rests on.
+NAMESPACE = "pine-exec-"
+
+
+def is_ours(client_order_id: str | None) -> bool:
+    """Did this gateway place the order?
+
+    Deliberately a namespace test rather than a grammar of known suffixes.
+    Both would answer today's question; only this one keeps answering it. A
+    suffix table would have to list `-tp{n}`, `-tp{n}r{k}`, `-protection-{gen}`,
+    `-stop`, `-oco`, `-flatten`, and would start reporting the gateway's own
+    orders as foreign the day someone adds an exit reason and forgets it — a
+    false alarm in the one place a false alarm is most expensive.
+
+    The distinction that matters is ours-versus-not, and the account is shared:
+    Wei runs a second system against it, so anything outside this namespace is
+    genuinely someone else's order and worth a line.
+    """
+    return (client_order_id or "").startswith(NAMESPACE)
+
 
 def prefixed(event_id: str) -> str:
     """`pine-exec-<id>`, without doubling it.
@@ -50,7 +72,7 @@ def prefixed(event_id: str) -> str:
     Safe to change only because no lot is open. An id format change would
     otherwise leave a resting stop unfindable by the code that placed it.
     """
-    return event_id if event_id.startswith("pine-exec-") else f"pine-exec-{event_id}"
+    return event_id if is_ours(event_id) else f"{NAMESPACE}{event_id}"
 
 
 class ExitPlanError(ValueError):
