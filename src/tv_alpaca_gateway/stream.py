@@ -485,7 +485,17 @@ class AlpacaTradeUpdateStream(_TradingSocket):
                 for message in _frames(raw):
                     event = parse_order_update(message)
                     if event is not None:
-                        await _invoke(self.on_update, event)
+                        try:
+                            await _invoke(self.on_update, event)
+                        except Exception:
+                            # A handler blowing up is a handler bug, not a
+                            # disconnect. Letting it propagate meant any
+                            # exception below — a failed notification, most
+                            # of all — tore down a healthy socket and was
+                            # logged as a network failure.
+                            logger.exception(
+                                "order-update handler failed; the stream is "
+                                "fine and stays connected")
 
 
 def _mark_down(socket: Any, reason: str) -> None:
