@@ -39,6 +39,9 @@ class Settings:
     # INFO keeps ordinary runs concise. DEBUG enables per-event stream and
     # managed-lot state diagnostics for paper-test operators.
     heartbeat_seconds: float = 60.0
+    # The per-tick firehose. Separate from LOG_LEVEL because "is data
+    # flowing" and "what was every tick" are different questions.
+    log_market_data: bool = False
     log_level: str = "INFO"
 
     @classmethod
@@ -79,6 +82,7 @@ class Settings:
             lot_reconcile_seconds=float(os.getenv("LOT_RECONCILE_SECONDS", "60")),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
             heartbeat_seconds=float(os.getenv("HEARTBEAT_SECONDS", "60")),
+            log_market_data=_bool_env("LOG_MARKET_DATA", False),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         )
 
@@ -167,7 +171,7 @@ def _decimal_env(name: str, default: Decimal) -> Decimal:
         raise ValueError(f"{name} must be a decimal number, got {raw!r}") from exc
 
 
-def configure_logging(level: str) -> None:
+def configure_logging(level: str, log_market_data: bool = False) -> None:
     """Configure the process logger without exposing credentials or payloads."""
     numeric = getattr(logging, level.upper(), None)
     if not isinstance(numeric, int):
@@ -189,3 +193,7 @@ def configure_logging(level: str) -> None:
     # not suppressed — quieter, not deafened.
     logging.getLogger().setLevel(max(numeric, logging.INFO))
     logging.getLogger("tv_alpaca_gateway").setLevel(numeric)
+    # Muted EXPLICITLY, not by omission: as a child of the package logger it
+    # would otherwise inherit DEBUG and reproduce the flood.
+    logging.getLogger("tv_alpaca_gateway.marketdata").setLevel(
+        numeric if log_market_data else logging.WARNING)
