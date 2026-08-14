@@ -120,19 +120,29 @@ def create_app(
     supervisor = LotSupervisor(store, broker)
 
     async def on_trade(event: MarketTrade) -> None:
-        logger.debug("market trade %s price=%s size=%s", event.symbol, event.price, event.size)
+        logger.debug("market trade symbol=%s timestamp=%s price=%s size=%s trade_id=%s",
+                     event.symbol, event.timestamp, event.price, event.size,
+                     event.trade_id)
         # Off the event loop: firing a rung is a blocking urllib call, and
         # blocking here stalls every other stream on the same loop.
         await asyncio.to_thread(supervisor.on_trade, event)
 
     async def on_bar(event: MarketBar) -> None:
+        logger.debug("market bar symbol=%s timestamp=%s o=%s h=%s l=%s c=%s "
+                     "volume=%s trades=%s", event.symbol, event.timestamp,
+                     event.open, event.high, event.low, event.close,
+                     event.volume, event.trade_count)
         await asyncio.to_thread(supervisor.on_bar, event)
 
     async def on_order_update(event: OrderUpdate) -> None:
         status = f"broker_{event.status or event.event}"
         detail = f"event={event.event}; filled_qty={event.filled_qty}"
         updated = store.update_by_order_id(event.order_id, status, detail)
-        logger.info("Alpaca order update order_id=%s event=%s status=%s", event.order_id, event.event, event.status)
+        logger.info("Alpaca order update order_id=%s event=%s status=%s",
+                    event.order_id, event.event, event.status)
+        logger.debug("order state symbol=%s side=%s qty=%s filled_qty=%s "
+                     "client_order_id=%s", event.symbol, event.side, event.qty,
+                     event.filled_qty, event.client_order_id)
         notifier.send(
             f"Alpaca paper order update: {event.side.upper()} {event.qty} {event.symbol}; "
             f"event={event.event}; status={event.status}; filled={event.filled_qty}"
