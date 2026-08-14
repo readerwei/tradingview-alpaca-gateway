@@ -129,7 +129,7 @@ async def run(args: argparse.Namespace) -> int:
         return 2
 
     settings = Settings.from_env()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_market_data)
     logger.debug("direct runner settings: paper=%s trading_enabled=%s stream_enabled=%s "
                  "allowed_symbols=%s max_qty=%s max_notional=%s",
                  settings.paper_trading, settings.trading_enabled,

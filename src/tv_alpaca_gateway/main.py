@@ -10,7 +10,8 @@ def run() -> None:
     # setting with no effect on the very process it matters most for. A knob
     # that silently does nothing is worse than no knob — you turn it and
     # conclude the thing you are debugging is not the problem.
-    configure_logging(Settings.from_env().log_level)
+    settings = Settings.from_env()
+    configure_logging(settings.log_level, settings.log_market_data)
     uvicorn.run("tv_alpaca_gateway.app:app", host="127.0.0.1", port=8000, reload=False)
 
 

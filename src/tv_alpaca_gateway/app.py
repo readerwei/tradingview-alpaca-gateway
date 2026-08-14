@@ -25,6 +25,8 @@ from .pine_alert_parser import AlertParseError as PineAlertParseError, PineOrder
 from .notifier import DiscordNotifier, NullNotifier
 from .risk import RiskError, approve
 from .lot_supervisor import LotSupervisor
+from .market_log import MarketDataCounters
+from .market_log import logger as market_logger
 from .stream import (AlpacaStreamManager, MarketBar, MarketQuote, MarketTrade,
                      OrderUpdate)
 from .store import EventStore
@@ -115,12 +117,15 @@ def create_app(
     notifier = notifier or (DiscordNotifier(settings.discord_webhook_url) if settings.discord_webhook_url else NullNotifier())
 
     async def on_quote(event: MarketQuote) -> None:
-        logger.debug("market quote %s bid=%s ask=%s", event.symbol, event.bid_price, event.ask_price)
+        counters.record_quote(event.symbol)
+        market_logger.debug("market quote %s bid=%s ask=%s", event.symbol, event.bid_price, event.ask_price)
 
     supervisor = LotSupervisor(store, broker)
+    counters = MarketDataCounters()
 
     async def on_trade(event: MarketTrade) -> None:
-        logger.debug("market trade symbol=%s timestamp=%s price=%s size=%s trade_id=%s",
+        counters.record_trade(event.symbol)
+        market_logger.debug("market trade symbol=%s timestamp=%s price=%s size=%s trade_id=%s",
                      event.symbol, event.timestamp, event.price, event.size,
                      event.trade_id)
         # Off the event loop: firing a rung is a blocking urllib call, and
@@ -128,7 +133,8 @@ def create_app(
         await asyncio.to_thread(supervisor.on_trade, event)
 
     async def on_bar(event: MarketBar) -> None:
-        logger.debug("market bar symbol=%s timestamp=%s o=%s h=%s l=%s c=%s "
+        counters.record_bar(event.symbol, getattr(event, "trade_count", None))
+        market_logger.debug("market bar symbol=%s timestamp=%s o=%s h=%s l=%s c=%s "
                      "volume=%s trades=%s", event.symbol, event.timestamp,
                      event.open, event.high, event.low, event.close,
                      event.volume, event.trade_count)
@@ -193,6 +199,9 @@ def create_app(
         while True:
             await asyncio.sleep(settings.heartbeat_seconds)
             try:
+                await asyncio.to_thread(
+                    counters.emit,
+                    [*settings.market_symbols, *settings.crypto_symbols])
                 await asyncio.to_thread(supervisor.heartbeat)
             except Exception:
                 logger.exception("heartbeat failed")
@@ -251,6 +260,7 @@ def create_app(
     app.state.store = store
     app.state.broker = broker
     app.state.supervisor = supervisor
+    app.state.market_counters = counters
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
