@@ -132,6 +132,24 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
+    if exit_plan and side == "sell":
+        # Fail closed, before any order exists.
+        #
+        # The exit manager is long-only — targets sit above entry, rungs fire
+        # on price >= target, the trail ratchets up on bar LOWS and every exit
+        # is a sell. A short satisfies none of it, and Lot.opened refuses one.
+        #
+        # But that refusal happens AFTER the entry has filled, and the fallback
+        # is an ordinary protective stop that a short alert does not ask for.
+        # Observed live on 2026-08-14: two SIDE=SELL alerts carrying an exit
+        # plan opened 10-share shorts with no protection of any kind, and sat
+        # unprotected until someone closed them by hand. Failing open on the
+        # protective path is the one direction that must not happen.
+        raise AlertParseError(
+            "EXIT_PLAN is long-only: a SIDE=SELL alert would fill and then get "
+            "no managed exits. Send it without an EXIT_PLAN, or use "
+            "PLACE_PROTECTIVE_STOP_AFTER_FILL for a plain stop")
+
     if exit_plan == "OCO_AFTER_FILL":
         if protective_stop:
             raise AlertParseError("OCO_AFTER_FILL cannot be combined with protective stop")

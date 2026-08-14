@@ -61,7 +61,32 @@ def _running_commit() -> str:
         return "unknown"
 
 
+def _worktree_dirty() -> bool | None:
+    """Whether the running checkout has uncommitted edits.
+
+    The commit hash caught three of four runtime/repository divergences. It
+    could not catch the fourth: on 2026-08-14 the gateway ran DYNAMIC_TRAIL at
+    0.2R/0.4R while master said 1.2R/2.5R, because exit_plans.py had been
+    edited in place and never committed. An uncommitted edit has exactly the
+    same commit hash as the code it changed, so "commit" answered the question
+    correctly and the answer was still wrong.
+
+    None rather than False when it cannot be determined, so "not a git
+    checkout" is never reported as "clean".
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=pathlib.Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5, check=True)
+        return bool(result.stdout.strip())
+    except Exception:
+        return None
+
+
 RUNNING_COMMIT = _running_commit()
+WORKTREE_DIRTY = _worktree_dirty()
 
 
 def _pine_command_payload(command: PineOrderCommand) -> dict[str, Any]:
@@ -291,6 +316,8 @@ def create_app(
             "paper_trading": settings.paper_trading,
             "trading_enabled": settings.trading_enabled,
             "commit": RUNNING_COMMIT,
+            # True means the running code differs from that commit.
+            "worktree_dirty": WORKTREE_DIRTY,
             "risk": {
                 "allowed_symbols": sorted(settings.allowed_symbols),
                 "max_qty": settings.max_qty,

@@ -389,3 +389,72 @@ def test_take_profit_without_any_plan_is_still_refused():
     sent is how an instruction disappears."""
     with pytest.raises(AlertParseError, match=r"(?i)EXIT_PLAN"):
         parse_pine_alert(_alert() + " | TAKE_PROFIT=66000")
+
+
+# ═══════════════════════ a short must not fill and then go unmanaged
+
+SHORT = ("EXECUTE_ALPACA_ORDER | SYMBOL=TSLA | SIDE=SELL | QTY=10 | "
+         "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | EXIT_PLAN=DYNAMIC_TRAIL | "
+         "INTERVAL=1 | PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=350 | "
+         "STOP_LIMIT=350.5")
+
+
+def test_a_short_carrying_an_exit_plan_is_refused_before_any_order():
+    """Observed live on 2026-08-14, and the worst kind of bug: fail-open.
+
+    Two SIDE=SELL alerts carrying an exit plan opened 10-share shorts with no
+    protection of any kind. The exit manager is long-only and refused the lot —
+    but only AFTER the entry had filled, and the fallback places a plain stop
+    the short alert never asked for. The positions sat naked until someone
+    closed them by hand.
+
+    Refused at the parser now, so nothing reaches the broker.
+    """
+    with pytest.raises(AlertParseError, match=r"(?i)long-only"):
+        parse_pine_alert(SHORT)
+
+
+def test_a_short_without_an_exit_plan_still_works():
+    """The guard refuses the COMBINATION. Shorting is not the problem —
+    shorting while expecting managed exits that cannot exist is."""
+    plain = SHORT.replace(" | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1", "")
+    command = parse_pine_alert(plain)
+
+    assert command.side == "sell"
+    assert command.exit_plan is None
+    assert command.place_protective_stop_after_fill
+
+
+def test_a_long_with_an_exit_plan_is_unaffected():
+    """Paired acceptance: a guard that never admits the good case is an
+    outage, not a check."""
+    long_alert = SHORT.replace("SIDE=SELL", "SIDE=BUY").replace(
+        "STOP_TRIGGER=350 | STOP_LIMIT=350.5", "STOP_TRIGGER=330 | STOP_LIMIT=329.5")
+
+    assert parse_pine_alert(long_alert).exit_plan == "DYNAMIC_TRAIL"
+
+
+def test_the_fast_plan_is_the_real_plan_with_closer_targets():
+    """Same shape, reachable targets — so a test exercises the strategy's
+    structure rather than a different strategy that happens to fire."""
+    real = exit_plans.resolve("DYNAMIC_TRAIL")
+    fast = exit_plans.resolve("DYNAMIC_TRAIL_FAST")
+
+    assert [f for f, _ in fast.tranches] == [f for f, _ in real.tranches], (
+        "the fast plan must split the position the same way")
+    assert fast.runner_fraction == real.runner_fraction
+    assert fast.breakeven_after == real.breakeven_after
+    assert fast.trail_source == real.trail_source
+
+    assert [m for _, m in fast.tranches] < [m for _, m in real.tranches], (
+        "the whole point is targets that are closer")
+
+
+def test_the_real_plan_still_has_the_multiples_wei_specified():
+    """Guards against the test plan quietly becoming the real one — which is
+    what editing DYNAMIC_TRAIL in place had already done on the host."""
+    real = exit_plans.resolve("DYNAMIC_TRAIL")
+
+    assert [m for _, m in real.tranches] == [Decimal("1.2"), Decimal("2.5")]
+    assert [f for f, _ in real.tranches] == [Decimal("0.20"), Decimal("0.30")]
+    assert real.runner_fraction == Decimal("0.50")
