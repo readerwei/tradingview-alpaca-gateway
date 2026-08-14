@@ -110,6 +110,11 @@ class Lot:
     timeframe: str
     plan: ExitPlan
     min_order_size: Decimal
+    # +1 long, -1 short. One sign threading through every decision, rather
+    # than `if short` at nine call sites — the same code then runs both ways,
+    # so a mistake shows up in both directions instead of hiding in the one
+    # nobody exercised.
+    direction: int = 1
 
     remaining_qty: Decimal = Decimal("0")
     working_stop: Decimal = Decimal("0")
@@ -153,7 +158,7 @@ class Lot:
         self.plan.validate()
         if self.held_qty <= 0:
             raise ExitPlanError("a lot needs a positive held quantity")
-        if self.initial_stop >= self.entry_price:
+        if self.sign * (self.entry_price - self.initial_stop) <= 0:
             # Long-only, said out loud. Everything here assumes it: targets sit
             # above entry, rungs fire on price >= target, the trail ratchets up
             # on bar LOWS, and every exit is a sell. A short entry satisfies
@@ -163,11 +168,12 @@ class Lot:
             # out as "R would be zero or negative", which reads like a bad
             # alert rather than an unsupported direction, and would have sent
             # whoever hit it looking in the wrong place.
+            where = "at or below" if self.is_short else "at or above"
             raise ExitPlanError(
-                f"stop {self.initial_stop} is at or above entry {self.entry_price}. "
-                "The exit manager is long-only: targets are above entry, the "
-                "trail follows bar lows, and every exit is a sell. A short "
-                "position needs its own plan, not this one inverted")
+                f"stop {self.initial_stop} is {where} entry {self.entry_price} "
+                f"on a {'short' if self.is_short else 'long'}; R would be zero "
+                f"or negative and every target would sit the wrong side of the "
+                f"entry")
 
         # Every rung is checked now, not when it fires. A ladder that clears TP1
         # and then cannot place TP2 leaves a position half managed, with a
@@ -188,16 +194,42 @@ class Lot:
     # ── the ladder, priced from the fill ────────────────────────────────────
 
     @property
+    def sign(self) -> Decimal:
+        return Decimal(self.direction)
+
+    @property
+    def is_short(self) -> bool:
+        return self.direction < 0
+
+    @property
+    def exit_side(self) -> str:
+        """A long exits by selling; a short exits by buying."""
+        return "sell" if self.direction > 0 else "buy"
+
+    @property
     def risk_per_unit(self) -> Decimal:
-        """R. Measured from the price the entry actually filled at, which a
-        market order into a fast tape will not make equal to the signal price."""
-        return self.entry_price - self.initial_stop
+        """R, always positive in both directions.
+
+        Long: entry above stop. Short: stop above entry. The sign makes it one
+        expression rather than a branch, which matters because every target and
+        every breach test is derived from it.
+        """
+        return self.sign * (self.entry_price - self.initial_stop)
 
     def target_price(self, rung: int) -> Decimal:
+        """Above entry for a long, below it for a short."""
         if rung <= len(self.explicit_targets):
             return self.explicit_targets[rung - 1]
         _fraction, multiple = self.plan.tranches[rung - 1]
-        return self.entry_price + multiple * self.risk_per_unit
+        return self.entry_price + self.sign * multiple * self.risk_per_unit
+
+    def _reached(self, price: Decimal, level: Decimal) -> bool:
+        """Has price got to `level` in the direction the trade profits?"""
+        return self.sign * (price - level) >= 0
+
+    def _breached(self, price: Decimal, stop: Decimal) -> bool:
+        """Has price gone through the stop, against the trade?"""
+        return self.sign * (price - stop) <= 0
 
     def _increment(self) -> Decimal:
         """Quantity granularity, taken from the asset's own minimum: 1e-9 for
@@ -248,20 +280,24 @@ class Lot:
         if self.is_closed:
             return
         self.last_price = price
-        if self.breakeven_pending and price > self.entry_price:
-            self.working_stop = max(self.working_stop, self.entry_price)
+        if self.breakeven_pending and self._reached(price, self.entry_price):
+            self.working_stop = (min(self.working_stop, self.entry_price) if self.is_short
+                                 else max(self.working_stop, self.entry_price))
             self.breakeven_pending = False
         if self.stage == "ladder":
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
                     continue
-                if price >= self.target_price(rung):
+                if self._reached(price, self.target_price(rung)):
                     self._fire_rung(rung)
         # Only act when the software stop is strictly tighter than the resting
         # one. While the two sit at the same price a breach triggers both, and
         # the broker's stop is already there and does not depend on us being
         # alive — so selling here as well would just race our own order.
-        if self.working_stop > self.initial_stop and price <= self.working_stop:
+        # "strictly tighter" means closer to price in the profitable direction,
+        # which is a comparison against the initial stop in the sign's terms.
+        if (self.sign * (self.working_stop - self.initial_stop) > 0
+                and self._breached(price, self.working_stop)):
             self._exit_remainder("stop")
 
     def on_bar(self, high: Decimal, low: Decimal, close: Decimal,
@@ -310,13 +346,23 @@ class Lot:
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
                     continue
-                if high >= self.target_price(rung):
+                # A long needs the bar HIGH to reach a target above it; a
+                # short needs the LOW to reach one below.
+                extreme = low if self.is_short else high
+                if self._reached(extreme, self.target_price(rung)):
                     self._fire_rung(rung)
 
         if self.stage != "runner":
             return
-        if low > self.working_stop:
-            self.working_stop = low          # monotonic: never loosens
+        # A long trails the bar LOW upward; a short trails the bar HIGH
+        # downward. Monotonic in the direction that locks in profit, never the
+        # other way.
+        candidate = high if self.is_short else low
+        if self.sign * (candidate - self.working_stop) > 0:
+            logger.info("trail %s: stop %s -> %s (bar %s, %s trades)",
+                        self.symbol, self.working_stop, candidate,
+                        "high" if self.is_short else "low", trade_count)
+            self.working_stop = candidate
 
     def _apply_breakeven(self) -> None:
         """Move the working stop to entry — but never above the market.
@@ -338,7 +384,7 @@ class Lot:
         that technique is what finally proved this system works after six runs
         that proved nothing.
         """
-        if self.last_price is not None and self.last_price <= self.entry_price:
+        if self.last_price is not None and self._breached(self.last_price, self.entry_price):
             self.breakeven_pending = True
             return
         self.working_stop = self.entry_price
@@ -348,7 +394,8 @@ class Lot:
         """Enter the trailing stage. Used by reconciliation when the ladder is
         already complete, and by tests. Moves no quantity."""
         self.stage = "runner"
-        if self.plan.breakeven_after and self.working_stop < self.entry_price:
+        if (self.plan.breakeven_after
+                and self.sign * (self.working_stop - self.entry_price) < 0):
             self.working_stop = self.entry_price
 
     def on_fill(self, rung: int, filled_qty: Decimal, fill_id: str | None = None) -> None:
@@ -380,7 +427,8 @@ class Lot:
             return                                 # still working; stop stays put
 
         self.filled_rungs.add(rung)
-        if rung == self.plan.breakeven_after and self.working_stop < self.entry_price:
+        if (rung == self.plan.breakeven_after
+                and self.sign * (self.working_stop - self.entry_price) < 0):
             self._apply_breakeven()
         if len(self.filled_rungs) >= len(self.plan.tranches):
             self.stage = "runner"
@@ -405,7 +453,10 @@ class Lot:
         symbol. Clamping to what is really held turns a silent accounting drift
         into a small visible one instead of an order for coins we do not own."""
         self._require_broker()
-        held = Decimal(str(self._broker.position_qty(self.symbol)))
+        # abs(): a short position reports a negative quantity, and an order
+        # quantity is always positive. The sign belongs in the price and side
+        # logic, never in a number handed to the broker.
+        held = abs(Decimal(str(self._broker.position_qty(self.symbol))))
         return min(wanted, held, self.remaining_qty)
 
     def _fire_rung(self, rung: int) -> None:
@@ -433,7 +484,7 @@ class Lot:
         attempt = self.rung_attempts.get(rung, 0)
         self.rung_attempts[rung] = attempt + 1
         placed = self._broker.submit_order(
-            symbol=self.symbol, side="sell", qty=assets.format_qty(qty),
+            symbol=self.symbol, side=self.exit_side, qty=assets.format_qty(qty),
             type="market", time_in_force=assets.time_in_force(self.symbol),
             client_order_id=self.rung_client_order_id(rung, attempt))
         self.rung_order_ids.setdefault(rung, []).append(placed["id"])
@@ -455,7 +506,7 @@ class Lot:
         qty = self._sellable(self.remaining_qty)
         if qty >= self.min_order_size:
             self._broker.submit_order(
-                symbol=self.symbol, side="sell", qty=assets.format_qty(qty),
+                symbol=self.symbol, side=self.exit_side, qty=assets.format_qty(qty),
                 type="market", time_in_force=assets.time_in_force(self.symbol),
                 client_order_id=f"{_prefixed(self.event_id)}-{reason}")
         self.stage = "closed"
@@ -484,7 +535,8 @@ class Lot:
         self.reserved_qty = qty
 
     def _place_stop(self, qty: Decimal) -> str:
-        order = build_stop_order(self.symbol, qty, self.initial_stop)
+        order = build_stop_order(self.symbol, qty, self.initial_stop,
+                                 direction=self.direction)
         order["client_order_id"] = f"{self.stop_client_order_id}-{self.stop_generation}"
         self.stop_generation += 1
         return self._broker.submit_order(**order)["id"]
@@ -506,6 +558,7 @@ def dump_lot(lot: Lot) -> str:
         "event_id": lot.event_id, "symbol": lot.symbol, "timeframe": lot.timeframe,
         "stage": lot.stage, "stop_order_id": lot.stop_order_id,
         "stop_generation": lot.stop_generation,
+        "direction": lot.direction,
         "explicit_targets": [str(t) for t in lot.explicit_targets],
         "breakeven_pending": lot.breakeven_pending,
         "last_price": str(lot.last_price) if lot.last_price is not None else None,
@@ -542,6 +595,7 @@ def load_lot(state: str) -> Lot:
             trail_source=plan["trail_source"],
             breakeven_after=plan["breakeven_after"],
         ),
+        direction=int(raw.get("direction", 1)),
         **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
     )
     lot.explicit_targets = tuple(Decimal(t) for t in raw.get("explicit_targets", []))
@@ -561,7 +615,8 @@ def load_lot(state: str) -> Lot:
 
 
 def build_stop_order(symbol: str, qty: Decimal, stop_price: Decimal,
-                     trail_percent: Decimal | None = None) -> dict:
+                     trail_percent: Decimal | None = None,
+                     direction: int = 1) -> dict:
     """The disaster stop, in the form the asset class actually accepts.
 
     ``trail_percent`` exists only to be refused on crypto. Alpaca has no
@@ -574,14 +629,19 @@ def build_stop_order(symbol: str, qty: Decimal, stop_price: Decimal,
             "runners trail in software")
     order = {
         "symbol": symbol,
-        "side": "sell",
+        # A long is protected by a sell below it; a short by a buy above it.
+        "side": "sell" if direction > 0 else "buy",
         "qty": assets.format_qty(qty),
         "time_in_force": assets.time_in_force(symbol),
     }
     if trail_percent is not None:
         order |= {"type": "trailing_stop", "trail_percent": str(trail_percent)}
     elif assets.is_crypto(symbol):
-        limit = (stop_price * (1 - STOP_LIMIT_OFFSET)).quantize(Decimal("0.01"))
+        # The limit sits on the far side of the trigger in the direction the
+        # order will execute: below for a sell, above for a buy. Putting it on
+        # the wrong side makes an order that can trigger and never fill.
+        offset = -STOP_LIMIT_OFFSET if direction > 0 else STOP_LIMIT_OFFSET
+        limit = (stop_price * (1 + offset)).quantize(Decimal("0.01"))
         order |= {"type": "stop_limit", "stop_price": str(stop_price),
                   "limit_price": str(limit)}
     else:
@@ -592,7 +652,8 @@ def build_stop_order(symbol: str, qty: Decimal, stop_price: Decimal,
 def open_lot(lot: Lot, broker) -> Lot:
     """Arm a lot: refuse if the symbol is busy, then rest the disaster stop."""
     if assets.is_crypto(lot.symbol):
-        resting = [o for o in broker.open_orders(lot.symbol) if o.get("side") == "sell"]
+        resting = [o for o in broker.open_orders(lot.symbol)
+                   if o.get("side") == lot.exit_side]
         if resting:
             raise LotConflict(
                 f"{lot.symbol} already has an open lot with {len(resting)} resting "

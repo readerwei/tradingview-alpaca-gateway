@@ -399,8 +399,18 @@ SHORT = ("EXECUTE_ALPACA_ORDER | SYMBOL=TSLA | SIDE=SELL | QTY=10 | "
          "STOP_LIMIT=350.5")
 
 
-def test_a_short_carrying_an_exit_plan_is_refused_before_any_order():
-    """Observed live on 2026-08-14, and the worst kind of bug: fail-open.
+def test_a_short_carrying_an_exit_plan_is_now_managed_not_refused():
+    """SUPERSEDED by short ladders, and worth keeping the history.
+
+    This asserted that any SIDE=SELL with an EXIT_PLAN was refused. That was
+    correct while the exit manager was long-only: the entry filled, the lot was
+    refused afterwards, and the fallback placed an ordinary stop the short
+    never asked for — two 10-share shorts sat unprotected until someone closed
+    them by hand.
+
+    Shorts are managed now, so the rule that has to survive is narrower: an
+    equity short is accepted, and the refusal remains only where the exchange
+    makes it impossible.
 
     Two SIDE=SELL alerts carrying an exit plan opened 10-share shorts with no
     protection of any kind. The exit manager is long-only and refused the lot —
@@ -410,8 +420,14 @@ def test_a_short_carrying_an_exit_plan_is_refused_before_any_order():
 
     Refused at the parser now, so nothing reaches the broker.
     """
-    with pytest.raises(AlertParseError, match=r"(?i)long-only"):
-        parse_pine_alert(SHORT)
+    command = parse_pine_alert(SHORT)
+    assert command.side == "sell" and command.exit_plan == "DYNAMIC_TRAIL"
+
+    crypto_short = (SHORT.replace("SYMBOL=TSLA", "SYMBOL=BTC/USD")
+                    .replace("TIME_IN_FORCE=DAY", "TIME_IN_FORCE=GTC")
+                    .replace("QTY=10", "QTY=0.0015"))
+    with pytest.raises(AlertParseError, match=r"(?i)shortable|cannot be shorted"):
+        parse_pine_alert(crypto_short)
 
 
 def test_a_short_without_an_exit_plan_still_works():

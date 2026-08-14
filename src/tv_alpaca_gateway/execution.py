@@ -481,6 +481,7 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
                 f"no fill price for {entry_id}; R cannot be measured and every "
                 f"target would sit at the wrong distance from the real risk")
         lot = exit_manager.Lot.opened(
+            direction=-1 if command.side == "sell" else 1,
             event_id=event_id, symbol=symbol, entry_price=entry_price,
             initial_stop=command.stop_trigger, held_qty=held_qty,
             timeframe=command.interval, plan=exit_plans.resolve(command.exit_plan),
