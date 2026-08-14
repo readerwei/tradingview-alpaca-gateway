@@ -14,6 +14,7 @@ invokes fails silently, which is the only failure mode with no symptom.
 from __future__ import annotations
 
 import asyncio
+import logging
 from decimal import Decimal
 
 import pytest
@@ -387,3 +388,44 @@ def test_debug_is_off_unless_asked_for(tmp_path):
 class _UnwatchedTrade:
     symbol = "ETH/USD"
     price = 1900.0
+
+
+def test_create_app_does_not_touch_logging(tmp_path):
+    """A factory builds a thing; it does not take over the process.
+
+    `create_app()` used to set the package logger's level from settings, so an
+    embedding application or a test that had configured DEBUG was silently
+    reset to INFO by construction alone. It caught me out in my own demo script
+    minutes after writing it, which is a fair warning about what it would do to
+    someone else.
+    """
+    import logging
+
+    log = logging.getLogger("tv_alpaca_gateway")
+    original = log.level
+    try:
+        log.setLevel(logging.DEBUG)
+        create_app(_settings(tmp_path, log_level="INFO"), _Broker(),
+                   EventStore(tmp_path / "l.sqlite3"))
+        assert log.level == logging.DEBUG, "constructing the app reset the log level"
+    finally:
+        log.setLevel(original)
+
+
+def test_the_entrypoints_configure_logging_explicitly(tmp_path):
+    """Removing it from the factory must not mean nobody does it — that would
+    silently turn LOG_LEVEL into a setting with no effect."""
+    import inspect
+
+    from tv_alpaca_gateway import direct_runner, logging_setup, main
+
+    assert "configure" in inspect.getsource(main.run)
+    assert "configure" in inspect.getsource(direct_runner.run)
+
+    log = logging.getLogger("tv_alpaca_gateway")
+    original = log.level
+    try:
+        logging_setup.configure(_settings(tmp_path, log_level="DEBUG"))
+        assert log.level == logging.DEBUG
+    finally:
+        log.setLevel(original)

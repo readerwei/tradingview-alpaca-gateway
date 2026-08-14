@@ -117,8 +117,6 @@ def create_app(
     async def on_quote(event: MarketQuote) -> None:
         logger.debug("market quote %s bid=%s ask=%s", event.symbol, event.bid_price, event.ask_price)
 
-    logging.getLogger("tv_alpaca_gateway").setLevel(
-        getattr(logging, settings.log_level, logging.INFO))
     supervisor = LotSupervisor(store, broker)
 
     async def on_trade(event: MarketTrade) -> None:

@@ -19,6 +19,7 @@ from typing import Sequence
 from . import execution
 from .app import create_app
 from .config import Settings
+from .logging_setup import configure
 from .pine_alert_parser import PineOrderCommand, parse_pine_alert
 
 
@@ -125,6 +126,7 @@ async def run(args: argparse.Namespace) -> int:
         return 2
 
     settings = Settings.from_env()
+    configure(settings)
     if not settings.paper_trading:
         print(json.dumps({"ok": False, "error": "direct runner requires PAPER_TRADING=true"}),
               file=sys.stderr)
