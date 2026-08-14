@@ -17,6 +17,8 @@ teach it a rule that belongs here.
 
 from __future__ import annotations
 
+import logging
+
 import json
 from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
@@ -26,6 +28,8 @@ from . import assets
 # Crypto has no plain stop order, only stop_limit, so a gap straight through the
 # limit leaves the position held with its protection unfilled. Wei's number:
 # 0.05% below the trigger. Tighter fills better and misses more often.
+logger = logging.getLogger(__name__)
+
 STOP_LIMIT_OFFSET = Decimal("0.0005")
 
 
@@ -247,6 +251,15 @@ class Lot:
             self.working_stop = max(self.working_stop, self.entry_price)
             self.breakeven_pending = False
         if self.stage == "ladder":
+            if logger.isEnabledFor(logging.DEBUG):
+                # The distance, not just the state. "Nothing fired" and "the
+                # target is 190 away" look the same in a state dump, and it was
+                # the second one we needed for three days.
+                gaps = " ".join(f"tp{r}{self.target_price(r) - price:+.2f}"
+                                for r in range(1, len(self.plan.tranches) + 1)
+                                if r not in self.filled_rungs)
+                logger.debug("rungs %s at %s: %s | stop %+.2f", self.symbol, price,
+                             gaps or "all filled", self.working_stop - price)
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
                     continue
@@ -274,6 +287,8 @@ class Lot:
         if self.is_closed:
             return
         if trade_count == 0:
+            logger.debug("bar %s ignored: no trades, so its low is a quote and "
+                         "not a price anything changed hands at", self.symbol)
             # No trades: the bar is built from quotes, and neither a stop nor a
             # take-profit should act on a price nothing traded at.
             return

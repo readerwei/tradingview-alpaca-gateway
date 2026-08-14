@@ -210,6 +210,24 @@ class LotSupervisor:
 
     # ── the timer ───────────────────────────────────────────────────────────
 
+    def heartbeat(self) -> None:
+        """Print every open lot's state even when nothing changes.
+
+        A process with nothing to do and one that has silently stopped working
+        look identical in a quiet log, and we could not tell them apart for two
+        days. Event-driven logging cannot fix that by construction: no events,
+        no lines.
+        """
+        if not self.lots:
+            logger.info("heartbeat: no open lots")
+            return
+        for lot in self.lots.values():
+            logger.info("heartbeat: lot %s %s stage=%s remaining=%s working_stop=%s "
+                        "reserved=%s filled=%s",
+                        lot.event_id, lot.symbol, lot.stage,
+                        assets.format_qty(lot.remaining_qty), lot.working_stop,
+                        assets.format_qty(lot.reserved_qty), sorted(lot.filled_rungs))
+
     def reconcile_all(self) -> None:
         """Re-check every open lot against the broker.
 

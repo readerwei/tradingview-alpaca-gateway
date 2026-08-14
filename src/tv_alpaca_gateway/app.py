@@ -189,6 +189,14 @@ def create_app(
         else None
     )
 
+    async def heartbeat_periodically() -> None:
+        while True:
+            await asyncio.sleep(settings.heartbeat_seconds)
+            try:
+                await asyncio.to_thread(supervisor.heartbeat)
+            except Exception:
+                logger.exception("heartbeat failed")
+
     async def reconcile_periodically() -> None:
         """Alpaca does not replay trade_updates missed while the socket was down.
 
@@ -220,13 +228,16 @@ def create_app(
             await stream.start()
         timer = (asyncio.create_task(reconcile_periodically(), name="lot-reconcile")
                  if settings.lot_reconcile_seconds > 0 else None)
+        beat = (asyncio.create_task(heartbeat_periodically(), name="lot-heartbeat")
+                if settings.heartbeat_seconds > 0 else None)
         try:
             yield
         finally:
-            if timer is not None:
-                timer.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await timer
+            for task in (timer, beat):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
             if stream is not None and settings.stream_enabled:
                 await stream.stop()
 
