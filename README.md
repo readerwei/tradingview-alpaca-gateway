@@ -291,6 +291,7 @@ TP1:       +1.2R, sell 20%
 TP2:       +2.5R, sell 30%
 Runner:    remaining 50%
 After TP1: move the software stop to the exact entry fill (breakeven)
+Ratchet:   re-place the resting broker stop once the software stop is 0.5R ahead
 ```
 
 Take-profit levels are software triggers, not resting Alpaca orders. A TP order
@@ -299,6 +300,22 @@ based on the previous completed eligible 1-minute bar: the long trail ratchets
 on bar lows, while the short trail ratchets on bar highs. Missing, forming,
 zero-trade, or synthetic bars do not advance it. Each trail is monotonic in its
 profitable direction and never moves back toward greater risk.
+
+There are two stops, and they are not the same number. The **software stop** is
+the trail: it moves every eligible bar and it dies with this process. The
+**resting stop** is the order actually held at Alpaca, and it survives anything.
+Between them sits the gap a crash would cost, and that gap grows with the size
+of the win — so the resting stop is re-placed to match once the software stop
+has pulled `stop_ratchet_r` ahead of it (0.5R on `DYNAMIC_TRAIL`). Moving it on
+every bar was rejected: each move is a cancel-then-place with the position
+unreserved in between, and sixty of those an hour is a poor trade for a stop
+that usually moves pennies. Set `stop_ratchet_r=0` on a plan to keep the older
+behaviour, where the resting stop never leaves the original disaster level.
+
+A ratchet that cannot re-place its stop logs at `ERROR`, leaves the lot
+reporting no stop rather than pointing at a cancelled order, and is repaired by
+the next reconcile — the position is genuinely unprotected at the broker until
+then, which is the cost this feature is paying for a bounded gap.
 
 Quotes never fire a rung: they are counted and logged, and never reach the
 supervisor.
