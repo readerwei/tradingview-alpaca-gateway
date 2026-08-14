@@ -374,3 +374,89 @@ def test_a_lot_still_on_the_ladder_is_not_seeded(tmp_path):
     supervisor.LotSupervisor(store, broker).start()
 
     assert not asked, "a laddering lot fetched history it cannot use"
+
+
+# ════════ the routing key must match what a lot actually calls itself
+
+def test_a_rung_id_resolves_to_the_lots_own_event_id():
+    """Live regression, 2026-08-14 16:42:25:
+
+        INFO fill for unmanaged lot btc-tp-ladder-test-3-20260811-1228 (BTC/USD)
+
+    `rung_of` stripped the `pine-exec-` prefix, but a lot's event_id CONTAINS
+    it — `_command_id` returns `pine-exec-<identity>` and that is what reaches
+    the lot. The comparison could never match.
+
+    It was hidden by a second bug. Client order ids used to double the prefix,
+    so stripping one still left the other and the ids matched by accident.
+    Fixing the doubling exposed this, and rung fills stopped routing entirely —
+    the ladder ran on the 60-second reconcile timer instead. Correct, and a
+    minute late.
+    """
+    from tv_alpaca_gateway.exit_manager import prefixed
+
+    event_id = "pine-exec-btc-tp-ladder-test-3-20260811-1228"
+    extracted, rung = supervisor.rung_of(f"{event_id}-tp1")
+
+    assert rung == 1
+    assert prefixed(extracted) == prefixed(event_id), (
+        "the routing key does not resolve to the lot's own event_id")
+
+
+def test_the_old_doubled_ids_still_resolve():
+    """Lots opened before the prefix fix are still in the store, and a fill for
+    one must not be dropped because its id has the older shape."""
+    from tv_alpaca_gateway.exit_manager import prefixed
+
+    doubled = "pine-exec-pine-exec-btc-t3-1228-tp1"
+    extracted, rung = supervisor.rung_of(doubled)
+
+    assert rung == 1
+    assert prefixed(extracted) == prefixed("pine-exec-btc-t3-1228")
+
+
+def test_a_fill_actually_reaches_the_lot_end_to_end(tmp_path, caplog):
+    """The behavioural version, because the unit above passed while routing was
+    broken in production — the ids were compared in a different place."""
+    import logging
+
+    broker = _Broker()
+    sup = _supervisor(tmp_path, broker)
+    lot = sup.adopt(manager.open_lot(_lot(event_id="pine-exec-evt-1"), broker))
+    lot.on_price(TP1)
+
+    with caplog.at_level(logging.INFO, logger="tv_alpaca_gateway"):
+        sup.on_order_update(_Update("pine-exec-evt-1-tp1", lot.tranche_qty(1)))
+
+    assert "unmanaged lot" not in caplog.text, "the fill was dropped as unmanaged"
+    assert lot.rung_filled(1), "the fill never reached the lot"
+
+
+def test_every_parsed_client_order_id_round_trips():
+    """The class of bug, not the instance.
+
+    Generating an id and parsing one back are two different code paths, and
+    only the parse direction was wrong — which is why everything looked
+    consistent right up until a fill arrived. Any id we generate must resolve
+    to the lot that generated it.
+    """
+    from decimal import Decimal
+
+    from tv_alpaca_gateway.exit_manager import prefixed
+
+    # The shapes an event_id actually takes. `_command_id` returns
+    # `pine-exec-<identity>`, and a lot created directly in a test may carry a
+    # bare id — a DOUBLED event_id is not a real shape: the doubling was in the
+    # generated client order id, never in the event_id itself, and asserting on
+    # it would be testing an invented case.
+    for event_id in ("evt-1", "pine-exec-evt-1",
+                     "pine-exec-btc-tp-ladder-test-3-20260811-1228"):
+        lot = _lot(event_id=event_id)
+        for rung in (1, 2):
+            for attempt in (0, 1):
+                cid = lot.rung_client_order_id(rung, attempt)
+                parsed = supervisor.rung_of(cid)
+                assert parsed is not None, f"{cid} did not parse as a rung"
+                assert prefixed(parsed[0]) == prefixed(lot.event_id), (
+                    f"{cid} resolves to {parsed[0]!r}, not to the lot that made it")
+                assert parsed[1] == rung

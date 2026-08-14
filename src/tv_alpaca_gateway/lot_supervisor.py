@@ -17,7 +17,7 @@ import re
 from decimal import Decimal
 
 from . import assets
-from .exit_manager import Lot, dump_lot, load_lot, reconcile_lot
+from .exit_manager import Lot, dump_lot, load_lot, prefixed, reconcile_lot
 from .market_log import logger as market_logger
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,21 @@ def rung_of(client_order_id: str) -> tuple[str, int] | None:
 
     Matched on the whole id, not by `in`: the protective order for event
     `abc-tp1` would otherwise look like a rung of event `abc`.
+
+    The event id is returned exactly as the client order id spells it. Whether
+    it carries the `pine-exec-` prefix depends on how the lot was created, so
+    the COMPARISON normalises both sides rather than this function guessing —
+    guessing here broke every lot whose event_id had no prefix.
+
+    The mismatch it fixes was hidden by another bug. Client order ids used to double
+    the prefix (`pine-exec-pine-exec-…`), so stripping one still left the other
+    and the comparison matched by accident. Removing the doubling made the
+    stripping visible, and every fill started arriving as:
+
+        INFO fill for unmanaged lot btc-… (BTC/USD)
+
+    Live consequence: rung fills stopped routing entirely, and the ladder ran
+    on the 60-second reconcile timer instead. Correct, and a minute late.
     """
     match = _RUNG.match(client_order_id or "")
     return (match["event"], int(match["rung"])) if match else None
@@ -212,7 +227,12 @@ class LotSupervisor:
             return
         event_id, rung = identified
         lot = self._for(update.symbol)
-        if lot is None or lot.event_id != event_id:
+        # Both sides normalised. A lot's event_id may or may not carry the
+        # `pine-exec-` prefix depending on how it was created, and the client
+        # order id always does — comparing them raw dropped every fill as
+        # "unmanaged", live, for as long as the ids were not accidentally
+        # symmetrical.
+        if lot is None or prefixed(lot.event_id) != prefixed(event_id):
             # A fill for a lot this process does not hold. Not an error — it may
             # belong to a closed lot — but worth seeing, because the other way
             # it happens is a routing bug.
