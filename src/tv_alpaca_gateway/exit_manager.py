@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 STOP_LIMIT_OFFSET = Decimal("0.0005")
 
 
-def _prefixed(event_id: str) -> str:
+def prefixed(event_id: str) -> str:
     """`pine-exec-<id>`, without doubling it.
 
     `_command_id` already returns `pine-exec-<identity>`, and that value is what
@@ -260,11 +260,11 @@ class Lot:
         stays readable in the order log.
         """
         suffix = f"-tp{rung}" if not attempt else f"-tp{rung}r{attempt}"
-        return f"{_prefixed(self.event_id)}{suffix}"
+        return f"{prefixed(self.event_id)}{suffix}"
 
     @property
     def stop_client_order_id(self) -> str:
-        return f"{_prefixed(self.event_id)}-protection"
+        return f"{prefixed(self.event_id)}-protection"
 
     @property
     def is_closed(self) -> bool:
@@ -528,7 +528,7 @@ class Lot:
             self._broker.submit_order(
                 symbol=self.symbol, side=self.exit_side, qty=assets.format_qty(qty),
                 type="market", time_in_force=assets.time_in_force(self.symbol),
-                client_order_id=f"{_prefixed(self.event_id)}-{reason}")
+                client_order_id=f"{prefixed(self.event_id)}-{reason}")
         logger.info("lot %s %s: closed", self.event_id, self.symbol)
         self.stage = "closed"
         self.remaining_qty = Decimal("0")

@@ -393,26 +393,26 @@ def test_a_rung_id_resolves_to_the_lots_own_event_id():
     the ladder ran on the 60-second reconcile timer instead. Correct, and a
     minute late.
     """
-    from tv_alpaca_gateway.exit_manager import _prefixed
+    from tv_alpaca_gateway.exit_manager import prefixed
 
     event_id = "pine-exec-btc-tp-ladder-test-3-20260811-1228"
     extracted, rung = supervisor.rung_of(f"{event_id}-tp1")
 
     assert rung == 1
-    assert _prefixed(extracted) == _prefixed(event_id), (
+    assert prefixed(extracted) == prefixed(event_id), (
         "the routing key does not resolve to the lot's own event_id")
 
 
 def test_the_old_doubled_ids_still_resolve():
     """Lots opened before the prefix fix are still in the store, and a fill for
     one must not be dropped because its id has the older shape."""
-    from tv_alpaca_gateway.exit_manager import _prefixed
+    from tv_alpaca_gateway.exit_manager import prefixed
 
     doubled = "pine-exec-pine-exec-btc-t3-1228-tp1"
     extracted, rung = supervisor.rung_of(doubled)
 
     assert rung == 1
-    assert _prefixed(extracted) == _prefixed("pine-exec-btc-t3-1228")
+    assert prefixed(extracted) == prefixed("pine-exec-btc-t3-1228")
 
 
 def test_a_fill_actually_reaches_the_lot_end_to_end(tmp_path, caplog):
@@ -430,3 +430,33 @@ def test_a_fill_actually_reaches_the_lot_end_to_end(tmp_path, caplog):
 
     assert "unmanaged lot" not in caplog.text, "the fill was dropped as unmanaged"
     assert lot.rung_filled(1), "the fill never reached the lot"
+
+
+def test_every_parsed_client_order_id_round_trips():
+    """The class of bug, not the instance.
+
+    Generating an id and parsing one back are two different code paths, and
+    only the parse direction was wrong — which is why everything looked
+    consistent right up until a fill arrived. Any id we generate must resolve
+    to the lot that generated it.
+    """
+    from decimal import Decimal
+
+    from tv_alpaca_gateway.exit_manager import prefixed
+
+    # The shapes an event_id actually takes. `_command_id` returns
+    # `pine-exec-<identity>`, and a lot created directly in a test may carry a
+    # bare id — a DOUBLED event_id is not a real shape: the doubling was in the
+    # generated client order id, never in the event_id itself, and asserting on
+    # it would be testing an invented case.
+    for event_id in ("evt-1", "pine-exec-evt-1",
+                     "pine-exec-btc-tp-ladder-test-3-20260811-1228"):
+        lot = _lot(event_id=event_id)
+        for rung in (1, 2):
+            for attempt in (0, 1):
+                cid = lot.rung_client_order_id(rung, attempt)
+                parsed = supervisor.rung_of(cid)
+                assert parsed is not None, f"{cid} did not parse as a rung"
+                assert prefixed(parsed[0]) == prefixed(lot.event_id), (
+                    f"{cid} resolves to {parsed[0]!r}, not to the lot that made it")
+                assert parsed[1] == rung

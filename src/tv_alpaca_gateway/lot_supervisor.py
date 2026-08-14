@@ -17,7 +17,7 @@ import re
 from decimal import Decimal
 
 from . import assets
-from .exit_manager import Lot, _prefixed, dump_lot, load_lot, reconcile_lot
+from .exit_manager import Lot, dump_lot, load_lot, prefixed, reconcile_lot
 from .market_log import logger as market_logger
 
 logger = logging.getLogger(__name__)
@@ -232,7 +232,7 @@ class LotSupervisor:
         # order id always does — comparing them raw dropped every fill as
         # "unmanaged", live, for as long as the ids were not accidentally
         # symmetrical.
-        if lot is None or _prefixed(lot.event_id) != _prefixed(event_id):
+        if lot is None or prefixed(lot.event_id) != prefixed(event_id):
             # A fill for a lot this process does not hold. Not an error — it may
             # belong to a closed lot — but worth seeing, because the other way
             # it happens is a routing bug.
