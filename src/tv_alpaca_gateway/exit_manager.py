@@ -123,6 +123,9 @@ class Lot:
     # strategy actually computed, and for a single-target plan there is no
     # ladder geometry for R to express anyway.
     explicit_targets: tuple[Decimal, ...] = ()
+    # Breakeven that could not be applied yet, and the last price seen.
+    breakeven_pending: bool = False
+    last_price: Decimal | None = None
     reserved_qty: Decimal = Decimal("0")
     stop_generation: int = 0
     _broker: object | None = field(default=None, repr=False, compare=False)
@@ -239,6 +242,10 @@ class Lot:
         """A trade print. Fires any breached rung, then checks the working stop."""
         if self.is_closed:
             return
+        self.last_price = price
+        if self.breakeven_pending and price > self.entry_price:
+            self.working_stop = max(self.working_stop, self.entry_price)
+            self.breakeven_pending = False
         if self.stage == "ladder":
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
@@ -299,6 +306,32 @@ class Lot:
         if low > self.working_stop:
             self.working_stop = low          # monotonic: never loosens
 
+    def _apply_breakeven(self) -> None:
+        """Move the working stop to entry — but never above the market.
+
+        Breakeven is a protective improvement, not an exit instruction. Setting
+        a stop above the current price is a market exit wearing a stop's name,
+        and on 2026-08-11 that is exactly what happened: a take-profit
+        deliberately placed below entry (to make a rung fire on demand) filled,
+        breakeven moved the stop to entry, entry was already above the market,
+        and the runner was closed 117 seconds later without ever trailing.
+
+        The behaviour was correct for the inputs and startling anyway. So when
+        entry is not yet reachable the move is DEFERRED rather than refused:
+        the original disaster stop keeps protecting, and breakeven applies the
+        moment price trades back above cost.
+
+        Deferring rather than rejecting the configuration matters — an explicit
+        target below entry is the only way to make a rung fire on demand, and
+        that technique is what finally proved this system works after six runs
+        that proved nothing.
+        """
+        if self.last_price is not None and self.last_price <= self.entry_price:
+            self.breakeven_pending = True
+            return
+        self.working_stop = self.entry_price
+        self.breakeven_pending = False
+
     def advance_to_runner(self) -> None:
         """Enter the trailing stage. Used by reconciliation when the ladder is
         already complete, and by tests. Moves no quantity."""
@@ -336,7 +369,7 @@ class Lot:
 
         self.filled_rungs.add(rung)
         if rung == self.plan.breakeven_after and self.working_stop < self.entry_price:
-            self.working_stop = self.entry_price
+            self._apply_breakeven()
         if len(self.filled_rungs) >= len(self.plan.tranches):
             self.stage = "runner"
 
@@ -462,6 +495,8 @@ def dump_lot(lot: Lot) -> str:
         "stage": lot.stage, "stop_order_id": lot.stop_order_id,
         "stop_generation": lot.stop_generation,
         "explicit_targets": [str(t) for t in lot.explicit_targets],
+        "breakeven_pending": lot.breakeven_pending,
+        "last_price": str(lot.last_price) if lot.last_price is not None else None,
         "filled_rungs": sorted(lot.filled_rungs),
         "pending_rungs": sorted(lot.pending_rungs),
         "rung_filled_qty": {str(k): str(v) for k, v in lot.rung_filled_qty.items()},
@@ -498,6 +533,9 @@ def load_lot(state: str) -> Lot:
         **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
     )
     lot.explicit_targets = tuple(Decimal(t) for t in raw.get("explicit_targets", []))
+    lot.breakeven_pending = bool(raw.get("breakeven_pending", False))
+    _last = raw.get("last_price")
+    lot.last_price = Decimal(_last) if _last else None
     lot.stage = raw["stage"]
     lot.stop_order_id = raw["stop_order_id"]
     lot.stop_generation = raw["stop_generation"]

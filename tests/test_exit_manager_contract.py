@@ -860,3 +860,69 @@ def test_an_event_id_without_the_prefix_still_gets_one():
 
     assert lot.stop_client_order_id == "pine-exec-btc-001-protection"
     assert lot.rung_client_order_id(2) == "pine-exec-btc-001-tp2"
+
+
+# ═════════════════ breakeven must not become an exit instruction
+
+def test_breakeven_is_deferred_when_entry_is_above_the_market():
+    """Live on 2026-08-11, and startling despite being correct.
+
+    A take-profit deliberately placed below entry (the only way to make a rung
+    fire on demand) filled at 64,225.10 against an entry of 64,275.05.
+    Breakeven moved the stop to entry — already above the market — and the
+    runner was closed 117 seconds later without ever trailing.
+
+    A stop set above the current price is a market exit wearing a stop's name.
+    Breakeven is a protective improvement, so when cost is not yet reachable
+    the move waits and the original disaster stop keeps protecting.
+    """
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.on_price(ENTRY - Decimal("50"))          # market below cost
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="f1")
+
+    assert lot.breakeven_pending, "breakeven should be waiting, not applied"
+    assert lot.working_stop == STOP, "the stop moved above the market"
+    assert not lot.is_closed, "the runner was closed by its own breakeven"
+
+
+def test_a_deferred_breakeven_applies_once_price_recovers():
+    """Deferred, not abandoned — the protection still arrives, just when it
+    can be protection rather than an exit."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.on_price(ENTRY - Decimal("50"))
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="f1")
+
+    lot.on_price(ENTRY + Decimal("25"))
+
+    assert not lot.breakeven_pending
+    assert lot.working_stop == ENTRY
+
+
+def test_breakeven_still_applies_immediately_in_the_normal_case():
+    """The ordinary path is unchanged: TP1 above entry means cost is already
+    behind us, so the stop moves at once."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.on_price(TP1_PRICE)                      # market above cost
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="f1")
+
+    assert lot.working_stop == ENTRY
+    assert not lot.breakeven_pending
+
+
+def test_a_pending_breakeven_survives_a_restart():
+    """It is a decision the lot has taken but not yet acted on; losing it in a
+    restart would silently drop the protection."""
+    broker = _RecordingBroker()
+    lot = manager.open_lot(_lot(), broker)
+    lot.on_price(ENTRY - Decimal("50"))
+    lot.on_fill(rung=1, filled_qty=lot.tranche_qty(1), fill_id="f1")
+
+    revived = manager.load_lot(manager.dump_lot(lot))
+
+    assert revived.breakeven_pending
+    revived._broker = broker
+    revived.on_price(ENTRY + Decimal("25"))
+    assert revived.working_stop == ENTRY
