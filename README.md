@@ -89,7 +89,7 @@ When enabled, the FastAPI lifespan starts two reconnecting WebSocket clients:
 - Alpaca market data: quotes and trades for `MARKET_SYMBOLS`
 - Alpaca paper trading updates: submitted, partial fills, fills, cancellations, rejections, and other order events
 
-The clients authenticate, subscribe, reconnect with bounded exponential backoff, and stop cleanly with the application. Order updates are matched to submitted orders by broker order ID and update the SQLite event record; partial-fill and terminal-status details are also sent to the optional Discord notifier. The default remains disabled, so normal tests and local webhook use do not open network connections.
+The clients authenticate, subscribe, reconnect with bounded exponential backoff, and stop cleanly with the application. Order updates are matched to submitted orders by broker order ID and update the SQLite event record; partial-fill and terminal-status details are also sent to the optional Discord notifier. Notification failures are isolated and logged; they cannot tear down the Alpaca stream or prevent the fill from reaching the supervisor. The default remains disabled, so normal tests and local webhook use do not open network connections.
 
 This stream is still paper-only and is not a live-trading safety certification. Before any unattended use, add a durable outbox/retry state machine, restart reconciliation, position-aware sell checks, and persisted managed-exit state.
 
@@ -204,6 +204,40 @@ stop-market leg; a numeric `STOP_LIMIT` creates a stop-limit leg. This plan
 does not use `INTERVAL` and is rejected for crypto. `DYNAMIC_TRAIL` remains
 unchanged and still requires `INTERVAL`.
 
+### Long and short managed ladders
+
+`DYNAMIC_TRAIL` uses one signed-direction implementation for both equity
+positions:
+
+- `SIDE=BUY` opens a long: targets are above entry, exits are sells, and the
+  disaster stop is below entry.
+- `SIDE=SELL` opens a short: targets are below entry, exits are buys, and the
+  disaster stop is above entry.
+
+The short entry is preflighted before the broker order is submitted. The asset
+must be confirmed `shortable=true`; an asset lookup failure is refused rather
+than treated as permission. Alpaca crypto spot assets report `shortable=false`
+and cannot be sold short.
+
+Alpaca also marks fractional sell orders as long rather than opening a short.
+Therefore a fractional `SIDE=SELL` with an `EXIT_PLAN` is rejected before
+submission. A fractional sell **without** an exit plan remains allowed because
+that is the normal way to close a fractional long. Whole-share equity shorts
+with a managed plan are supported.
+
+Examples:
+
+```text
+# Managed long
+SIDE=BUY | QTY=10 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
+
+# Managed whole-share short
+SIDE=SELL | QTY=10 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
+
+# Rejected: fractional sell cannot open a short
+SIDE=SELL | QTY=10.5 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
+```
+
 The named `DYNAMIC_TRAIL` plan is paper-only and must be requested explicitly in
 the Pine alert:
 
@@ -223,9 +257,10 @@ After TP1: move the software stop to the exact entry fill (breakeven)
 
 Take-profit levels are software triggers, not resting Alpaca orders. A TP order
 is submitted only when an incoming trade crosses its level. The runner trail is
-based on the previous completed eligible 1-minute crypto bar low; missing,
-forming, zero-trade, or synthetic bars do not advance it. The long trail is
-monotonic and never moves downward.
+based on the previous completed eligible 1-minute bar: the long trail ratchets
+on bar lows, while the short trail ratchets on bar highs. Missing, forming,
+zero-trade, or synthetic bars do not advance it. Each trail is monotonic in its
+profitable direction and never moves back toward greater risk.
 
 Alpaca crypto supports simple `stop_limit` protection, but not native crypto
 brackets, OCO, or trailing-stop orders. The gateway therefore owns the ladder
