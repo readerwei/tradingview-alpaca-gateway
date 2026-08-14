@@ -135,17 +135,36 @@ class LotSupervisor:
     def on_bar(self, bar) -> None:
         lot = self._for(bar.symbol)
         if lot is None:
+            logger.debug("lot state=none event=bar symbol=%s timestamp=%s",
+                         bar.symbol, getattr(bar, "timestamp", None))
             return
+        before = (lot.stage, lot.working_stop, lot.remaining_qty,
+                  tuple(sorted(lot.filled_rungs)))
         lot.on_bar(high=bar.high, low=bar.low, close=bar.close,
                    trade_count=bar.trade_count)
         self._remember(lot)
+        logger.debug("lot state=after_bar event_id=%s symbol=%s stage=%s->%s "
+                     "working_stop=%s->%s remaining=%s->%s filled_rungs=%s "
+                     "bar_trades=%s", lot.event_id, lot.symbol, before[0],
+                     lot.stage, before[1], lot.working_stop, before[2],
+                     lot.remaining_qty, sorted(lot.filled_rungs),
+                     bar.trade_count)
 
     def on_trade(self, trade) -> None:
         lot = self._for(trade.symbol)
         if lot is None:
+            logger.debug("lot state=none event=trade symbol=%s timestamp=%s",
+                         trade.symbol, getattr(trade, "timestamp", None))
             return
+        before = (lot.stage, lot.working_stop, lot.remaining_qty,
+                  tuple(sorted(lot.filled_rungs)))
         lot.on_price(Decimal(str(trade.price)))
         self._remember(lot)
+        logger.debug("lot state=after_trade event_id=%s symbol=%s price=%s "
+                     "stage=%s->%s working_stop=%s->%s remaining=%s->%s "
+                     "filled_rungs=%s", lot.event_id, lot.symbol, trade.price,
+                     before[0], lot.stage, before[1], lot.working_stop,
+                     before[2], lot.remaining_qty, sorted(lot.filled_rungs))
 
     # ── order events ────────────────────────────────────────────────────────
 
@@ -156,6 +175,10 @@ class LotSupervisor:
         carries a filled quantity of zero and would otherwise be counted as an
         execution of nothing, consuming the dedupe id that the real fill needs.
         """
+        logger.debug("lot order event=%s order_id=%s client_order_id=%s "
+                     "symbol=%s status=%s filled_qty=%s", getattr(update, "event", None),
+                     update.order_id, update.client_order_id, update.symbol,
+                     getattr(update, "status", None), update.filled_qty)
         if not update.is_fill:
             return
         identified = rung_of(update.client_order_id)

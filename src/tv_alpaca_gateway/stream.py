@@ -427,10 +427,16 @@ class AlpacaMarketStream(_MarketDataSocket):
 
     async def _run_once(self) -> None:
         self._buffer.clear()          # frames never survive a reconnect
+        logger.debug("stream state=connecting name=%s url=%s", self.label, self.url)
         async with self.connect() as websocket:
+            logger.debug("stream state=socket_open name=%s", self.label)
             await self.authenticate(websocket)
+            logger.debug("stream state=authenticated name=%s", self.label)
             await self.subscribe(websocket, self.symbols)
+            logger.debug("stream state=subscribed name=%s symbols=%s", self.label,
+                         self.symbols)
             self.connected, self.last_error = True, None
+            logger.debug("stream state=connected name=%s", self.label)
             async for raw in websocket:
                 for message in _frames(raw):
                     event = parse_market_message(message)
@@ -461,10 +467,16 @@ class AlpacaTradeUpdateStream(_TradingSocket):
 
     async def _run_once(self) -> None:
         self._buffer.clear()          # frames never survive a reconnect
+        logger.debug("stream state=connecting name=trade_updates url=%s", self.url)
         async with self.connect() as websocket:
+            logger.debug("stream state=socket_open name=trade_updates")
             await self.authenticate(websocket)
+            logger.debug("stream state=authenticated name=trade_updates")
             await self.listen(websocket, ["trade_updates"])
+            logger.debug("stream state=subscribed name=trade_updates streams=%s",
+                         ["trade_updates"])
             self.connected, self.last_error = True, None
+            logger.debug("stream state=connected name=trade_updates")
             if self.on_connected is not None:
                 # Resync BEFORE reading, so anything missed during the outage is
                 # recovered even if no new update ever arrives.
@@ -490,11 +502,15 @@ async def _run_with_reconnect(run_once: Callable[[], Awaitable[None]],
     loop = asyncio.get_running_loop()
     while not stop_event.is_set():
         started = loop.time()
+        logger.debug("stream state=attempting name=%s retry_delay=%ss",
+                     stream_name, delay)
         try:
             await run_once()
             # Returning normally means the server closed the socket cleanly.
             # That is a disconnect, not a success.
             logger.info("Alpaca %s stream closed by server", stream_name)
+            logger.debug("stream state=disconnected name=%s reason=server_closed",
+                         stream_name)
             _mark_down(socket, "closed by server")
         except asyncio.CancelledError:
             raise

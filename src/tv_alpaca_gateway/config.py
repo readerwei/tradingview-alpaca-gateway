@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -35,6 +36,9 @@ class Settings:
     # without this a lot keeps its pre-outage state forever. 0 disables.
     lot_reconcile_seconds: float = 60.0
     discord_webhook_url: str = ""
+    # INFO keeps ordinary runs concise. DEBUG enables per-event stream and
+    # managed-lot state diagnostics for paper-test operators.
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -73,9 +77,13 @@ class Settings:
             stream_enabled=_bool_env("ALPACA_STREAM_ENABLED", False),
             lot_reconcile_seconds=float(os.getenv("LOT_RECONCILE_SECONDS", "60")),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
+            log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         )
 
     def validate(self) -> None:
+        if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError(
+                "LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
         if not self.paper_trading:
             raise ValueError("This implementation is paper-only: PAPER_TRADING must be true")
         try:
@@ -155,3 +163,17 @@ def _decimal_env(name: str, default: Decimal) -> Decimal:
         return Decimal(raw.strip())
     except InvalidOperation as exc:
         raise ValueError(f"{name} must be a decimal number, got {raw!r}") from exc
+
+
+def configure_logging(level: str) -> None:
+    """Configure the process logger without exposing credentials or payloads."""
+    numeric = getattr(logging, level.upper(), None)
+    if not isinstance(numeric, int):
+        raise ValueError(f"unsupported log level {level!r}")
+    logging.basicConfig(
+        level=numeric,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # basicConfig is a no-op when uvicorn or a test runner already installed a
+    # handler. In that case still make LOG_LEVEL effective for this process.
+    logging.getLogger().setLevel(numeric)

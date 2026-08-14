@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from dataclasses import asdict
 from decimal import Decimal
@@ -18,8 +19,11 @@ from typing import Sequence
 
 from . import execution
 from .app import create_app
-from .config import Settings
+from .config import Settings, configure_logging
 from .pine_alert_parser import PineOrderCommand, parse_pine_alert
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +129,12 @@ async def run(args: argparse.Namespace) -> int:
         return 2
 
     settings = Settings.from_env()
+    configure_logging(settings.log_level)
+    logger.debug("direct runner settings: paper=%s trading_enabled=%s stream_enabled=%s "
+                 "allowed_symbols=%s max_qty=%s max_notional=%s",
+                 settings.paper_trading, settings.trading_enabled,
+                 settings.stream_enabled, sorted(settings.allowed_symbols),
+                 settings.max_qty, settings.max_notional)
     if not settings.paper_trading:
         print(json.dumps({"ok": False, "error": "direct runner requires PAPER_TRADING=true"}),
               file=sys.stderr)
@@ -132,6 +142,9 @@ async def run(args: argparse.Namespace) -> int:
 
     app = create_app(settings=settings)
     async with app.router.lifespan_context(app):
+        logger.debug("execution state=starting event_id=%s symbol=%s side=%s qty=%s "
+                     "exit_plan=%s", command.event_id, command.symbol,
+                     command.side, command.qty, command.exit_plan)
         result = await asyncio.to_thread(
             execution.execute_pine_command,
             command,
@@ -143,6 +156,10 @@ async def run(args: argparse.Namespace) -> int:
             delivery_id=args.delivery_id,
             supervisor=app.state.supervisor,
         )
+        logger.debug("execution state=complete event_id=%s entry_status=%s "
+                     "entry_order_id=%s protection_status=%s protection_order_id=%s",
+                     command.event_id, result.entry_status, result.entry_order_id,
+                     result.protection_status, result.protection_order_id)
         output = {
             "ok": True,
             "executed": True,
