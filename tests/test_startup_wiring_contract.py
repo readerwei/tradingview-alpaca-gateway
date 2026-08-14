@@ -311,3 +311,43 @@ def test_healthz_still_hides_the_secrets(tmp_path):
 
     for secret in ("s3cret", "PK-real", "sh-h-h", str(settings.db_path)):
         assert secret not in body, f"{secret!r} leaked into /healthz"
+
+
+def test_healthz_reports_whether_the_checkout_is_dirty(tmp_path):
+    """The commit hash caught three of four runtime/repo divergences and could
+    not catch the fourth: DYNAMIC_TRAIL ran at 0.2R/0.4R while master said
+    1.2R/2.5R, because exit_plans.py was edited in place. An uncommitted edit
+    carries the same commit hash as the code it changes, so `commit` answered
+    correctly and the answer was still misleading.
+    """
+    from fastapi.testclient import TestClient
+
+    body = TestClient(create_app(_settings(tmp_path), _Broker(),
+                                 EventStore(tmp_path / "hz.sqlite3"))).get("/healthz").json()
+
+    assert "worktree_dirty" in body
+    assert body["worktree_dirty"] in (True, False, None)
+
+
+def test_an_undeterminable_worktree_is_not_reported_clean(monkeypatch):
+    """None, not False.
+
+    "Not a git checkout" and "no local edits" are different facts, and
+    conflating them is how a check reassures you about something it never
+    examined. Asserted by making the git call fail, rather than by reading the
+    docstring — my first version checked the prose, which would pass whatever
+    the code did.
+    """
+    import subprocess
+
+    # NOT `from tv_alpaca_gateway import app` — app.py defines a module-level
+    # `app = create_app()`, so that name resolves to the FastAPI instance and
+    # the attribute lookup fails with a message about FastAPI. Same trap that
+    # cost time once before.
+    from tv_alpaca_gateway.app import _worktree_dirty
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("git not installed")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    assert _worktree_dirty() is None

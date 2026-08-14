@@ -52,6 +52,26 @@ _PLANS: dict[str, dict] = {
     # below is never consulted when TAKE_PROFIT is supplied — and TAKE_PROFIT
     # is required for this plan — so it exists only to keep the tranche shape
     # uniform with every other plan. One tranche, whole position, no runner.
+    # The same shape as DYNAMIC_TRAIL with targets you can reach in minutes.
+    #
+    # Wei had been editing DYNAMIC_TRAIL's multiples in place to test — 1.2R on
+    # a 26-cent R needs TSLA to move 65 cents, which can take an afternoon. It
+    # worked, and it left the repository saying 1.2R/2.5R while the running
+    # gateway used 0.2R/0.4R: the fourth time this week the deployed code
+    # differed from master, and the only one /healthz could not have caught,
+    # because an uncommitted edit has the same commit hash.
+    #
+    # A named plan makes testing an alert field instead of a file edit. The
+    # real strategy cannot be overwritten by a test value, and test multiples
+    # cannot be left running by forgetting to revert them.
+    "DYNAMIC_TRAIL_FAST": dict(
+        tranches=((Decimal("0.20"), Decimal("0.2")),
+                  (Decimal("0.30"), Decimal("0.4"))),
+        runner_fraction=Decimal("0.50"),
+        trail_source="previous_completed_bar_low",
+        breakeven_after=1,
+        rungs_on_bar_high=True,
+    ),
     "OCO_AFTER_FILL": dict(
         tranches=((Decimal("1.00"), Decimal("2.0")),),
         runner_fraction=Decimal("0"),
