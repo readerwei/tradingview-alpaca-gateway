@@ -169,8 +169,16 @@ def test_no_rung_may_leave_an_unsellable_remainder():
             f"a rung leaves {remaining}, below the {MIN_ORDER} floor")
 
 
-def test_a_short_entry_is_refused_by_name():
-    """This module is long-only, and until now that was true by accident.
+def test_a_stop_on_the_wrong_side_of_entry_is_refused_by_name():
+    """SUPERSEDES `test_a_short_entry_is_refused_by_name`.
+
+    That test asserted the module was long-only, which it was until short
+    ladders were added. What still has to hold is the rule underneath it: the
+    stop must sit on the LOSING side of entry, whichever direction the trade
+    is. A long with a stop above entry and a short with a stop below it are
+    both incoherent, and both used to surface as "R would be zero or negative"
+    — a message that reads like a malformed alert rather than an impossible
+    geometry.
 
     Every part of it assumes the direction: targets above entry, rungs firing
     on `price >= target`, a trail that ratchets up on bar LOWS, and exits that
@@ -181,8 +189,11 @@ def test_a_short_entry_is_refused_by_name():
     malformed alert and sends whoever hits it looking in the wrong place. A
     wrong diagnosis costs more than a plain refusal.
     """
-    with pytest.raises(manager.ExitPlanError, match=r"(?i)long-only|short"):
-        _lot(entry_price=STOP, initial_stop=ENTRY)      # stop above entry
+    with pytest.raises(manager.ExitPlanError, match=r"(?i)long|wrong side|zero or negative"):
+        _lot(entry_price=STOP, initial_stop=ENTRY)      # long, stop above entry
+
+    with pytest.raises(manager.ExitPlanError, match=r"(?i)short|wrong side|zero or negative"):
+        _lot(direction=-1)                              # short, stop below entry
 
 
 def test_the_plan_is_snapshotted_onto_the_lot():

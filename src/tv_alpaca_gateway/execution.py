@@ -179,6 +179,27 @@ def execute_pine_command(
     # forced: the open lot's stop is a resting sell, and a resting sell makes
     # Alpaca refuse the entry buy at submission with NO order record at all.
     # Refusing here produces a reason; letting it through produces silence.
+    # Shortability, before the entry rather than after it. A broker rejection
+    # would arrive once the alert had already been accepted, and on the path
+    # where the ladder cannot manage the position anyway — the same fail-open
+    # shape that left two shorts unprotected on 2026-08-14.
+    if command.side == "sell" and command.exit_plan:
+        try:
+            can_short = broker.shortable(symbol)
+        except Exception as exc:
+            # Unknown is not permission. Refusing a tradeable name costs one
+            # alert; shorting an unshortable one costs a rejected entry with a
+            # lot already recorded against it.
+            raise ExecutionError(
+                f"could not confirm {symbol} is shortable ({exc}); refusing "
+                f"rather than assuming") from exc
+        if not can_short:
+            store.record_refusal(command.event_id or "", "not_shortable",
+                                 f"{symbol} reports shortable=false")
+            raise ExecutionError(
+                f"{symbol} is not shortable: Alpaca reports shortable=false, so "
+                f"a SIDE=SELL exit plan has nothing to manage")
+
     open_lot_id = store.open_lot_for(symbol)
     if open_lot_id and command.exit_plan:
         store.record_refusal(command.event_id or "", "lot_already_open",
@@ -481,6 +502,7 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
                 f"no fill price for {entry_id}; R cannot be measured and every "
                 f"target would sit at the wrong distance from the real risk")
         lot = exit_manager.Lot.opened(
+            direction=-1 if command.side == "sell" else 1,
             event_id=event_id, symbol=symbol, entry_price=entry_price,
             initial_stop=command.stop_trigger, held_qty=held_qty,
             timeframe=command.interval, plan=exit_plans.resolve(command.exit_plan),

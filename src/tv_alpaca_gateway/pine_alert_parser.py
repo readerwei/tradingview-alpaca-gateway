@@ -132,23 +132,26 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
-    if exit_plan and side == "sell":
-        # Fail closed, before any order exists.
+    if exit_plan and side == "sell" and crypto_symbol:
+        # NARROWED from "no shorts at all".
         #
-        # The exit manager is long-only — targets sit above entry, rungs fire
-        # on price >= target, the trail ratchets up on bar LOWS and every exit
-        # is a sell. A short satisfies none of it, and Lot.opened refuses one.
+        # The blanket refusal was right when the exit manager was long-only: a
+        # SIDE=SELL alert filled and then got no managed exits, because the lot
+        # was refused only AFTER the entry, and the fallback placed an ordinary
+        # stop the short never asked for. Two 10-share shorts sat unprotected
+        # on 2026-08-14 until someone closed them by hand.
         #
-        # But that refusal happens AFTER the entry has filled, and the fallback
-        # is an ordinary protective stop that a short alert does not ask for.
-        # Observed live on 2026-08-14: two SIDE=SELL alerts carrying an exit
-        # plan opened 10-share shorts with no protection of any kind, and sat
-        # unprotected until someone closed them by hand. Failing open on the
-        # protective path is the one direction that must not happen.
+        # Shorts are now managed, so the refusal narrows to where the exchange
+        # makes it impossible rather than where our code did. Measured, not
+        # assumed: Alpaca reports BTC/USD shortable=false and marginable=false,
+        # while QQQ and TSLA report shortable=true with easy_to_borrow=true.
+        #
+        # The message names Alpaca's constraint rather than ours, because a
+        # limitation of the exchange and a limitation of our code should not
+        # read the same to whoever hits it at 3am.
         raise AlertParseError(
-            "EXIT_PLAN is long-only: a SIDE=SELL alert would fill and then get "
-            "no managed exits. Send it without an EXIT_PLAN, or use "
-            "PLACE_PROTECTIVE_STOP_AFTER_FILL for a plain stop")
+            f"{symbol} cannot be shorted: Alpaca reports crypto as "
+            f"shortable=false, so a SIDE=SELL exit plan has nothing to manage")
 
     if exit_plan == "OCO_AFTER_FILL":
         if protective_stop:
