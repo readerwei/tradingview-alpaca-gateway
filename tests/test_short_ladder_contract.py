@@ -221,3 +221,80 @@ def test_execution_gives_a_short_alert_a_short_lot():
 
     source = inspect.getsource(execution._open_managed_lot)
     assert "direction=-1 if command.side == \"sell\" else 1" in source
+
+
+def test_a_non_shortable_equity_is_refused_before_any_order(tmp_path):
+    """The gap TradingBot found in review.
+
+    Crypto is refused at the parser because `is_crypto` needs no broker. An
+    equity's shortability does — and without asking, a non-shortable name
+    reached the broker and was rejected there, after the alert had been
+    accepted and on the path where the ladder cannot manage the position
+    anyway. That is the same fail-open shape that left two shorts unprotected.
+    """
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import execution
+    from tv_alpaca_gateway.broker import FakeBroker
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+    from tv_alpaca_gateway.store import EventStore
+
+    broker = FakeBroker()
+    broker.shortable_symbols = {"TSLA": False}
+    settings = Settings(paper_trading=True, trading_enabled=True, webhook_secret="s",
+                        allowed_symbols=frozenset({"TSLA"}), max_qty=100,
+                        crypto_max_qty=D("0.05"), max_notional=100000.0,
+                        market_symbols=("TSLA",), db_path=tmp_path / "s.sqlite3")
+    store = EventStore(settings.db_path)
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=TSLA | SIDE=SELL | QTY=10 | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | EXIT_PLAN=DYNAMIC_TRAIL | "
+             "INTERVAL=1 | PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=350 | "
+             "STOP_LIMIT=350.5")
+
+    with pytest.raises(execution.ExecutionError, match=r"(?i)shortable"):
+        execution.execute_pine_command(parse_pine_alert(alert), settings, broker,
+                                       store, delivery_id="d-1")
+
+    assert broker.orders == [], "an order reached the broker despite the refusal"
+    assert any("not_shortable" in reason for reason, _d in store.refusals_for("")), (
+        "the refusal was not recorded")
+
+
+def test_an_unknown_shortability_is_refused_rather_than_assumed(tmp_path):
+    """Unknown is not permission. If the lookup fails we do not get to guess —
+    refusing costs one alert, guessing costs a rejected entry with a lot
+    already recorded against it."""
+    from decimal import Decimal as D
+
+    from tv_alpaca_gateway import execution
+    from tv_alpaca_gateway.broker import FakeBroker
+    from tv_alpaca_gateway.config import Settings
+    from tv_alpaca_gateway.pine_alert_parser import parse_pine_alert
+    from tv_alpaca_gateway.store import EventStore
+
+    broker = FakeBroker()
+    broker.shortable = lambda _s: (_ for _ in ()).throw(RuntimeError("asset lookup failed"))
+    settings = Settings(paper_trading=True, trading_enabled=True, webhook_secret="s",
+                        allowed_symbols=frozenset({"TSLA"}), max_qty=100,
+                        crypto_max_qty=D("0.05"), max_notional=100000.0,
+                        market_symbols=("TSLA",), db_path=tmp_path / "u.sqlite3")
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=TSLA | SIDE=SELL | QTY=10 | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | EXIT_PLAN=DYNAMIC_TRAIL | "
+             "INTERVAL=1 | PLACE_PROTECTIVE_STOP_AFTER_FILL | STOP_TRIGGER=350 | "
+             "STOP_LIMIT=350.5")
+
+    with pytest.raises(execution.ExecutionError, match=r"(?i)could not confirm"):
+        execution.execute_pine_command(parse_pine_alert(alert), settings, broker,
+                                       EventStore(settings.db_path), delivery_id="d-2")
+
+    assert broker.orders == []
+
+
+def test_a_shortable_equity_still_goes_through(tmp_path):
+    """Paired acceptance — a preflight that refuses everything is an outage."""
+    from tv_alpaca_gateway.broker import FakeBroker
+
+    broker = FakeBroker()
+    assert broker.shortable("TSLA") is True
+    assert broker.shortable("BTC/USD") is False

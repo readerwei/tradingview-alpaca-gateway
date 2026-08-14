@@ -184,6 +184,20 @@ class AlpacaPaperClient:
             status=QueryOrderStatus.OPEN, symbols=[assets.normalise(symbol)]))
         return [self._as_dict(order) for order in orders or []]
 
+    def shortable(self, symbol: str) -> bool:
+        """Whether Alpaca will let this asset be sold short.
+
+        Asked before a short entry, not after. Crypto is refused at the parser
+        because `is_crypto` is knowable without the broker; an equity's
+        shortability is not — TSLA and QQQ report shortable=true with
+        easy_to_borrow=true, but plenty of names do not, and finding out from a
+        broker rejection means the refusal arrives after the alert was accepted.
+        """
+        if is_crypto(symbol):
+            return False
+        asset = self.client.get_asset(assets.normalise(symbol))
+        return bool(getattr(asset, "shortable", False))
+
     def min_order_size(self, symbol: str) -> Decimal:
         """Asked for, never hardcoded: Alpaca recalculates it against price, and
         BTC/USD moved 0.000015417 -> 0.000015437 in a few hours."""
@@ -406,6 +420,12 @@ class FakeBroker:
         # The real BTC/USD figure, so a fake ladder is sized against the same
         # floor the account enforces.
         return Decimal("0.000015417") if is_crypto(symbol) else Decimal("1")
+
+    def shortable(self, symbol: str) -> bool:
+        # Overridable per test; equities shortable by default, crypto never.
+        if is_crypto(symbol):
+            return False
+        return getattr(self, "shortable_symbols", {}).get(symbol, True)
 
     def recent_bars(self, symbol: str, timeframe: str, limit: int = 30) -> list:
         return list(getattr(self, "bars", []))
