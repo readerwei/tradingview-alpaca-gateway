@@ -493,6 +493,15 @@ class Lot:
 
         if self.weakened:
             self._update_weak_trail(extreme)
+            # Same rule as an armed slice: the whole remainder rides on this
+            # trail, so a bar that traded through it must exit rather than wait
+            # for a print that may never be delivered.
+            if (self.sign * (self.working_stop - self.initial_stop) > 0
+                    and self._breached(structure, self.working_stop)):
+                logger.info("lot %s %s: weak trail %s broken by the bar (%s %s)",
+                            self.event_id, self.symbol, self.working_stop,
+                            "high" if self.is_short else "low", structure)
+                self._exit_remainder("stop")
             return
 
         # Weakness first: it overrides everything, including an armed slice.
@@ -512,6 +521,27 @@ class Lot:
             return
 
         if self.armed_rung == rung:
+            # A bar that traded THROUGH the trail sells the slice, before any
+            # question of raising it.
+            #
+            # Found by TradingBot reviewing the plan. Waiting for a trade print
+            # below the level is the same hole `rungs_on_bar_high` closed on the
+            # entry side, and it is worse here: a missed rung costs a better
+            # fill, a missed trail break leaves the slice riding down while the
+            # gateway believes it is managed. On Alpaca's crypto feed two
+            # thirds of bars deliver no trades at all, so "we will see a print
+            # below it" is not an assumption this system may make.
+            #
+            # `structure` is the bar's low for a long — a traded price, since
+            # zero-trade bars never reach here.
+            if self._breached(structure, self.tranche_trail[rung]):
+                logger.info("lot %s %s: slice %d trail %s broken by the bar "
+                            "(%s %s), selling on the bar rather than waiting "
+                            "for a print", self.event_id, self.symbol, rung,
+                            self.tranche_trail[rung],
+                            "high" if self.is_short else "low", structure)
+                self._fire_rung(rung, level=self.tranche_trail[rung])
+                return
             # Follow the structure up. Monotonic: a lower low leaves it alone.
             if self.sign * (structure - self.tranche_trail[rung]) > 0:
                 logger.info("lot %s %s: slice %d trail %s -> %s",

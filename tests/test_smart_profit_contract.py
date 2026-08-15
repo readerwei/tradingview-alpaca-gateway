@@ -185,13 +185,28 @@ def test_the_armed_trail_follows_each_new_higher_low():
     assert lot.tranche_trail[1] == Decimal("112")
 
 
-def test_the_armed_trail_never_retreats():
+def test_an_armed_slice_is_sold_by_the_very_first_lower_low():
+    """This test used to assert "the trail never retreats" and passed for the
+    wrong reason once bars could break a trail: the trail held at 112 because
+    the slice had already been SOLD, not because anything declined to move it.
+
+    The real property, stated plainly because it is the strategy's sharpest
+    edge: an armed slice survives only while every bar's low holds at or above
+    the highest low so far. The first bar that dips a cent below it ends the
+    slice. On a 1m chart that is close to a one-bar trailing stop — which is
+    why trailing a confirmed PIVOT low rather than a bar low is the open
+    question about this plan.
+    """
     broker = _Broker()
     lot = _lot(broker)
     _bars(lot, "106", "107", "108", "109", "112")
-
-    _bars(lot, "111")               # a lower low; the trail must hold
     assert lot.tranche_trail[1] == Decimal("112")
+
+    _bars(lot, "111")                       # one dollar below the trail
+
+    assert Decimal(broker.sells[-1]["qty"]) == Decimal("30"), (
+        "an armed slice survived a bar that traded below its trail")
+    assert lot.tranche_trail[1] == Decimal("112"), "the broken trail moved"
 
 
 def test_breaking_the_trail_sells_exactly_that_slice():
@@ -507,3 +522,66 @@ def test_the_heartbeat_reports_swing_state_not_a_meaningless_target(tmp_path, ca
     assert "gate=" in arming
     assert "armed" in armed and "trail=109" in armed, armed
     assert "tp1" not in arming, "printed a ladder target for a swing plan"
+
+
+# ── a bar that traded through a trail (found by TradingBot) ─────────────────
+
+def test_a_bar_that_trades_through_the_trail_sells_the_slice():
+    """Waiting for a trade print below the level is the same hole
+    `rungs_on_bar_high` closed on the entry side, and worse here: a missed rung
+    costs a better fill, a missed trail break leaves the slice riding down
+    while the gateway believes it is managed. Two thirds of Alpaca's crypto
+    bars deliver no trades, so "we will see a print below it" is not an
+    assumption this system may make."""
+    broker = _Broker()
+    lot = _lot(broker)
+    _bars(lot, "106", "107", "108", "109")
+    assert lot.tranche_trail[1] == Decimal("109")
+
+    # No on_price call anywhere: the bar alone must do it.
+    _bar(lot, Decimal("104"), high=Decimal("110"))
+
+    assert Decimal(broker.sells[-1]["qty"]) == Decimal("30"), (
+        "a bar that traded five dollars through the trail sold nothing")
+
+
+def test_a_bar_through_the_trail_does_not_also_raise_it():
+    broker = _Broker()
+    lot = _lot(broker)
+    _bars(lot, "106", "107", "108", "109")
+
+    _bar(lot, Decimal("104"), high=Decimal("110"))
+
+    assert lot.tranche_trail[1] == Decimal("109"), "the broken trail moved"
+
+
+def test_a_bar_through_the_weak_trail_flattens_the_remainder():
+    """In weakness the whole remainder rides on one trail, so the same rule
+    has to hold there or the tightening is decorative."""
+    broker = _Broker()
+    lot = _lot(broker)
+    _bar(lot, Decimal("106"), high=Decimal("130"))
+    _bar(lot, Decimal("105"), high=Decimal("129"))
+    _bar(lot, Decimal("104"), high=Decimal("128"))       # weakness; trail 129
+    assert lot.weakened and lot.working_stop == Decimal("129")
+
+    _bar(lot, Decimal("120"), high=Decimal("126"))       # bar trades through it
+
+    assert lot.stage == "closed"
+    assert Decimal(broker.sells[-1]["qty"]) == Decimal("100")
+
+
+def test_a_short_bar_through_the_trail_sells_the_slice():
+    broker = _Broker()
+    entry, stop = Decimal("100"), Decimal("110")
+    lot = _lot(broker, direction=-1, entry=entry, stop=stop)
+    for high in ("94", "93", "92", "91"):
+        lot.on_bar(high=Decimal(high), low=Decimal(high) - 5 * R,
+                   close=Decimal(high), trade_count=9)
+    assert lot.tranche_trail[1] == Decimal("91")
+
+    lot.on_bar(high=Decimal("96"), low=Decimal("90"), close=Decimal("95"),
+               trade_count=9)
+
+    assert broker.sells[-1]["side"] == "buy"
+    assert Decimal(broker.sells[-1]["qty"]) == Decimal("30")
