@@ -260,7 +260,21 @@ class LotSupervisor:
             return
         for lot in self.lots.values():
             gaps = ""
-            if lot.last_price is not None and lot.stage == "ladder":
+            if lot.is_swing:
+                # A swing slice has no price target to be a distance from — it
+                # has a trail and a count of the structure it still needs.
+                # Printing `tp1-1.11` here would be a number nothing consults.
+                if lot.weakened:
+                    gaps = f"WEAKENED trail={lot.working_stop}"
+                elif lot.armed_rung is not None:
+                    gaps = (f"slice{lot.armed_rung} armed "
+                            f"trail={lot.tranche_trail[lot.armed_rung]}")
+                else:
+                    gaps = (f"slice{lot.current_rung} arming "
+                            f"{lot.swing_count}/{lot.plan.swing_arm_count} "
+                            f"weak={lot.weak_count}/{lot.plan.swing_weaken_count} "
+                            f"gate={lot.arm_gate}")
+            elif lot.last_price is not None and lot.stage == "ladder":
                 gaps = " ".join(
                     f"tp{r}{lot.target_price(r) - lot.last_price:+.2f}"
                     for r in range(1, len(lot.plan.tranches) + 1)
