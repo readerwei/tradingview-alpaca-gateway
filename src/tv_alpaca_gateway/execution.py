@@ -408,6 +408,15 @@ def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
     if not crypto and command.trail is not None:
         # trailing_stop is an equity feature; Alpaca refuses it on crypto.
         kwargs.update({"type": "trailing_stop", "trail_price": command.trail})
+    elif command.stop_limit is None:
+        # Equities support a stop-market order. `STOP_LIMIT=NONE` is the
+        # explicit alert spelling for that protection mode. Crypto must take
+        # the stop-limit branch because Alpaca rejects plain stops there and
+        # the parser refuses a crypto alert without a numeric limit.
+        kwargs.update({
+            "type": "stop",
+            "stop_price": command.stop_trigger,
+        })
     else:
         kwargs.update({
             "type": "stop_limit",

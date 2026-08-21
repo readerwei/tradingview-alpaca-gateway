@@ -76,14 +76,14 @@ def test_unknown_exit_plan_is_rejected_before_execution():
         parse_pine_alert(raw)
 
 
-def test_managed_plan_rejects_none_stop_limit():
+def test_equity_managed_plan_allows_stop_market():
     raw = (
         "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=10 | "
         "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=DYNAMIC_TRAIL_FAST | "
         "INTERVAL=1m | STOP_TRIGGER=700 | STOP_LIMIT=NONE"
     )
-    with pytest.raises(AlertParseError, match="numeric STOP_LIMIT"):
-        parse_pine_alert(raw)
+    command = parse_pine_alert(raw)
+    assert command.stop_limit is None
 
 
 def test_sell_take_profit_must_be_below_stop_trigger():
