@@ -157,6 +157,10 @@ def create_app(
     # than one per event. Bounded because this process runs for days against an
     # account another system also trades.
     foreign_orders_seen: set[str] = set()
+    # Filled entries from a previous run that were never protected. Filled
+    # at startup and surfaced on /healthz, because a CRITICAL line at boot
+    # scrolls away and this is a question worth answering hours later.
+    unprotected_fills: list[str] = []
     background_tasks: set[asyncio.Task[Any]] = set()
 
     async def on_trade(event: MarketTrade) -> None:
@@ -294,6 +298,32 @@ def create_app(
         except Exception:
             logger.exception("could not re-arm managed lots at startup")
 
+        # The net that #71's cancellation handler promised and did not have.
+        #
+        # A crash between an entry filling and its protection being placed
+        # leaves no lot row (written only after protection succeeds), and
+        # `broker_filled` is TERMINAL so the reconnect resync skips it. Nothing
+        # looked for this state, while a CRITICAL log line told the operator
+        # reconciliation would find it.
+        #
+        # Reported, not auto-repaired. After a restart the stop price is not
+        # reliably recoverable, and this account is shared — placing a guessed
+        # protective order, or flattening a position another system may own, is
+        # its own hazard. Naming the event ids is what the operator needs; the
+        # decision is theirs.
+        try:
+            unprotected_fills.clear()
+            unprotected_fills.extend(await asyncio.to_thread(
+                store.filled_without_protection))
+            for event_id in unprotected_fills:
+                logger.critical(
+                    "UNPROTECTED FILL from a previous run: %s filled and no "
+                    "protective or flatten order was ever recorded. Check the "
+                    "position at the broker — re-sending the alert will be "
+                    "refused as a duplicate", event_id)
+        except Exception:
+            logger.exception("could not check for unprotected fills at startup")
+
         if stream is not None and settings.stream_enabled:
             await stream.start()
         timer = (asyncio.create_task(reconcile_periodically(), name="lot-reconcile")
@@ -355,6 +385,10 @@ def create_app(
             "streams": streams,
             "paper_trading": settings.paper_trading,
             "trading_enabled": settings.trading_enabled,
+            # Entries that filled in a previous run and were never protected.
+            # A CRITICAL line at boot scrolls away; this is a question worth
+            # answering hours later, from another machine, without log access.
+            "unprotected_fills": list(unprotected_fills),
             "commit": RUNNING_COMMIT,
             # True means the running code differs from that commit.
             "worktree_dirty": WORKTREE_DIRTY,
@@ -490,7 +524,9 @@ def create_app(
                 logger.critical(
                     "protection was CANCELLED before it completed event_id=%s "
                     "entry_order_id=%s; the worker thread may or may not have "
-                    "placed a stop — reconcile on next start is the net",
+                    "placed a stop. The next start reports this as an "
+                    "UNPROTECTED FILL and lists it on /healthz — it does not "
+                    "repair it, so check the position at the broker",
                     submission.event_id, submission.entry_order_id)
                 with contextlib.suppress(Exception):
                     store.update(submission.event_id, "protection_cancelled",
