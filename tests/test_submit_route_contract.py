@@ -26,6 +26,7 @@ the exact failure this contract exists to prevent.
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 import pytest
@@ -300,7 +301,14 @@ def test_protective_orders_are_discoverable_by_reconciliation(tmp_path):
                    " | STOP_TRIGGER=700 | STOP_LIMIT=699")
     client.post(SUBMIT_PATH, content=protected, headers={"x-tv-secret": SECRET})
 
-    roles = {role for _, role, _ in store.broker_orders_for("pine-exec-QQQ-1-recon")}
+    deadline = time.monotonic() + 1.0
+    roles = set()
+    while time.monotonic() < deadline:
+        roles = {role for _, role, _ in store.broker_orders_for("pine-exec-QQQ-1-recon")}
+        if "protection" in roles:
+            break
+        time.sleep(0.01)
+
     assert "entry" in roles, "the entry was not recorded per-order"
     assert "protection" in roles, "the protective order is invisible to reconciliation"
     assert len(store.unresolved_broker_orders()) >= 2, (
