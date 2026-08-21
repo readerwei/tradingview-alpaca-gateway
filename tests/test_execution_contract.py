@@ -648,6 +648,27 @@ def test_an_entry_that_fills_during_polling_is_still_protected(tmp_path):
         broker.position_qty("BTC/USD")
 
 
+def test_a_managed_plan_waits_for_an_accepted_entry_before_opening_its_lot(tmp_path):
+    """A named plan must not return while Alpaca still reports pending_new.
+
+    Reproduced live on QQQ: the entry filled 0.899s after the 202 response, but
+    the completion worker treated pending_new as final and skipped the lot.
+    """
+    alert = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+        "EVENT_ID=managed-pending-1 | BAR_TIME=" + _now() + " | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | "
+        "EXIT_PLAN=DYNAMIC_TRAIL_FAST | INTERVAL=1m | "
+        "STOP_TRIGGER=640 | STOP_LIMIT=639"
+    )
+    broker = _FillsDuringPolling()
+    result = _run(alert, _settings(tmp_path, market_symbols=frozenset({"QQQ"})), broker,
+                  deadline_seconds=1.5, poll_interval=0.2)
+
+    assert result.entry_status == "filled"
+    assert result.protection_status == "submitted"
+    assert broker.orders_of("stop_limit"), (
+        "managed entry filled during polling but no protective stop was placed")
 def test_an_entry_that_never_fills_is_still_cancelled(tmp_path):
     """The other half: the fix must not turn every unfilled entry into a
     protection attempt on a position that does not exist."""

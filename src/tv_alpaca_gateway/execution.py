@@ -356,8 +356,7 @@ def _await_fill_or_cancel(command, entry_id, entry_status, event_id, broker,
     #
     # So: wait whenever the outcome depends on knowing the fill happened.
     # Cancel only when the alert asked for it.
-    needs_fill = (command.place_protective_stop_after_fill
-                  or command.exit_plan == "OCO_AFTER_FILL")
+    needs_fill = command.place_protective_stop_after_fill or bool(command.exit_plan)
     if not (command.cancel_unfilled_at_deadline or needs_fill):
         return entry_status
 

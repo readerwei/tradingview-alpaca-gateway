@@ -301,7 +301,7 @@ def test_protective_orders_are_discoverable_by_reconciliation(tmp_path):
                    " | STOP_TRIGGER=700 | STOP_LIMIT=699")
     client.post(SUBMIT_PATH, content=protected, headers={"x-tv-secret": SECRET})
 
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 3.0
     roles = set()
     while time.monotonic() < deadline:
         roles = {role for _, role, _ in store.broker_orders_for("pine-exec-QQQ-1-recon")}
