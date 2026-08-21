@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+from . import exit_plans
 from .assets import is_crypto
 
 
@@ -132,6 +133,11 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
+    if exit_plan and exit_plan not in exit_plans.names():
+        raise AlertParseError(
+            f"unknown EXIT_PLAN {exit_plan!r}; known plans are "
+            f"{', '.join(exit_plans.names())}")
+
     if exit_plan and side == "sell" and not crypto_symbol \
             and qty != qty.to_integral_value():
         # Alpaca: "We do not support short sales in fractional orders. All
@@ -210,7 +216,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     managed_plan = bool(exit_plan and exit_plan != "OCO_AFTER_FILL")
     if protective_stop and (not trigger_raw or not limit_raw):
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires STOP_TRIGGER and STOP_LIMIT")
-    if managed_plan and (not trigger_raw or not limit_raw):
+    if managed_plan and (not trigger_raw or not limit_raw
+                         or limit_raw.upper() == "NONE"):
         raise AlertParseError(
             f"{exit_plan} requires STOP_TRIGGER and numeric STOP_LIMIT")
     if not protective_stop and not managed_plan and exit_plan != "OCO_AFTER_FILL" \
@@ -225,15 +232,46 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         # The only direction check available before a fill price exists. A
         # take-profit below the stop is not a tight target, it is the pair
         # inverted — and it would arm, sit there, and never make sense.
+        # Both directions. This arm used to exist for BUY only, under a comment
+        # claiming to be "the only direction check available" — so a short with
+        # its pair inverted was accepted outright and only caught later, at OCO
+        # submission, by which time the entry had already filled.
+        #
+        # A long takes profit ABOVE its stop; a short takes profit BELOW it.
         if side == "buy" and take_profit <= stop_for_check:
             raise AlertParseError(
                 f"TAKE_PROFIT {take_profit} is at or below STOP_TRIGGER "
                 f"{stop_for_check} on a BUY; the exit pair is inverted")
+        if side == "sell" and take_profit >= stop_for_check:
+            raise AlertParseError(
+                f"TAKE_PROFIT {take_profit} is at or above STOP_TRIGGER "
+                f"{stop_for_check} on a SELL; the exit pair is inverted")
     if protective_stop and stop_limit is None:
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires a numeric STOP_LIMIT")
+    # Side-aware, so it agrees with the general protective-stop rule below
+    # instead of fighting it.
+    #
+    # This rule had no side check and encoded the LONG shape. For a short the
+    # two demanded opposite things — one wanted the limit at or below the
+    # trigger, the other at or above — so the ONLY expressible short OCO was
+    # `STOP_LIMIT == STOP_TRIGGER`, which is exactly the shape STOP_LIMIT_OFFSET
+    # exists to avoid: a trigger and limit at the same price gaps straight
+    # through and never fills.
+    #
+    # Neither rule was wrong read alone. They were jointly impossible, which is
+    # why it survived review — it took generating the cases and running them.
     if (exit_plan == "OCO_AFTER_FILL" and stop_limit is not None
-            and stop_trigger is not None and stop_limit > stop_trigger):
-        raise AlertParseError("OCO_AFTER_FILL requires STOP_LIMIT <= STOP_TRIGGER")
+            and stop_trigger is not None):
+        if side == "buy" and stop_limit > stop_trigger:
+            raise AlertParseError(
+                "OCO_AFTER_FILL on a BUY requires STOP_LIMIT <= STOP_TRIGGER: "
+                "the protective leg is a sell, which fills at or below its "
+                "trigger")
+        if side == "sell" and stop_limit < stop_trigger:
+            raise AlertParseError(
+                "OCO_AFTER_FILL on a SELL requires STOP_LIMIT >= STOP_TRIGGER: "
+                "the protective leg is a buy, which fills at or above its "
+                "trigger")
     if stop_trigger is not None and stop_limit is not None:
         if side == "buy" and stop_limit > stop_trigger:
             raise AlertParseError(
@@ -247,6 +285,11 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError(
             f"INTERVAL {interval!r} is not a TradingView interval; the runner's "
             "trail has no bar size without it")
+    if interval is not None and interval[0].isdigit():
+        number = int("".join(character for character in interval if character.isdigit()))
+        if number <= 0:
+            raise AlertParseError(
+                f"INTERVAL {interval!r} must be greater than zero")
     if exit_plan and exit_plan != "OCO_AFTER_FILL" and interval is None:
         raise AlertParseError(
             "EXIT_PLAN requires INTERVAL — \"previous completed bar low\" has no "
