@@ -44,6 +44,28 @@ def test_parses_relevant_fields_from_current_pine_alert():
     assert command.trail is None
 
 
+def test_dynamic_trail_fast_requires_an_initial_protective_stop():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=10 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=DYNAMIC_TRAIL_FAST | "
+        "INTERVAL=1m"
+    )
+    with pytest.raises(AlertParseError, match="requires STOP_TRIGGER"):
+        parse_pine_alert(raw)
+
+
+def test_dynamic_trail_fast_accepts_explicit_initial_stop_without_legacy_flag():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=10 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=DYNAMIC_TRAIL_FAST | "
+        "INTERVAL=1m | STOP_TRIGGER=700 | STOP_LIMIT=699.5"
+    )
+    command = parse_pine_alert(raw)
+    assert command.stop_trigger == Decimal("700")
+    assert command.stop_limit == Decimal("699.5")
+    assert command.place_protective_stop_after_fill is False
+
+
 def test_current_deployed_alert_without_unverified_identity_fields_still_parses():
     raw = (
         "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
