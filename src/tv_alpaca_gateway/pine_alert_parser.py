@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+from . import exit_plans
 from .assets import is_crypto
 
 
@@ -132,6 +133,11 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     protective_stop = "PLACE_PROTECTIVE_STOP_AFTER_FILL" in flags
     exit_plan = (fields.get("EXIT_PLAN") or "").upper() or None
     take_profit_raw = fields.get("TAKE_PROFIT")
+    if exit_plan and exit_plan not in exit_plans.names():
+        raise AlertParseError(
+            f"unknown EXIT_PLAN {exit_plan!r}; known plans are "
+            f"{', '.join(exit_plans.names())}")
+
     if exit_plan and side == "sell" and not crypto_symbol \
             and qty != qty.to_integral_value():
         # Alpaca: "We do not support short sales in fractional orders. All
@@ -210,7 +216,8 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
     managed_plan = bool(exit_plan and exit_plan != "OCO_AFTER_FILL")
     if protective_stop and (not trigger_raw or not limit_raw):
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires STOP_TRIGGER and STOP_LIMIT")
-    if managed_plan and (not trigger_raw or not limit_raw):
+    if managed_plan and (not trigger_raw or not limit_raw
+                         or limit_raw.upper() == "NONE"):
         raise AlertParseError(
             f"{exit_plan} requires STOP_TRIGGER and numeric STOP_LIMIT")
     if not protective_stop and not managed_plan and exit_plan != "OCO_AFTER_FILL" \
@@ -278,6 +285,11 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError(
             f"INTERVAL {interval!r} is not a TradingView interval; the runner's "
             "trail has no bar size without it")
+    if interval is not None and interval[0].isdigit():
+        number = int("".join(character for character in interval if character.isdigit()))
+        if number <= 0:
+            raise AlertParseError(
+                f"INTERVAL {interval!r} must be greater than zero")
     if exit_plan and exit_plan != "OCO_AFTER_FILL" and interval is None:
         raise AlertParseError(
             "EXIT_PLAN requires INTERVAL — \"previous completed bar low\" has no "

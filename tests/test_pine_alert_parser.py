@@ -66,6 +66,46 @@ def test_dynamic_trail_fast_accepts_explicit_initial_stop_without_legacy_flag():
     assert command.place_protective_stop_after_fill is False
 
 
+def test_unknown_exit_plan_is_rejected_before_execution():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=10 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=DYNAMIC_TRAIL_FATS | "
+        "INTERVAL=1m | STOP_TRIGGER=700 | STOP_LIMIT=699.5"
+    )
+    with pytest.raises(AlertParseError, match="unknown EXIT_PLAN"):
+        parse_pine_alert(raw)
+
+
+def test_managed_plan_rejects_none_stop_limit():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=10 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=DYNAMIC_TRAIL_FAST | "
+        "INTERVAL=1m | STOP_TRIGGER=700 | STOP_LIMIT=NONE"
+    )
+    with pytest.raises(AlertParseError, match="numeric STOP_LIMIT"):
+        parse_pine_alert(raw)
+
+
+def test_sell_take_profit_must_be_below_stop_trigger():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=SELL | QTY=10 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=OCO_AFTER_FILL | "
+        "STOP_TRIGGER=700 | STOP_LIMIT=701 | TAKE_PROFIT=705"
+    )
+    with pytest.raises(AlertParseError, match="above STOP_TRIGGER"):
+        parse_pine_alert(raw)
+
+
+def test_zero_interval_is_rejected():
+    raw = (
+        "EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=10 | "
+        "ORDER_TYPE=MARKET | TIME_IN_FORCE=GTC | EXIT_PLAN=DYNAMIC_TRAIL_FAST | "
+        "INTERVAL=0m | STOP_TRIGGER=700 | STOP_LIMIT=699.5"
+    )
+    with pytest.raises(AlertParseError, match="INTERVAL"):
+        parse_pine_alert(raw)
+
+
 def test_current_deployed_alert_without_unverified_identity_fields_still_parses():
     raw = (
         "EXECUTE_ALPACA_ORDER | SYMBOL=BTCUSD | SIDE=BUY | QTY=0.001 | "
