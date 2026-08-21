@@ -31,6 +31,49 @@ Health check:
 curl http://127.0.0.1:8000/healthz
 ```
 
+## Optional Discord relay
+
+The Discord relay is a **separate process** from the gateway. Start the gateway
+first, then start the relay in a second terminal. TradingView sends to the
+Discord incoming webhook; the relay observes the approved Discord message and
+forwards the raw Pine alert to the local gateway.
+
+### Terminal 1 — gateway
+
+```bash
+set -a; . ./.env; set +a
+export PAPER_TRADING=true
+export TRADING_ENABLED=true
+uv run tv-alpaca-gateway
+```
+
+### Terminal 2 — relay
+
+Install the optional Discord dependency once per virtual environment:
+
+```bash
+uv sync --extra relay
+```
+
+Then start the relay:
+
+```bash
+set -a; . ./.env; set +a
+uv run tv-alpaca-relay
+```
+
+The relay requires `DISCORD_BOT_TOKEN`, `DISCORD_SIGNAL_CHANNEL_ID`,
+`DISCORD_SOURCE_WEBHOOK_ID`, and `TV_WEBHOOK_SECRET`. It defaults to the safe
+parse-only route:
+
+```text
+http://127.0.0.1:8000/webhooks/tradingview/pine/dry-run
+```
+
+Keep the two processes running in separate terminals. See [Relay deployment and
+verification](#start-the-relay-separately) below for the execution opt-in,
+logging, and end-to-end verification steps.
+
 ## Direct parsed-alert runner
 
 For paper testing, the same parsed Pine command can be run without TradingView,
