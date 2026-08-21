@@ -18,7 +18,7 @@ os.environ.setdefault("GATEWAY_DB_PATH", "/tmp/claude-501/-Users-wzhao/91e25b9c-
 
 from tv_alpaca_gateway.app import create_app
 from tv_alpaca_gateway.config import Settings
-from tv_alpaca_gateway.relay import GatewayRelay, RelaySettings, handle_message
+from tv_alpaca_relay.relay import GatewayRelay, RelaySettings, handle_message
 
 PORT = 8131
 CHANNEL, WEBHOOK = 1530636075947659424, 555444333
@@ -41,7 +41,7 @@ relay_settings = RelaySettings(
 relay = GatewayRelay(relay_settings)
 
 def msg(content=ALERT, channel=CHANNEL, webhook=WEBHOOK):
-    return SimpleNamespace(channel=SimpleNamespace(id=channel),
+    return SimpleNamespace(id=1530636075947659425, channel=SimpleNamespace(id=channel),
                            webhook_id=webhook, content=content)
 
 print()

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tv_alpaca_gateway.relay import RelaySettings, admit_message, handle_message
+from tv_alpaca_relay.relay import RelaySettings, admit_message, handle_message
 
 
 @pytest.fixture

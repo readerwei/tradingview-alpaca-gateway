@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tv_alpaca_gateway.relay import RelaySettings, admit_message
+from tv_alpaca_relay.relay import RelaySettings, admit_message
 
 CHANNEL = 1530636075947659424
 WEBHOOK = 999888777
@@ -157,7 +157,7 @@ def test_the_rejection_path_is_testable_without_discord(caplog):
     """
     import logging
 
-    from tv_alpaca_gateway import relay as relay_module
+    from tv_alpaca_relay import relay as relay_module
 
     handle = getattr(relay_module, "handle_message", None)
     assert handle is not None, (
@@ -180,7 +180,7 @@ def test_the_rejection_path_is_testable_without_discord(caplog):
 def test_an_admitted_message_is_forwarded_once(caplog):
     """The other half — the handler must actually forward what it admits, and
     say so, or a silent success is indistinguishable from a silent drop."""
-    from tv_alpaca_gateway import relay as relay_module
+    from tv_alpaca_relay import relay as relay_module
 
     handle = getattr(relay_module, "handle_message", None)
     assert handle is not None, "no importable handler"

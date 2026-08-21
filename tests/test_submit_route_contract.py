@@ -202,7 +202,7 @@ def test_the_relay_still_refuses_an_executing_target_by_default(tmp_path):
     the relay at execution is a decision someone made rather than a URL they
     edited.
     """
-    from tv_alpaca_gateway.relay import RelaySettings
+    from tv_alpaca_relay.relay import RelaySettings
 
     settings = RelaySettings(
         token="t", channel_id=1, source_webhook_id=2,
@@ -215,7 +215,7 @@ def test_the_relay_still_refuses_an_executing_target_by_default(tmp_path):
 def test_the_relay_can_be_opted_into_execution_explicitly(tmp_path):
     """And once opted in, it must still refuse everything else — a flag that
     widens the target to 'anything' is not a gate."""
-    from tv_alpaca_gateway.relay import RelaySettings
+    from tv_alpaca_relay.relay import RelaySettings
 
     opted_in = dict(token="t", channel_id=1, source_webhook_id=2,
                     internal_secret="s", allow_execution=True)

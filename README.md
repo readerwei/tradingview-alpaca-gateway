@@ -22,7 +22,7 @@ cp .env.example .env
 # edit .env with paper credentials and a random webhook secret
 uv sync --extra test
 set -a; . ./.env; set +a
-uv run uvicorn tv_alpaca_gateway.app:app --host 127.0.0.1 --port 8000
+uv run tv-alpaca-gateway
 ```
 
 Health check:
@@ -533,22 +533,96 @@ TradingView → HTTPS endpoint → authentication → schema/freshness checks
              → optional Discord receipt
 ```
 
-For a deployment with no public broker webhook, use the optional Discord relay:
+For a deployment with no public broker webhook, use the optional Discord relay.
+The relay is a separate process and a separate component from the gateway:
 
 ```text
-TradingView → Discord incoming webhook → private channel
-             → outbound Python Discord bot → 127.0.0.1 gateway → Alpaca paper API
+TradingView → Discord incoming webhook → private signal channel
+             → outbound Python Discord relay → 127.0.0.1 gateway → Alpaca paper API
 ```
 
-The relay admits only messages from one configured channel and source webhook ID. It requires Discord's Message Content intent, forwards structured JSON to the local gateway, and ignores human messages, other bots, other channels, malformed content, and unapproved webhooks. Keep the bot token, source webhook URL, and broker credentials out of Git and out of Discord messages.
+The gateway process owns the FastAPI routes, Alpaca streams, risk checks, execution,
+SQLite state, and managed exits. The relay process owns Discord connectivity and
+the external admission boundary. It admits only messages from the configured
+channel and source webhook ID, requires Discord's Message Content intent, forwards
+the raw pipe-delimited Pine command unchanged, and ignores human messages, other
+bots, other channels, malformed content, and unapproved webhooks.
 
-Run the relay separately:
+TradingView does not call the local gateway directly. It calls the Discord
+incoming webhook. Discord then creates a message, and the relay bot observes that
+message and forwards it to the gateway with `X-TV-Secret` and
+`X-Discord-Message-Id` headers. Keep the bot token, source webhook URL, and broker
+credentials out of Git and out of Discord messages.
+
+### Start the gateway
+
+```bash
+set -a; . ./.env; set +a
+export PAPER_TRADING=true
+export TRADING_ENABLED=true
+uv run tv-alpaca-gateway
+```
+
+Keep this process running. It listens on `127.0.0.1:8000` and exposes the
+gateway routes. The project command must be used rather than invoking Uvicorn
+directly because it loads the gateway settings and configures application
+logging before starting Uvicorn.
+
+### Start the relay separately
+
+Install the optional Discord dependency once per virtual environment:
 
 ```bash
 uv sync --extra relay
-set -a; . ./.env; set +a
-uv run python -c 'from tv_alpaca_gateway.relay import run_relay; run_relay()'
 ```
+
+Then, in a second terminal, load the same environment and start the relay:
+
+```bash
+set -a; . ./.env; set +a
+uv run tv-alpaca-relay
+```
+
+The relay requires these variables:
+
+```text
+DISCORD_BOT_TOKEN
+DISCORD_SIGNAL_CHANNEL_ID
+DISCORD_SOURCE_WEBHOOK_ID
+TV_WEBHOOK_SECRET
+```
+
+`GATEWAY_INTERNAL_URL` defaults to the safe parse-only route:
+
+```text
+http://127.0.0.1:8000/webhooks/tradingview/pine/dry-run
+```
+
+For an explicitly enabled paper execution relay, set both of these values after
+the dry-run path has been verified:
+
+```text
+GATEWAY_INTERNAL_URL=http://127.0.0.1:8000/webhooks/tradingview/pine/submit
+RELAY_ALLOW_EXECUTION=true
+```
+
+The relay prints a connection message when Discord login succeeds. Its stdout
+contains admission and forwarding failures; the gateway's stdout contains the
+HTTP request, parser, risk, broker, and protection results. Run the two processes
+in separate terminals or redirect each process to a separate log file.
+
+### Verify the boundary safely
+
+Start with `GATEWAY_INTERNAL_URL` pointing to `pine/dry-run`. Send a current
+pipe-delimited alert through the configured Discord incoming webhook and verify:
+
+1. TradingView reports a successful Discord webhook request.
+2. The relay prints that it connected and does not reject the message.
+3. The gateway records a `200` dry-run response.
+
+Only after those three checks should a paper execution target be enabled. The
+relay does not retry forwarding failures, and the gateway's `EVENT_ID` or the
+relay's Discord message ID provides the duplicate identity used by execution.
 
 For production, put the service behind a managed HTTPS reverse proxy, add a durable queue/worker, rotate secrets, monitor failures, and keep the kill switch accessible outside the request process. Receipt-notification failures are deliberately isolated from broker submission state.
 
