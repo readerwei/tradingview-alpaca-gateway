@@ -158,6 +158,15 @@ class EventStore:
                 "SELECT order_id, role, status FROM broker_orders "
                 "WHERE event_id = ? ORDER BY rowid", (event_id,))]
 
+    def broker_order_for_event(self, event_id: str, role: str = "entry") -> str | None:
+        """Return the recorded broker order for an event and role."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT order_id FROM broker_orders WHERE event_id = ? AND role = ? "
+                "ORDER BY rowid LIMIT 1", (event_id, role)
+            ).fetchone()
+        return str(row[0]) if row else None
+
     def unresolved_broker_orders(self) -> list[str]:
         """Broker order ids whose last known status is not terminal.
 

@@ -70,7 +70,14 @@ parse-only route:
 http://127.0.0.1:8000/webhooks/tradingview/pine/dry-run
 ```
 
-Keep the two processes running in separate terminals. See [Relay deployment and
+Keep the two processes running in separate terminals. Submit forwarding returns
+`202 Accepted` with the entry order ID once the gateway has validated, claimed,
+and submitted the entry. Fill tracking and protective-order management continue
+in the gateway background; a relay timeout must not be retried blindly. The
+relay sends the generic `X-Delivery-ID` header (the gateway temporarily accepts
+`X-Discord-Message-Id` for compatibility).
+
+See [Relay deployment and
 verification](#start-the-relay-separately) below for the execution opt-in,
 logging, and end-to-end verification steps.
 

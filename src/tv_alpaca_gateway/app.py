@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .broker import AlpacaPaperClient
 from .config import Settings
@@ -156,6 +157,7 @@ def create_app(
     # than one per event. Bounded because this process runs for days against an
     # account another system also trades.
     foreign_orders_seen: set[str] = set()
+    background_tasks: set[asyncio.Task[Any]] = set()
 
     async def on_trade(event: MarketTrade) -> None:
         counters.record_trade(event.symbol)
@@ -301,6 +303,10 @@ def create_app(
         try:
             yield
         finally:
+            for task in tuple(background_tasks):
+                task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
             for task in (timer, beat):
                 if task is not None:
                     task.cancel()
@@ -389,12 +395,13 @@ def create_app(
             "command": command_payload,
         }
 
-    @app.post("/webhooks/tradingview/pine/submit")
+    @app.post("/webhooks/tradingview/pine/submit", status_code=202, response_model=None)
     async def pine_submit(
         request: Request,
         x_tv_secret: str | None = Header(default=None),
+        x_delivery_id: str | None = Header(default=None),
         x_discord_message_id: str | None = Header(default=None),
-    ) -> dict[str, Any]:
+    ) -> JSONResponse | dict[str, Any]:
         """Authenticate, parse, and hand the command to the execution engine.
 
         Deliberately thin. An earlier draft did its own parse -> risk -> claim
@@ -413,50 +420,70 @@ def create_app(
         except (UnicodeDecodeError, PineAlertParseError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        delivery_id = x_delivery_id or x_discord_message_id
         try:
-            # The relay sends its Discord snowflake, which is the fallback
-            # identity for an alert with no EVENT_ID. Accepting the header was
-            # missing, so the fallback existed in the engine and was
-            # unreachable through the only path that can supply it.
-            result = await asyncio.to_thread(
-                execution.execute_pine_command, command, settings, broker, store,
-                delivery_id=x_discord_message_id, supervisor=supervisor)
+            submission = await asyncio.to_thread(
+                execution.submit_pine_entry, command, settings, broker, store,
+                delivery_id=delivery_id, supervisor=supervisor)
         except ExecutionError as exc:
-            # Refused before anything reached the broker.
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except UnprotectedPositionError as exc:
-            # Filled, exposed, and neither protected nor closed. The entry id
-            # goes in the response because the caller has to be able to act on
-            # it without reading the database.
-            logger.critical("unprotected position from %s: %s", command.event_id, exc)
-            raise HTTPException(status_code=500, detail={
-                "error": "position is open and unprotected",
-                "entry_order_id": exc.entry_order_id,
-                "detail": str(exc),
-            }) from exc
         except Exception as exc:
             logger.exception("submission failed for %s", command.event_id)
             raise HTTPException(status_code=502, detail="broker submission failed") from exc
 
-        notifier_note = (f"Pine order: {command.side.upper()} {command.qty} "
-                         f"{command.symbol}; entry={result.entry_order_id}; "
-                         f"protection={result.protection_status}")
-        try:
-            notifier.send(notifier_note)
-        except Exception:
-            # A receipt is a courtesy and must never rewrite order state.
-            logger.exception("receipt notification failed for %s", result.entry_order_id)
+        if isinstance(submission, execution.ExecutionResult):
+            return JSONResponse(status_code=200, content={
+                "accepted": submission.entry_status == "duplicate",
+                "event_id": command.event_id or delivery_id,
+                "order_id": submission.entry_order_id,
+                "entry_status": submission.entry_status,
+                "protection_status": submission.protection_status,
+            })
 
-        return {
-            # The identity actually used, not the one the alert happened to
-            # carry: reporting command.event_id showed None whenever the
-            # snowflake fallback was in play.
-            "event_id": command.event_id or x_discord_message_id,
-            "order_id": result.entry_order_id,
-            "entry_status": result.entry_status,
-            "protection_order_id": result.protection_order_id,
-            "protection_status": result.protection_status,
-        }
+        async def finish_in_background() -> None:
+            try:
+                result = await asyncio.to_thread(
+                    execution.finish_pine_execution, submission)
+                logger.info(
+                    "Pine execution complete event_id=%s entry_order_id=%s "
+                    "entry_status=%s protection_order_id=%s protection_status=%s",
+                    submission.event_id, result.entry_order_id, result.entry_status,
+                    result.protection_order_id, result.protection_status)
+                try:
+                    notifier.send(
+                        f"Pine order complete: {command.side.upper()} {command.qty} "
+                        f"{command.symbol}; entry={result.entry_order_id}; "
+                        f"protection={result.protection_status}"
+                    )
+                except Exception:
+                    logger.exception("completion notification failed for %s", submission.event_id)
+            except Exception:
+                logger.exception(
+                    "background Pine execution failed event_id=%s entry_order_id=%s",
+                    submission.event_id, submission.entry_order_id)
+
+        task = asyncio.create_task(
+            finish_in_background(), name=f"pine-finish-{submission.event_id}")
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+        try:
+            notifier.send(
+                f"Pine order accepted: {command.side.upper()} {command.qty} "
+                f"{command.symbol}; entry={submission.entry_order_id}; "
+                "protection=pending"
+            )
+        except Exception:
+            logger.exception("acceptance notification failed for %s", submission.event_id)
+
+        return JSONResponse(status_code=202, content={
+            "accepted": True,
+            "event_id": command.event_id or delivery_id,
+            "order_id": submission.entry_order_id,
+            "entry_order_id": submission.entry_order_id,
+            "entry_status": submission.entry_status,
+            "protection_status": "pending",
+        })
 
     @app.post("/webhooks/tradingview")
     async def tradingview_webhook(request: Request, x_tv_secret: str | None = Header(default=None)) -> dict[str, Any]:

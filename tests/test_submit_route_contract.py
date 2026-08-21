@@ -118,8 +118,8 @@ def test_the_route_delegates_to_the_contracted_engine(tmp_path, monkeypatch):
     """
     execution = pytest.importorskip("tv_alpaca_gateway.execution")
     calls = []
-    monkeypatch.setattr(execution, "execute_pine_command",
-                        lambda *a, **k: calls.append((a, k)) or execution.ExecutionResult("ord-1"))
+    monkeypatch.setattr(execution, "submit_pine_entry",
+                        lambda *a, **k: calls.append((a, k)) or execution.ExecutionResult("ord-1", entry_status="duplicate"))
 
     broker = _RecordingBroker()
     _post(_client(_settings(tmp_path), broker))
@@ -245,10 +245,10 @@ def test_a_bare_alert_is_accepted_when_the_relay_supplies_its_snowflake(tmp_path
     client = _client(_settings(tmp_path), broker)
 
     response = client.post(SUBMIT_PATH, content=bare, headers={
-        "x-tv-secret": SECRET, "x-discord-message-id": "1535708305480093756"})
+        "x-tv-secret": SECRET, "x-delivery-id": "1535708305480093756"})
 
-    assert response.status_code == 200, response.text
-    assert broker.submitted, "the snowflake did not satisfy identity"
+    assert response.status_code == 202, response.text
+    assert response.json()["event_id"] == "1535708305480093756"
 
 
 def test_a_bare_alert_with_no_snowflake_is_refused(tmp_path):

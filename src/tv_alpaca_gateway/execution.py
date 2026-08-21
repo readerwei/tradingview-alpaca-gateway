@@ -93,6 +93,23 @@ class ExecutionResult:
     protection_status: str | None = None
 
 
+@dataclass(frozen=True)
+class EntrySubmission:
+    """Entry state returned before fill and protection work completes."""
+
+    command: PineOrderCommand
+    settings: Settings
+    broker: Any
+    store: EventStore
+    supervisor: Any
+    symbol: str
+    crypto: bool
+    event_id: str
+    position_before: Decimal
+    entry_order_id: str
+    entry_status: str
+
+
 def _command_id(command: PineOrderCommand, delivery_id: str | None = None) -> str:
     """Identity comes from EVENT_ID, or a delivery id, and never from the order.
 
@@ -124,17 +141,15 @@ def _decimal(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
-def execute_pine_command(
+def submit_pine_entry(
     command: PineOrderCommand,
     settings: Settings,
     broker: Any,
     store: EventStore,
     *,
-    deadline_seconds: float = 60.0,
-    poll_interval: float = 1.0,
     delivery_id: str | None = None,
     supervisor: Any = None,
-) -> ExecutionResult:
+) -> EntrySubmission | ExecutionResult:
     settings.validate()
     if not settings.trading_enabled:
         # Recorded, not merely logged. A refusal that leaves no trace is
@@ -218,7 +233,8 @@ def execute_pine_command(
     event_id = _command_id(command, delivery_id)
     if not store.claim(event_id):
         logger.info("duplicate delivery of %s; not resubmitting", command.event_id)
-        return ExecutionResult(None, entry_status="duplicate")
+        return ExecutionResult(
+            store.broker_order_for_event(event_id), entry_status="duplicate")
 
     # Read the position BEFORE the entry. Protection covers what THIS entry
     # added, and the only way to know that without assuming a fee rate is to
@@ -228,14 +244,35 @@ def execute_pine_command(
     entry = _submit_entry(command, symbol, event_id, broker, store)
     entry_id, entry_status = entry
 
+    return EntrySubmission(
+        command=command,
+        settings=settings,
+        broker=broker,
+        store=store,
+        supervisor=supervisor,
+        symbol=symbol,
+        crypto=crypto,
+        event_id=event_id,
+        position_before=position_before,
+        entry_order_id=entry_id,
+        entry_status=entry_status,
+    )
+
+
+def finish_pine_execution(
+    submission: EntrySubmission,
+    *,
+    deadline_seconds: float = 60.0,
+    poll_interval: float = 1.0,
+) -> ExecutionResult:
+    """Complete fill tracking and protection after entry acknowledgement."""
+    command = submission.command
+    entry_id = submission.entry_order_id
+    entry_status = submission.entry_status
     if entry_status != "filled":
-        # Wait it out. This may observe a fill, in which case the entry is
-        # filled and must be protected exactly like one that filled instantly —
-        # returning here was a real bug: an order accepted as `new` that filled
-        # a second later got no protective stop at all.
         entry_status = _await_fill_or_cancel(
-            command, entry_id, entry_status, event_id, broker, store,
-            deadline_seconds, poll_interval)
+            command, entry_id, entry_status, submission.event_id,
+            submission.broker, submission.store, deadline_seconds, poll_interval)
 
     if entry_status != "filled":
         return ExecutionResult(entry_id, entry_status=entry_status)
@@ -243,9 +280,31 @@ def execute_pine_command(
     if not command.place_protective_stop_after_fill and command.exit_plan != "OCO_AFTER_FILL":
         return ExecutionResult(entry_id, entry_status=entry_status)
 
-    return _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
-                               event_id, broker, store, position_before, settings,
-                               supervisor)
+    return _protect_or_flatten(
+        command, submission.symbol, submission.crypto, entry_id, entry_status,
+        submission.event_id, submission.broker, submission.store,
+        submission.position_before, submission.settings, submission.supervisor)
+
+
+def execute_pine_command(
+    command: PineOrderCommand,
+    settings: Settings,
+    broker: Any,
+    store: EventStore,
+    *,
+    deadline_seconds: float = 60.0,
+    poll_interval: float = 1.0,
+    delivery_id: str | None = None,
+    supervisor: Any = None,
+) -> ExecutionResult:
+    """Synchronous compatibility wrapper for direct callers and tests."""
+    submission = submit_pine_entry(
+        command, settings, broker, store,
+        delivery_id=delivery_id, supervisor=supervisor)
+    if isinstance(submission, ExecutionResult):
+        return submission
+    return finish_pine_execution(
+        submission, deadline_seconds=deadline_seconds, poll_interval=poll_interval)
 
 
 def _submit_entry(command, symbol, event_id, broker, store) -> tuple[str, str]:

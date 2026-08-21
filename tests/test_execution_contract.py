@@ -397,6 +397,59 @@ def test_oco_after_fill_submits_one_native_exit_for_the_position_delta(tmp_path)
     assert len([o for o in broker.submitted if o.get("side") == "sell"]) == 1
 
 
+@dataclass
+class ShortEntryBroker(RecordingBroker):
+    """Models an existing short that receives another short entry."""
+
+    _positions: dict = field(default_factory=lambda: {"QQQ": Decimal("-13")})
+
+    def shortable(self, symbol: str) -> bool:
+        return True
+
+    def submit_order(self, **kwargs) -> dict:
+        if kwargs.get("side") == "sell" and kwargs.get("type") == "market":
+            self.submitted.append(dict(kwargs))
+            order_id = f"ord-{len(self.submitted)}"
+            self._positions[kwargs["symbol"]] -= Decimal(str(kwargs["qty"]))
+            return {"id": order_id, "status": "filled", "filled_qty": str(kwargs["qty"])}
+        if kwargs.get("side") == "buy":
+            self.submitted.append(dict(kwargs))
+            return {"id": f"ord-{len(self.submitted)}", "status": "new"}
+        return super().submit_order(**kwargs)
+
+
+def test_short_entry_protects_signed_position_delta(tmp_path):
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=SELL | QTY=13 | "
+             "EVENT_ID=qqq-short-delta-1 | BAR_TIME=" + _now() + " | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | "
+             "EXIT_PLAN=OCO_AFTER_FILL | STOP_TRIGGER=710.83 | "
+             "STOP_LIMIT=NONE | TAKE_PROFIT=707.98")
+    broker = ShortEntryBroker()
+    result = _run(alert, _settings(tmp_path, max_qty=30), broker)
+
+    assert result.protection_status == "submitted"
+    exits = [o for o in broker.submitted if o.get("order_class") == "oco"]
+    assert len(exits) == 1
+    assert exits[0]["side"] == "buy"
+    assert Decimal(str(exits[0]["qty"])) == Decimal("13")
+
+
+def test_duplicate_submission_returns_recorded_entry_order_id(tmp_path):
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=1 | "
+             "EVENT_ID=duplicate-receipt-1 | BAR_TIME=" + _now() + " | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY")
+    broker = RecordingBroker()
+    store = EventStore(tmp_path / "events.sqlite3")
+
+    first = _run(alert, _settings(tmp_path), broker, store=store)
+    second = _run(alert, _settings(tmp_path), broker, store=store)
+
+    assert first.entry_order_id == "ord-1"
+    assert second.entry_status == "duplicate"
+    assert second.entry_order_id == "ord-1"
+    assert len(broker.submitted) == 1
+
+
 class _ProtectionFails(RecordingBroker):
     """Refuses the first `fail_times` protective orders, then behaves."""
 
