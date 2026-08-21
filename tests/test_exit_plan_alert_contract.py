@@ -34,6 +34,9 @@ OCO_BASE = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=BUY | QTY=302 | "
 
 
 def _alert(**fields):
+    if fields.get("EXIT_PLAN") not in (None, "OCO_AFTER_FILL"):
+        fields.setdefault("STOP_TRIGGER", "65000")
+        fields.setdefault("STOP_LIMIT", "64950")
     extra = "".join(f" | {k}={v}" for k, v in fields.items() if v is not None)
     return BASE + extra
 

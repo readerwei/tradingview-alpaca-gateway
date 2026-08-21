@@ -207,9 +207,14 @@ def parse_pine_alert(content: str) -> PineOrderCommand:
         raise AlertParseError(
             "TAKE_PROFIT requires an EXIT_PLAN; there is nothing to apply it to")
     trigger_raw, limit_raw = fields.get("STOP_TRIGGER"), fields.get("STOP_LIMIT")
+    managed_plan = bool(exit_plan and exit_plan != "OCO_AFTER_FILL")
     if protective_stop and (not trigger_raw or not limit_raw):
         raise AlertParseError("PLACE_PROTECTIVE_STOP_AFTER_FILL requires STOP_TRIGGER and STOP_LIMIT")
-    if not protective_stop and exit_plan != "OCO_AFTER_FILL" and (trigger_raw or limit_raw):
+    if managed_plan and (not trigger_raw or not limit_raw):
+        raise AlertParseError(
+            f"{exit_plan} requires STOP_TRIGGER and numeric STOP_LIMIT")
+    if not protective_stop and not managed_plan and exit_plan != "OCO_AFTER_FILL" \
+            and (trigger_raw or limit_raw):
         raise AlertParseError("STOP_TRIGGER and STOP_LIMIT require PLACE_PROTECTIVE_STOP_AFTER_FILL")
     stop_trigger = _positive_decimal(trigger_raw, "STOP_TRIGGER") if trigger_raw else None
     stop_limit = (None if (not limit_raw or limit_raw.upper() == "NONE")

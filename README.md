@@ -284,10 +284,12 @@ Examples:
 
 ```text
 # Managed long
-SIDE=BUY | QTY=10 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
+SIDE=BUY | QTY=10 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m |
+STOP_TRIGGER=<below-entry> | STOP_LIMIT=<below-trigger>
 
 # Managed whole-share short
-SIDE=SELL | QTY=10 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
+SIDE=SELL | QTY=10 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m |
+STOP_TRIGGER=<above-entry> | STOP_LIMIT=<above-trigger>
 
 # Rejected: fractional sell cannot open a short
 SIDE=SELL | QTY=10.5 | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL=1m
