@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 # leak guard: forgetting costs one repeated warning, which is the cheap side.
 FOREIGN_ORDER_MEMORY = 2048
 
+# How long shutdown waits for in-flight protection before giving up on it.
+# Long enough that a completion about to place a stop is not killed for no
+# reason; short enough that a restart cannot hang on one that never will.
+SHUTDOWN_DRAIN_SECONDS = 20.0
+
 
 def _running_commit() -> str:
     """The commit this process is actually running, not the one on master.
@@ -303,10 +308,32 @@ def create_app(
         try:
             yield
         finally:
-            for task in tuple(background_tasks):
-                task.cancel()
+            # WAIT, then cancel — not the other way round.
+            #
+            # The old drain cancelled every completion outright and treated
+            # `gather` returning as proof the work had stopped. It was wrong
+            # twice. A completion 200ms from placing a stop was killed for no
+            # reason; and the work runs inside `asyncio.to_thread`, so
+            # cancelling the awaiting coroutine does not stop the thread —
+            # the process exited while a protective order might still be in
+            # flight, with no way to know which.
+            #
+            # Bounded, because an unbounded drain turns a restart into a hang,
+            # and protection that has not settled in this long is not going to.
             if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
+                _, unfinished = await asyncio.wait(
+                    set(background_tasks), timeout=SHUTDOWN_DRAIN_SECONDS)
+                for task in unfinished:
+                    # Named, because these are the events whose protection is
+                    # now genuinely unknown. Cancelling the wrapper does not
+                    # stop the thread, so "unresolved" is the honest word.
+                    logger.critical(
+                        "shutting down with protection unresolved for %s; the "
+                        "worker thread may still be placing an order — "
+                        "reconcile on next start is the net", task.get_name())
+                    task.cancel()
+                if unfinished:
+                    await asyncio.gather(*unfinished, return_exceptions=True)
             for task in (timer, beat):
                 if task is not None:
                     task.cancel()
@@ -355,6 +382,14 @@ def create_app(
             "streams": streams,
             "paper_trading": settings.paper_trading,
             "trading_enabled": settings.trading_enabled,
+            # Whether the alarm itself is working. UNPROTECTED POSITION is
+            # routed through this channel, and on 2026-08-14 and 2026-08-21 it
+            # returned 403 on every send — four warnings that read as noise
+            # rather than as "the alarm is dead". A field can be looked at; a
+            # warning has to be noticed.
+            "notifier_configured": getattr(notifier, "configured", False),
+            "notifier_last_ok": getattr(notifier, "last_ok", None),
+            "notifier_last_error": getattr(notifier, "last_error", None),
             "commit": RUNNING_COMMIT,
             # True means the running code differs from that commit.
             "worktree_dirty": WORKTREE_DIRTY,
