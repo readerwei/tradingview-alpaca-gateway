@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import logging
 
+import contextlib
 import json
 from dataclasses import dataclass, field, replace
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 
 from . import assets
 from .market_log import logger as market_logger
@@ -97,6 +98,16 @@ class ExitPlan:
     # Per-plan rather than global: it changes when a strategy takes profit, so
     # it belongs with the tranches and the R-multiples, not in the engine.
     rungs_on_bar_high: bool = False
+    # How far the software stop must pull ahead of the RESTING broker stop, in
+    # R, before the resting one is re-placed to match. 0 disables it.
+    #
+    # The trail lives in the gateway and dies with it, so between ratchets the
+    # broker only guarantees the last price we told it. Moving it every bar
+    # would be sixty cancel-then-place windows an hour for a stop that usually
+    # moves pennies; never moving it leaves the whole trailed gain resting on
+    # this process staying alive. A threshold buys a bounded gap for a handful
+    # of orders over a runner's life.
+    stop_ratchet_r: Decimal = Decimal("0")
 
     def validate(self) -> None:
         if not self.tranches:
@@ -160,6 +171,13 @@ class Lot:
     last_price: Decimal | None = None
     reserved_qty: Decimal = Decimal("0")
     stop_generation: int = 0
+    # Where the RESTING broker stop actually sits, which is not the same number
+    # as `working_stop`. The working stop is the gateway's, moves every bar and
+    # dies with the process; this one is Alpaca's and survives anything. They
+    # start equal at `initial_stop` and the ratchet closes the gap in steps.
+    # Held separately rather than derived, because "what did we last tell the
+    # broker" is a fact about an order that exists, not a calculation.
+    resting_stop: Decimal | None = None
     _broker: object | None = field(default=None, repr=False, compare=False)
 
     # ── construction ────────────────────────────────────────────────────────
@@ -169,6 +187,8 @@ class Lot:
         lot = cls(**fields)
         lot.remaining_qty = lot.held_qty
         lot.working_stop = lot.initial_stop
+        if lot.resting_stop is None:
+            lot.resting_stop = lot.initial_stop
         lot._validate()
         return lot
 
@@ -385,6 +405,54 @@ class Lot:
                         self.symbol, self.working_stop, candidate,
                         "high" if self.is_short else "low", trade_count)
             self.working_stop = candidate
+        self._ratchet_resting_stop()
+
+    def _ratchet_resting_stop(self) -> None:
+        """Drag the broker's stop up behind the software one, in coarse steps.
+
+        The software stop dies with this process; the broker's does not. Between
+        ratchets the only guaranteed floor is the last price we told Alpaca, so
+        the distance between the two is exactly what a crash costs — and it
+        grows with the size of the win, which is the wrong way round.
+
+        Not every bar, because each move is a cancel-then-place and the position
+        is unreserved in between. Sixty of those an hour, for a stop that
+        usually moves pennies, buys churn and risk for very little. At 0.5R it
+        is a handful of orders over a runner's life and the gap is bounded.
+        """
+        threshold = self.plan.stop_ratchet_r
+        if threshold <= 0 or self.stage != "runner" or self.is_closed:
+            return
+        if self.sign * (self.working_stop - self.resting_stop) < threshold * self.risk_per_unit:
+            return
+        # Never place a stop the market has already passed. That is a market
+        # exit wearing a stop's name, and it is exactly what closed a runner on
+        # 2026-08-11 — `_apply_breakeven` learned to defer instead, and this
+        # must not re-learn it the expensive way. The software stop is still
+        # watching, so deferring costs nothing.
+        if self.last_price is not None and self._breached(self.last_price, self.working_stop):
+            return
+
+        previous, qty = self.resting_stop, self._sellable(self.remaining_qty)
+        self.resting_stop = self.working_stop
+        logger.info("lot %s %s: ratchet — resting stop %s -> %s (software stop "
+                    "is %s, %s ahead)", self.event_id, self.symbol, previous,
+                    self.resting_stop, self.working_stop,
+                    self.sign * (self.working_stop - previous))
+        try:
+            self._reserve(qty, force=True)
+        except Exception:
+            # Cancelled and not replaced: the position is naked at the broker
+            # right now. Say so at ERROR and leave the lot honest about having
+            # no stop, because `_resize_stop` on the reconcile timer is what
+            # repairs it and it only fires when `stop_order_id` is gone. A lot
+            # that kept pointing at a cancelled order would stay unprotected
+            # until somebody read a chart.
+            self.resting_stop = previous
+            logger.exception(
+                "lot %s %s: ratchet failed and left the position UNPROTECTED at "
+                "the broker; the reconcile timer will replace the stop at %s",
+                self.event_id, self.symbol, previous)
 
     def _apply_breakeven(self) -> None:
         """Move the working stop to entry — but never above the market.
@@ -558,20 +626,24 @@ class Lot:
     def _resize_stop(self) -> None:
         self._reserve(self._sellable(self.remaining_qty))
 
-    def _reserve(self, qty: Decimal) -> None:
+    def _reserve(self, qty: Decimal, *, force: bool = False) -> None:
         """Make the resting disaster stop cover exactly `qty`.
 
         Cancel then place — Wei's call, and on crypto the only option: with the
         old stop still resting there is no available quantity for a replacement
         to reserve, however small. A failed placement leaves the position naked,
         which is why the caller retries and then flattens.
+
+        `force` re-places an order whose QUANTITY is unchanged, which is what a
+        ratchet is: same size, new price. Without it the short-circuit below
+        would read "already reserving that much" and skip the move.
         """
-        if qty == self.reserved_qty and self.stop_order_id:
+        if qty == self.reserved_qty and self.stop_order_id and not force:
             return
         logger.info("lot %s %s: protection %s -> %s at %s",
                     self.event_id, self.symbol,
                     assets.format_qty(self.reserved_qty), assets.format_qty(qty),
-                    self.initial_stop)
+                    self.resting_stop)
         if self.stop_order_id:
             self._broker.cancel_order(self.stop_order_id)
             self.stop_order_id = None
@@ -585,7 +657,7 @@ class Lot:
                     str(self.stop_order_id)[:8])
 
     def _place_stop(self, qty: Decimal) -> str:
-        order = build_stop_order(self.symbol, qty, self.initial_stop,
+        order = build_stop_order(self.symbol, qty, self.resting_stop,
                                  direction=self.direction)
         order["client_order_id"] = f"{self.stop_client_order_id}-{self.stop_generation}"
         self.stop_generation += 1
@@ -633,9 +705,11 @@ def dump_lot(lot: Lot) -> str:
             "trail_source": lot.plan.trail_source,
             "breakeven_after": lot.plan.breakeven_after,
             "rungs_on_bar_high": lot.plan.rungs_on_bar_high,
+            "stop_ratchet_r": str(lot.plan.stop_ratchet_r),
         },
     }
     state |= {name: str(getattr(lot, name)) for name in _DECIMAL_FIELDS}
+    state["resting_stop"] = str(lot.resting_stop)
     return json.dumps(state)
 
 
@@ -660,11 +734,16 @@ def load_lot(state: str) -> Lot:
             # already in the market, and reaching back into the config on load
             # would defeat that from the other direction.
             rungs_on_bar_high=plan.get("rungs_on_bar_high", False),
+            stop_ratchet_r=Decimal(plan.get("stop_ratchet_r", "0")),
         ),
         direction=int(raw.get("direction", 1)),
         **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
     )
     lot.explicit_targets = tuple(Decimal(t) for t in raw.get("explicit_targets", []))
+    # Rows written before the ratchet have no resting stop recorded, and for
+    # those the disaster stop is exactly where it was left — so that is the
+    # honest default rather than a guess.
+    lot.resting_stop = Decimal(raw.get("resting_stop") or raw["initial_stop"])
     lot.breakeven_pending = bool(raw.get("breakeven_pending", False))
     _last = raw.get("last_price")
     lot.last_price = Decimal(_last) if _last else None
@@ -786,6 +865,18 @@ def reconcile_lot(stored: Lot, broker) -> Lot:
     if resting:
         lot.stop_order_id = resting[-1].get("id")
         lot.reserved_qty = Decimal(str(resting[-1]["qty"]))
+        # And its PRICE, for the same reason as its size: the ratchet measures
+        # from where the broker's stop actually is. Believing it is still at the
+        # disaster level after a restart would re-place an order already in the
+        # right place; believing it is higher than it is would skip a move that
+        # was needed. Only trusted when it is an improvement, so a stale or
+        # unparseable price cannot walk the stop backwards.
+        broker_stop = resting[-1].get("stop_price")
+        if broker_stop is not None:
+            with contextlib.suppress(InvalidOperation, TypeError, ValueError):
+                actual = Decimal(str(broker_stop))
+                if lot.sign * (actual - lot.resting_stop) > 0:
+                    lot.resting_stop = actual
     else:
         lot.stop_order_id, lot.reserved_qty = None, Decimal("0")
 

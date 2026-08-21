@@ -32,6 +32,13 @@ _PLANS: dict[str, dict] = {
         # rather than made global, so the simple protective-stop path and any
         # future plan are unaffected.
         rungs_on_bar_high=True,
+        # Re-place the resting broker stop once the software trail has pulled
+        # 0.5R ahead of it. Wei's original call was that the disaster stop stays
+        # put and the gateway moves its own — correct against per-bar churn, but
+        # it leaves the whole trailed gain resting on this process staying
+        # alive, and that exposure grows with the size of the win. 0.5R is a
+        # handful of orders over a runner's life for a bounded gap.
+        stop_ratchet_r=Decimal("0.5"),
     ),
     # A take-profit and a stop, whichever comes first — the shape people mean
     # by "OCO".
@@ -71,6 +78,10 @@ _PLANS: dict[str, dict] = {
         trail_source="previous_completed_bar_low",
         breakeven_after=1,
         rungs_on_bar_high=True,
+        # Scaled with the multiples: this plan exists so a rung can be reached
+        # in minutes, and a 0.5R ratchet on a 0.2R/0.4R ladder would never fire
+        # inside a test.
+        stop_ratchet_r=Decimal("0.1"),
     ),
     "OCO_AFTER_FILL": dict(
         tranches=((Decimal("1.00"), Decimal("2.0")),),
