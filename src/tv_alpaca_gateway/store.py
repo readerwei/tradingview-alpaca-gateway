@@ -195,6 +195,36 @@ class EventStore:
         seen = dict.fromkeys(row[0] for row in rows if row[0])
         return list(seen)
 
+    def filled_without_protection(self) -> list[str]:
+        """Events whose ENTRY filled and for which nothing was ever placed.
+
+        The state a crash between fill and protection leaves behind, and until
+        this query existed nothing looked for it. Three mechanisms each decline
+        to help:
+
+          * `_open_managed_lot` writes the lot row AFTER protection succeeds,
+            so there is no lot for `supervisor.start()` to re-arm;
+          * `broker_filled` is TERMINAL, so `unresolved_broker_orders` — the
+            reconnect resync — deliberately skips this exact order;
+          * re-firing the alert is refused as a duplicate, so the operator's
+            obvious remedy silently does nothing.
+
+        A `flatten` counts as resolved: the position is gone, and there is
+        nothing left to protect. Only an entry with neither a protective order
+        nor a flatten is reported.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT entry.event_id FROM broker_orders AS entry "
+                "WHERE entry.role = 'entry' "
+                "  AND entry.status IN ('filled', 'partially_filled') "
+                "  AND NOT EXISTS ("
+                "        SELECT 1 FROM broker_orders AS resolved "
+                "        WHERE resolved.event_id = entry.event_id "
+                "          AND resolved.role IN ('protection', 'flatten'))"
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def save_lot(self, event_id: str, symbol: str, stage: str, state: str) -> None:
         """Upsert one managed lot. Called after every state change, because the
         window between deciding and persisting is the window a crash loses."""
