@@ -99,7 +99,8 @@ def _run(tmp_path, alert=ALERT, broker=None, store=None):
 
 
 def _with_plan(interval="1"):
-    return ALERT + f" | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL={interval}"
+    managed_alert = ALERT.replace(" | PLACE_PROTECTIVE_STOP_AFTER_FILL", "")
+    return managed_alert + f" | EXIT_PLAN=DYNAMIC_TRAIL | INTERVAL={interval}"
 
 
 # ═════════════════════════════════════════════════════ the plan is honoured

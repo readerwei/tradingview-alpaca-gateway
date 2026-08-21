@@ -277,7 +277,7 @@ def finish_pine_execution(
     if entry_status != "filled":
         return ExecutionResult(entry_id, entry_status=entry_status)
 
-    if not command.place_protective_stop_after_fill and command.exit_plan != "OCO_AFTER_FILL":
+    if not command.place_protective_stop_after_fill and not command.exit_plan:
         return ExecutionResult(entry_id, entry_status=entry_status)
 
     return _protect_or_flatten(
