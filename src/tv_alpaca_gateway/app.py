@@ -457,6 +457,46 @@ def create_app(
                     )
                 except Exception:
                     logger.exception("completion notification failed for %s", submission.event_id)
+            except UnprotectedPositionError as exc:
+                # The worst state this system can reach, and it must not be
+                # reported like a transient failure. Synchronously this raised
+                # out of the request and the caller learned at once; the
+                # acknowledgement took that away, so what is left has to carry
+                # the weight on its own.
+                #
+                # Recorded as well as logged, deliberately. A log line does not
+                # survive a rotation or a restart, and this is the one state an
+                # operator must still be able to find tomorrow morning.
+                logger.critical(
+                    "UNPROTECTED POSITION after acknowledgement: %s %s %s "
+                    "event_id=%s entry_order_id=%s — %s",
+                    command.side, command.qty, command.symbol,
+                    submission.event_id, exc.entry_order_id, exc)
+                with contextlib.suppress(Exception):
+                    store.update(submission.event_id, "unprotected_and_open",
+                                 str(exc), broker_order_id=exc.entry_order_id)
+                with contextlib.suppress(Exception):
+                    notifier.send(
+                        f"UNPROTECTED POSITION: {command.side.upper()} "
+                        f"{command.qty} {command.symbol} is open and could not "
+                        f"be protected or closed (entry={exc.entry_order_id})")
+            except asyncio.CancelledError:
+                # CancelledError is a BaseException, so the generic arm below
+                # never saw it: a shutdown between fill and stop placement
+                # produced no output at all. Worse, the work is in
+                # `asyncio.to_thread`, so cancelling the task does not stop the
+                # thread — whether the stop was placed is genuinely unknown
+                # from here, and saying so is the only honest option.
+                logger.critical(
+                    "protection was CANCELLED before it completed event_id=%s "
+                    "entry_order_id=%s; the worker thread may or may not have "
+                    "placed a stop — reconcile on next start is the net",
+                    submission.event_id, submission.entry_order_id)
+                with contextlib.suppress(Exception):
+                    store.update(submission.event_id, "protection_cancelled",
+                                 "shutdown before protection completed",
+                                 broker_order_id=submission.entry_order_id)
+                raise
             except Exception:
                 logger.exception(
                     "background Pine execution failed event_id=%s entry_order_id=%s",
