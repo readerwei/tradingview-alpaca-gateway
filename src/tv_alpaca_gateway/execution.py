@@ -557,20 +557,35 @@ def _open_managed_lot(command, symbol, entry_id, entry_status, event_id,
 
 
 def _flatten(command, symbol, entry_id, entry_status, event_id, broker, store,
-             last_error, held_qty: Decimal | None = None) -> ExecutionResult:
+             last_error, held_qty: Decimal) -> ExecutionResult:
     """Close a position that cannot be protected.
 
-    Sized from the broker's position for the same reason the stop is: a close
-    sized from the fill asks to sell more than is held, is refused, and the
-    position survives the mechanism meant to end it.
+    `held_qty` is what THIS entry added, measured as the signed change in the
+    broker's position — never the position itself. Sizing from the fill instead
+    asks to sell more than is held, is refused, and the position survives the
+    mechanism meant to end it.
+
+    It is required, and that is the fix for a default that guessed badly in two
+    directions at once. It used to fall back to `position_qty(symbol)`, which:
+
+      * is NEGATIVE for a short, so the `<= 0` guard below concluded there was
+        no position and declined to flatten. The same sign mistake that left
+        QQQ -26 open and unprotected on 2026-08-21, sitting inside the safety
+        net meant to catch exactly that;
+      * is the WHOLE position, contradicting the note below it. On an account a
+        second system also trades, unwinding our own 13-share failure could
+        have closed its 100 shares with it.
+
+    Neither had fired, because both callers pass the delta. Removing the
+    default makes the unsafe call impossible rather than merely unlikely — a
+    caller that cannot say how much this entry added has no business guessing,
+    and a TypeError beats a silent wrong quantity here of all places.
     """
     store.update(event_id, "protection_failed", str(last_error),
                  broker_order_id=entry_id)
     # Close what this entry added, not the whole position — flattening
     # someone else's holdings to unwind our own failure would be worse than
     # the failure.
-    if held_qty is None:
-        held_qty = _decimal(broker.position_qty(symbol))
     if held_qty <= 0:
         return ExecutionResult(entry_id, entry_status=entry_status,
                                protection_status="failed_no_position")
