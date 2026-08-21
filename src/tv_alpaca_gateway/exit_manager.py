@@ -97,8 +97,40 @@ class ExitPlan:
     # Per-plan rather than global: it changes when a strategy takes profit, so
     # it belongs with the tranches and the R-multiples, not in the engine.
     rungs_on_bar_high: bool = False
+    # "ladder"  rungs fire when price REACHES a level given in advance.
+    # "swing"   a slice is armed by market structure and sold when price FALLS
+    #           BACK THROUGH a level the market chose. See _swing_on_bar.
+    #
+    # A separate style rather than a plan that happens to configure differently:
+    # the two answer different questions of a bar, and folding them together
+    # would put an `if` inside every decision instead of one at the top.
+    exit_style: str = "ladder"
+    # SWING ONLY. All inert while exit_style is "ladder".
+    swing_arm_count: int = 0            # N cumulatively higher lows to arm
+    swing_weaken_count: int = 0         # M consecutive lower lows is weakness
+    swing_min_arm_r: Decimal = Decimal("0")     # arm only beyond entry ± this×R
+    swing_weak_trail_r: Decimal = Decimal("0")  # the tight trail weakness adopts
 
     def validate(self) -> None:
+        if self.exit_style not in ("ladder", "swing"):
+            raise ExitPlanError(f"unknown exit style: {self.exit_style!r}")
+        if self.exit_style == "swing":
+            # Checked here rather than trusted from the config table, because a
+            # swing plan missing its counts would not fail — it would simply
+            # never arm, and a plan that silently never takes profit is the
+            # worst failure this file can produce.
+            if self.swing_arm_count < 1:
+                raise ExitPlanError(
+                    "a swing plan needs swing_arm_count >= 1; with 0 no slice "
+                    "would ever arm and the position would ride to its stop")
+            if self.swing_weaken_count < 1:
+                raise ExitPlanError(
+                    "a swing plan needs swing_weaken_count >= 1; with 0 there "
+                    "is no definition of weakness and the tight trail is dead")
+            if self.swing_weak_trail_r <= 0:
+                raise ExitPlanError(
+                    "a swing plan needs a positive swing_weak_trail_r — that is "
+                    "the trail every remaining share collapses onto")
         if not self.tranches:
             raise ExitPlanError("a plan needs at least one take-profit rung")
         total = sum(f for f, _ in self.tranches) + self.runner_fraction
@@ -160,6 +192,23 @@ class Lot:
     last_price: Decimal | None = None
     reserved_qty: Decimal = Decimal("0")
     stop_generation: int = 0
+    # ── swing state (SMART_PROFIT); untouched by every other plan ───────────
+    # The highest low seen since counting began, and how many bars have beaten
+    # it. Wei: a lower low "just does not increment it" — the reference holds
+    # and the count holds, so a dip inside a climb costs a bar, not a sequence.
+    swing_reference_low: Decimal | None = None
+    swing_count: int = 0
+    # Which slice is currently trailing, and where each slice's trail sits.
+    # Only ever one armed at a time: counting belongs to whichever slice is
+    # next, so a slice cannot accumulate structure while its predecessor runs.
+    armed_rung: int | None = None
+    tranche_trail: dict[int, Decimal] = field(default_factory=dict)
+    # Weakness: consecutive lower lows, and the extreme the tight trail hangs
+    # from once it triggers.
+    prev_bar_low: Decimal | None = None
+    weak_count: int = 0
+    weakened: bool = False
+    high_water: Decimal | None = None
     _broker: object | None = field(default=None, repr=False, compare=False)
 
     # ── construction ────────────────────────────────────────────────────────
@@ -306,7 +355,16 @@ class Lot:
             self.working_stop = (min(self.working_stop, self.entry_price) if self.is_short
                                  else max(self.working_stop, self.entry_price))
             self.breakeven_pending = False
-        if self.stage == "ladder":
+        if self.is_swing:
+            # One armed slice, sold when price falls back THROUGH its trail —
+            # the mirror image of a ladder rung, which fires when price climbs
+            # UP TO a level. Nothing else here can sell a slice.
+            rung = self.armed_rung
+            if (rung is not None and rung not in self.filled_rungs
+                    and rung not in self.pending_rungs
+                    and self._breached(price, self.tranche_trail[rung])):
+                self._fire_rung(rung, level=self.tranche_trail[rung])
+        elif self.stage == "ladder":
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
                     continue
@@ -364,6 +422,10 @@ class Lot:
         # and sometimes none. Checking the bar high turns "we must catch the
         # tick" into "we cannot miss the minute", at a cost of up to one bar of
         # latency on a strategy whose runner already trails on bar closes.
+        if self.is_swing:
+            self._swing_on_bar(high, low)
+            return
+
         if self.stage == "ladder" and self.plan.rungs_on_bar_high:
             for rung in range(1, len(self.plan.tranches) + 1):
                 if rung in self.filled_rungs or rung in self.pending_rungs:
@@ -385,6 +447,172 @@ class Lot:
                         self.symbol, self.working_stop, candidate,
                         "high" if self.is_short else "low", trade_count)
             self.working_stop = candidate
+
+    # ── SMART_PROFIT: slices armed by structure ─────────────────────────────
+
+    @property
+    def is_swing(self) -> bool:
+        return self.plan.exit_style == "swing"
+
+    @property
+    def current_rung(self) -> int | None:
+        """The slice the market is currently working towards — the first that
+        has not been sold. Only this one can count structure or be armed."""
+        for rung in range(1, len(self.plan.tranches) + 1):
+            if rung not in self.filled_rungs:
+                return rung
+        return None
+
+    @property
+    def arm_gate(self) -> Decimal:
+        """No slice arms before the trade is meaningfully in profit.
+
+        Wei: "must be above entry + multiple * R, say multiple = 0.5". Without
+        it, three higher lows made entirely below entry would arm a slice and
+        sell it for a loss under the name take-profit — the structure rule is
+        about trend, and says nothing about whether the trend has paid yet.
+        """
+        return self.entry_price + self.sign * self.plan.swing_min_arm_r * self.risk_per_unit
+
+    def _swing_on_bar(self, high: Decimal, low: Decimal) -> None:
+        """One completed, traded bar through the SMART_PROFIT state machine.
+
+        For a long the structure is higher LOWS and the tight trail hangs from
+        the highest HIGH; a short mirrors both through `sign`, so `structure`
+        and `extreme` below are the only place the direction is read.
+        """
+        structure = high if self.is_short else low       # the swing point
+        extreme = low if self.is_short else high         # the profit extreme
+
+        # Tracked from the first bar, not from the moment weakness is declared.
+        # The peak of a move happens BEFORE it starts weakening — that is what
+        # weakening means — so a trail hung only off post-weakness bars starts
+        # below where the run actually reached and gives back the difference.
+        if self.high_water is None or self.sign * (extreme - self.high_water) > 0:
+            self.high_water = extreme
+
+        if self.weakened:
+            self._update_weak_trail(extreme)
+            # Same rule as an armed slice: the whole remainder rides on this
+            # trail, so a bar that traded through it must exit rather than wait
+            # for a print that may never be delivered.
+            if (self.sign * (self.working_stop - self.initial_stop) > 0
+                    and self._breached(structure, self.working_stop)):
+                logger.info("lot %s %s: weak trail %s broken by the bar (%s %s)",
+                            self.event_id, self.symbol, self.working_stop,
+                            "high" if self.is_short else "low", structure)
+                self._exit_remainder("stop")
+            return
+
+        # Weakness first: it overrides everything, including an armed slice.
+        # Consecutive, unlike the higher-low count — one bar that breaks lower
+        # inside a climb is noise, two in a row is the structure failing.
+        if self.prev_bar_low is not None and self.sign * (structure - self.prev_bar_low) < 0:
+            self.weak_count += 1
+        else:
+            self.weak_count = 0
+        self.prev_bar_low = structure
+        if self.weak_count >= self.plan.swing_weaken_count:
+            self._enter_weakness(extreme)
+            return
+
+        rung = self.current_rung
+        if rung is None:
+            return
+
+        if self.armed_rung == rung:
+            # A bar that traded THROUGH the trail sells the slice, before any
+            # question of raising it.
+            #
+            # Found by TradingBot reviewing the plan. Waiting for a trade print
+            # below the level is the same hole `rungs_on_bar_high` closed on the
+            # entry side, and it is worse here: a missed rung costs a better
+            # fill, a missed trail break leaves the slice riding down while the
+            # gateway believes it is managed. On Alpaca's crypto feed two
+            # thirds of bars deliver no trades at all, so "we will see a print
+            # below it" is not an assumption this system may make.
+            #
+            # `structure` is the bar's low for a long — a traded price, since
+            # zero-trade bars never reach here.
+            if self._breached(structure, self.tranche_trail[rung]):
+                logger.info("lot %s %s: slice %d trail %s broken by the bar "
+                            "(%s %s), selling on the bar rather than waiting "
+                            "for a print", self.event_id, self.symbol, rung,
+                            self.tranche_trail[rung],
+                            "high" if self.is_short else "low", structure)
+                self._fire_rung(rung, level=self.tranche_trail[rung])
+                return
+            # Follow the structure up. Monotonic: a lower low leaves it alone.
+            if self.sign * (structure - self.tranche_trail[rung]) > 0:
+                logger.info("lot %s %s: slice %d trail %s -> %s",
+                            self.event_id, self.symbol, rung,
+                            self.tranche_trail[rung], structure)
+                self.tranche_trail[rung] = structure
+            return
+
+        # Counting. The first bar establishes what later bars must beat —
+        # there is nothing behind it for it to be higher than, so it sets the
+        # reference without counting.
+        if self.swing_reference_low is None:
+            self.swing_reference_low = structure
+            return
+        # A bar counts only if it beats EVERY low since counting began, not
+        # merely the one before it. Failing that it does NOT reset the count,
+        # it simply does not add to it — Wei, asked directly: "just not
+        # increment it". A dip inside a climb costs a bar, not the sequence.
+        if self.sign * (structure - self.swing_reference_low) <= 0:
+            return
+        self.swing_reference_low = structure
+        self.swing_count += 1
+        logger.info("lot %s %s: higher %s %d/%d at %s (slice %d)",
+                    self.event_id, self.symbol, "high" if self.is_short else "low",
+                    self.swing_count, self.plan.swing_arm_count, structure, rung)
+        if self.swing_count < self.plan.swing_arm_count:
+            return
+        if self.sign * (structure - self.arm_gate) < 0:
+            # Structure is there and profit is not. Keep counting: the next
+            # higher low that clears the gate arms immediately.
+            logger.info("lot %s %s: slice %d has its %d %s but %s is short of "
+                        "the %s gate; not arming",
+                        self.event_id, self.symbol, rung, self.swing_count,
+                        "highs" if self.is_short else "lows", structure,
+                        self.arm_gate)
+            return
+        self.armed_rung = rung
+        self.tranche_trail[rung] = structure
+        logger.info("lot %s %s: slice %d ARMED at %s (%s of the position "
+                    "now trails the structure)", self.event_id, self.symbol,
+                    rung, structure, self.plan.tranches[rung - 1][0])
+
+    def _enter_weakness(self, extreme: Decimal) -> None:
+        """M lower lows. Everything left collapses onto one tight trail.
+
+        Wei: "we will flatten all our remaining positions to trail by 0.1R" —
+        tighten and let it stop out, not a market exit. So this hands the whole
+        remainder to `working_stop`, which `on_price` already exits on, rather
+        than inventing a second exit path that would have to be kept in step.
+        """
+        logger.info("lot %s %s: WEAKENING — %d consecutive lower %s; every "
+                    "remaining share moves onto a %sR trail",
+                    self.event_id, self.symbol, self.weak_count,
+                    "highs" if self.is_short else "lows",
+                    self.plan.swing_weak_trail_r)
+        self.weakened = True
+        self.armed_rung = None
+        self._update_weak_trail(extreme)
+
+    def _update_weak_trail(self, extreme: Decimal) -> None:
+        if self.high_water is None or self.sign * (extreme - self.high_water) > 0:
+            self.high_water = extreme
+        level = self.high_water - self.sign * self.plan.swing_weak_trail_r * self.risk_per_unit
+        # Never widens. A 0.1R trail hung off a high water mark barely beyond
+        # entry can sit further from price than the disaster stop, and adopting
+        # it would answer weakness with MORE risk.
+        if self.sign * (level - self.working_stop) > 0:
+            logger.info("lot %s %s: weak trail %s -> %s (high water %s)",
+                        self.event_id, self.symbol, self.working_stop, level,
+                        self.high_water)
+            self.working_stop = level
 
     def _apply_breakeven(self) -> None:
         """Move the working stop to entry — but never above the market.
@@ -458,6 +686,17 @@ class Lot:
         if (rung == self.plan.breakeven_after
                 and self.sign * (self.working_stop - self.entry_price) < 0):
             self._apply_breakeven()
+        if self.is_swing and rung == self.armed_rung:
+            # This slice is spent, and so is the structure that armed it. The
+            # next needs N FRESH higher lows — Wei's answer to question 4.
+            # Carrying the count over would arm the successor almost at once,
+            # off highs the market has already paid for.
+            self.armed_rung = None
+            self.swing_count = 0
+            self.swing_reference_low = None
+            logger.info("lot %s %s: slice %d taken; counting restarts for "
+                        "slice %s", self.event_id, self.symbol, rung,
+                        self.current_rung)
         if len(self.filled_rungs) >= len(self.plan.tranches):
             self.stage = "runner"
 
@@ -487,7 +726,7 @@ class Lot:
         held = abs(Decimal(str(self._broker.position_qty(self.symbol))))
         return min(wanted, held, self.remaining_qty)
 
-    def _fire_rung(self, rung: int) -> None:
+    def _fire_rung(self, rung: int, level: Decimal | None = None) -> None:
         """Free the tranche from under the stop, then sell it.
 
         The order matters. A resting stop reserves its quantity, so with the
@@ -508,9 +747,14 @@ class Lot:
         if qty < self.min_order_size:
             return
         keeping = self._sellable(self.remaining_qty) - qty
-        logger.info("lot %s %s: rung %d reached %s — freeing %s from the stop "
+        # `level` is what actually triggered: a swing slice is sold because
+        # price fell back through its trail, so logging `target_price` there
+        # would print a number nothing consulted.
+        logger.info("lot %s %s: rung %d %s %s — freeing %s from the stop "
                     "(reserve %s -> %s), then exiting it",
-                    self.event_id, self.symbol, rung, self.target_price(rung),
+                    self.event_id, self.symbol, rung,
+                    "trail broken at" if level is not None else "reached",
+                    level if level is not None else self.target_price(rung),
                     assets.format_qty(qty), assets.format_qty(self.reserved_qty),
                     assets.format_qty(keeping))
         self._reserve(keeping)
@@ -596,6 +840,15 @@ _DECIMAL_FIELDS = ("entry_price", "initial_stop", "held_qty", "min_order_size",
                    "remaining_qty", "working_stop", "reserved_qty")
 
 
+def _maybe_decimal(value) -> Decimal | None:
+    return None if value is None else Decimal(value)
+
+
+def _or_none(value: Decimal | None) -> str | None:
+    """A Decimal as a string, or None. Never a float — see dump_lot."""
+    return None if value is None else str(value)
+
+
 def dump_lot(lot: Lot) -> str:
     """Serialise a lot for the store.
 
@@ -633,7 +886,23 @@ def dump_lot(lot: Lot) -> str:
             "trail_source": lot.plan.trail_source,
             "breakeven_after": lot.plan.breakeven_after,
             "rungs_on_bar_high": lot.plan.rungs_on_bar_high,
+            "exit_style": lot.plan.exit_style,
+            "swing_arm_count": lot.plan.swing_arm_count,
+            "swing_weaken_count": lot.plan.swing_weaken_count,
+            "swing_min_arm_r": str(lot.plan.swing_min_arm_r),
+            "swing_weak_trail_r": str(lot.plan.swing_weak_trail_r),
         },
+        # Swing state. A restart mid-trend must not re-count from zero or
+        # forget which slice is trailing and at what level — that would sell
+        # the wrong fraction, or none.
+        "swing_reference_low": _or_none(lot.swing_reference_low),
+        "swing_count": lot.swing_count,
+        "armed_rung": lot.armed_rung,
+        "tranche_trail": {str(k): str(v) for k, v in lot.tranche_trail.items()},
+        "prev_bar_low": _or_none(lot.prev_bar_low),
+        "weak_count": lot.weak_count,
+        "weakened": lot.weakened,
+        "high_water": _or_none(lot.high_water),
     }
     state |= {name: str(getattr(lot, name)) for name in _DECIMAL_FIELDS}
     return json.dumps(state)
@@ -660,11 +929,27 @@ def load_lot(state: str) -> Lot:
             # already in the market, and reaching back into the config on load
             # would defeat that from the other direction.
             rungs_on_bar_high=plan.get("rungs_on_bar_high", False),
+            exit_style=plan.get("exit_style", "ladder"),
+            swing_arm_count=plan.get("swing_arm_count", 0),
+            swing_weaken_count=plan.get("swing_weaken_count", 0),
+            swing_min_arm_r=Decimal(plan.get("swing_min_arm_r", "0")),
+            swing_weak_trail_r=Decimal(plan.get("swing_weak_trail_r", "0")),
         ),
         direction=int(raw.get("direction", 1)),
         **{name: Decimal(raw[name]) for name in _DECIMAL_FIELDS},
     )
     lot.explicit_targets = tuple(Decimal(t) for t in raw.get("explicit_targets", []))
+    # `.get` throughout: rows written before SMART_PROFIT existed have none of
+    # these, and a ladder lot never reads them.
+    lot.swing_reference_low = _maybe_decimal(raw.get("swing_reference_low"))
+    lot.swing_count = raw.get("swing_count", 0)
+    lot.armed_rung = raw.get("armed_rung")
+    lot.tranche_trail = {int(k): Decimal(v)
+                         for k, v in raw.get("tranche_trail", {}).items()}
+    lot.prev_bar_low = _maybe_decimal(raw.get("prev_bar_low"))
+    lot.weak_count = raw.get("weak_count", 0)
+    lot.weakened = bool(raw.get("weakened", False))
+    lot.high_water = _maybe_decimal(raw.get("high_water"))
     lot.breakeven_pending = bool(raw.get("breakeven_pending", False))
     _last = raw.get("last_price")
     lot.last_price = Decimal(_last) if _last else None

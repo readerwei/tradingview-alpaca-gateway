@@ -323,12 +323,51 @@ twice for the same reason.
 | `DYNAMIC_TRAIL` | 20% @ 1.2R, 30% @ 2.5R, 50% runner | the strategy |
 | `DYNAMIC_TRAIL_FAST` | same splits at 0.2R / 0.4R | testing — targets reachable in minutes |
 | `OCO_AFTER_FILL` | one target, whole position | take-profit and stop, whichever comes first |
+| `SMART_PROFIT` | 30% / 40% / 30%, armed by structure | let the trend decide the targets |
 
 `DYNAMIC_TRAIL_FAST` exists so that testing is an alert field rather than an
 edit to `exit_plans.py`. Editing the real plan's multiples in place left the
 repository saying 1.2R/2.5R while the gateway ran 0.2R/0.4R — a divergence
 `/healthz` could not report, because an uncommitted edit carries the same commit
 hash as the code it changes. `/healthz` now also reports `worktree_dirty`.
+
+### SMART_PROFIT — slices armed by market structure
+
+The other plans fire a rung when price **reaches** a level chosen in advance.
+`SMART_PROFIT` sells a slice when price **falls back through** a level the market
+chose, so the targets are discovered rather than predicted.
+
+```text
+arming    a bar whose low beats EVERY low since counting began -> count++
+          N = 3 of those, and above entry + 0.5R                -> arm the slice
+armed     each new higher low raises that slice's trail
+sold      price breaks the trail -> sell the slice, stop to breakeven,
+                                    counting restarts from zero for the next
+weakening M = 2 CONSECUTIVE lower lows -> every remaining share collapses onto
+                                          one 0.1R trail hung off the run's peak
+```
+
+Slices are 30% / 40% / 30%, and only one is ever armed at a time — counting
+belongs to whichever slice is next, so a slice cannot accumulate structure while
+its predecessor is still running.
+
+Two rules are worth stating because they are asymmetric on purpose:
+
+- **A lower low does not reset the arming count**, it merely fails to increment
+  it. A dip inside a climb costs a bar, not the sequence.
+- **Weakness does require consecutive lower lows.** One wide bar is noise; two
+  in a row is the structure failing.
+
+The `entry + 0.5R` gate exists because three higher lows can happen entirely
+below entry — arming there would sell at a loss under the name take-profit. The
+weak trail never widens either: a 0.1R trail hung off a high water mark barely
+above entry can sit further from price than the disaster stop, and adopting it
+would answer weakness with more risk.
+
+This plan consumes **bars**, not prints, and ignores zero-trade bars. On
+Alpaca's crypto feed, where only 34% of 1-minute bars contain a trade, `N=3` can
+mean twenty minutes of wall clock; on TSLA it is three minutes. Pick `N` per
+symbol accordingly.
 
 The named `DYNAMIC_TRAIL` plan must be requested explicitly in the Pine alert:
 ```text

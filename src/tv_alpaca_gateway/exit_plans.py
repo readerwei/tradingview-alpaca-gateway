@@ -72,6 +72,37 @@ _PLANS: dict[str, dict] = {
         breakeven_after=1,
         rungs_on_bar_high=True,
     ),
+    # Slices armed by market structure rather than by a distance chosen in
+    # advance. Wei's specification, in his words:
+    #
+    #   "TP1 is not a particular multiplier or R, it is defined as N sticks of
+    #    higher lows ... then that bar's low is considered as TP1, and the
+    #    profit target should start to trail that low."
+    #
+    # 30% follows the structure first; once it is taken the stop goes to
+    # breakeven and 40% waits for N FRESH higher lows; then the last 30%. If
+    # the trend breaks down first — M consecutive lower lows — everything left
+    # collapses onto one tight trail instead.
+    #
+    # The r_multiples below are never read: a swing slice has no price target,
+    # it has a trail. They are present only to keep the tranche shape uniform
+    # with every other plan, the same way OCO_AFTER_FILL carries one it ignores.
+    "SMART_PROFIT": dict(
+        tranches=((Decimal("0.30"), Decimal("0")),
+                  (Decimal("0.40"), Decimal("0")),
+                  (Decimal("0.30"), Decimal("0"))),
+        runner_fraction=Decimal("0"),      # every slice trails; none is left over
+        trail_source="previous_completed_bar_low",
+        breakeven_after=1,
+        exit_style="swing",
+        swing_arm_count=3,                 # N
+        swing_weaken_count=2,              # M — one wide bar is noise, two is a break
+        # No slice arms before the trade is meaningfully in profit. Three higher
+        # lows can happen entirely below entry, and selling there is a loss
+        # wearing the name take-profit.
+        swing_min_arm_r=Decimal("0.5"),
+        swing_weak_trail_r=Decimal("0.1"),
+    ),
     "OCO_AFTER_FILL": dict(
         tranches=((Decimal("1.00"), Decimal("2.0")),),
         runner_fraction=Decimal("0"),
