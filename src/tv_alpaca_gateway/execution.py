@@ -383,10 +383,25 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
     first place.
     """
     position_after = _decimal(broker.position_qty(symbol))
-    held_qty = position_after - position_before
+    # In the ENTRY's direction. A long entry makes the signed position more
+    # positive; a short entry makes it more negative, so a plain subtraction
+    # reads a real short as "the entry did not happen".
+    #
+    # Live on 2026-08-21: a short of 13 QQQ took the position from -13 to -26,
+    # this computed -13, and the gate below returned before ANY protection was
+    # reached — native OCO, the managed ladder and the fallback stop all sit
+    # after it. The entry filled, nothing protected it, and the log said
+    # "nothing to protect" while 26 shares sat naked.
+    #
+    # abs() is the tempting fix and is wrong: a long 13 flipped to short 13
+    # leaves the magnitude unchanged at 13, so it would again report nothing to
+    # protect while holding a fresh short.
+    held_qty = (position_after - position_before
+                if command.side == "buy"
+                else position_before - position_after)
     if held_qty <= 0:
         logger.warning(
-            "%s position did not increase after a filled entry (%s -> %s); "
+            "%s position did not increase in the entry direction (%s -> %s); "
             "nothing to protect", symbol, position_before, position_after)
         return ExecutionResult(entry_id, entry_status=entry_status)
 

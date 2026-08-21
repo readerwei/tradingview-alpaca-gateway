@@ -806,3 +806,58 @@ def test_a_kill_switch_refusal_does_not_consume_the_event_id(tmp_path):
     assert broker.orders_of("market"), (
         "the same alert was refused after arming; the kill switch consumed "
         "its identity")
+
+
+@dataclass
+class ShortEntryBroker(RecordingBroker):
+    """An existing short that receives another short entry.
+
+    The shape of the live failure on 2026-08-21: already short 13 QQQ, a second
+    short of 13 fills, and the position goes -13 -> -26.
+    """
+
+    _positions: dict = field(default_factory=lambda: {"QQQ": Decimal("-13")})
+
+    def shortable(self, symbol: str) -> bool:
+        return True
+
+    def submit_order(self, **kwargs) -> dict:
+        if kwargs.get("side") == "sell" and kwargs.get("type") == "market":
+            self.submitted.append(dict(kwargs))
+            order_id = f"ord-{len(self.submitted)}"
+            self._positions[kwargs["symbol"]] -= Decimal(str(kwargs["qty"]))
+            return {"id": order_id, "status": "filled",
+                    "filled_qty": str(kwargs["qty"])}
+        if kwargs.get("side") == "buy":
+            self.submitted.append(dict(kwargs))
+            return {"id": f"ord-{len(self.submitted)}", "status": "new"}
+        return super().submit_order(**kwargs)
+
+    def position_qty(self, symbol: str) -> Decimal:
+        return self._positions.get(symbol, Decimal("0"))
+
+
+def test_a_short_entry_is_recognised_as_an_entry_and_gets_protected(tmp_path):
+    """The 2026-08-21 defect, as a test.
+
+    A short of 13 against an existing -13 leaves -26. The old gate computed
+    `position_after - position_before` = -13, read that as "no entry", and
+    returned before ANY protection was reached — the native OCO, the managed
+    ladder and the fallback stop all sit below it. The entry filled and 26
+    shares sat naked while the log said "nothing to protect".
+    """
+    alert = ("EXECUTE_ALPACA_ORDER | SYMBOL=QQQ | SIDE=SELL | QTY=13 | "
+             "EVENT_ID=qqq-short-delta-1 | BAR_TIME=" + _now() + " | "
+             "ORDER_TYPE=MARKET | TIME_IN_FORCE=DAY | "
+             "EXIT_PLAN=OCO_AFTER_FILL | STOP_TRIGGER=710.83 | "
+             "STOP_LIMIT=NONE | TAKE_PROFIT=707.98")
+    broker = ShortEntryBroker()
+    result = _run(alert, _settings(tmp_path, max_qty=30), broker)
+
+    assert result.protection_status == "submitted", (
+        "a short entry reached no protection at all")
+    exits = [o for o in broker.submitted if o.get("order_class") == "oco"]
+    assert len(exits) == 1, "no OCO was placed for the short"
+    assert exits[0]["side"] == "buy", "a short is protected by buying"
+    assert Decimal(str(exits[0]["qty"])) == Decimal("13"), (
+        "protected the wrong quantity — should be what THIS entry added")
