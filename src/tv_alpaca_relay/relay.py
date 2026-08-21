@@ -107,7 +107,7 @@ class GatewayRelay:
             headers={
                 "content-type": "text/plain; charset=utf-8",
                 "x-tv-secret": self.settings.internal_secret,
-                "x-discord-message-id": discord_message_id,
+                "x-delivery-id": discord_message_id,
             },
             method="POST",
         )
