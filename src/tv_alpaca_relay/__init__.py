@@ -1,6 +1,7 @@
 """Optional Discord-to-gateway relay component."""
 
 from .relay import (
+    ForwardResult,
     GatewayRelay,
     RelaySettings,
     admit_message,
@@ -9,6 +10,7 @@ from .relay import (
 )
 
 __all__ = [
+    "ForwardResult",
     "GatewayRelay",
     "RelaySettings",
     "admit_message",

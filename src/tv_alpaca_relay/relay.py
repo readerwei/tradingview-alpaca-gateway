@@ -5,6 +5,7 @@ import logging
 import os
 import urllib.request
 from dataclasses import dataclass
+from urllib.error import HTTPError
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -51,6 +52,7 @@ class RelaySettings:
             allowed = " or ".join(sorted(permitted))
             raise ValueError(f"relay target must be a local {allowed} endpoint")
 
+
     @classmethod
     def from_env(cls) -> "RelaySettings":
         token = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -67,6 +69,14 @@ class RelaySettings:
             allow_execution=os.getenv("RELAY_ALLOW_EXECUTION", "").strip().lower()
             in {"1", "true", "yes", "on"},
         )
+
+
+@dataclass(frozen=True)
+class ForwardResult:
+    """The gateway response observed by the relay."""
+
+    status_code: int
+    body: str
 
 
 def admit_message(message: Any, settings: RelaySettings) -> str:
@@ -90,7 +100,7 @@ class GatewayRelay:
         settings.validate_target()
         self.settings = settings
 
-    def forward(self, pine_alert: str, *, discord_message_id: str) -> None:
+    def forward(self, pine_alert: str, *, discord_message_id: str) -> ForwardResult:
         request = urllib.request.Request(
             self.settings.internal_url,
             data=pine_alert.encode("utf-8"),
@@ -101,8 +111,9 @@ class GatewayRelay:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=3):
-            pass
+        with urllib.request.urlopen(request, timeout=3) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            return ForwardResult(response.status, body)
 
 
 def _canonical_discord_message_id(message: Any) -> str:
@@ -125,10 +136,19 @@ def handle_message(message: Any, settings: RelaySettings, relay: GatewayRelay) -
     """
     try:
         payload = admit_message(message, settings)
-        relay.forward(payload, discord_message_id=_canonical_discord_message_id(message))
+        result = relay.forward(payload, discord_message_id=_canonical_discord_message_id(message))
+        if result is not None:
+            logger.info(
+                "relay forwarded Discord message %s: gateway_status=%s response=%s",
+                getattr(message, "id", "unknown"), result.status_code, result.body,
+            )
         return True
     except ValueError as exc:
         logger.warning("relay ignored a message: %s", exc)
+        return False
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"relay forwarding failed: HTTP {exc.code}: {body or exc.reason}")
         return False
     except Exception as exc:
         print(f"relay forwarding failed: {exc}")
