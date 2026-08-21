@@ -397,6 +397,36 @@ def _await_fill_or_cancel(command, entry_id, entry_status, event_id, broker,
     return "canceled"
 
 
+# How many times to re-read the position when a confirmed fill appears to have
+# added nothing. Small: this covers broker propagation, not a market that moved.
+POSITION_SETTLE_ATTEMPTS = 3
+POSITION_SETTLE_PAUSE_SECONDS = 0.5
+
+
+def _settled_position(broker, symbol, command, position_before: Decimal) -> Decimal:
+    """The position after the entry, re-read while it still looks unchanged.
+
+    Returns as soon as the delta moves in the entry's direction. If it never
+    does, returns the last read and lets the caller decide — a persistent zero
+    after a CONFIRMED fill is not a lag, it is a contradiction, and the caller
+    reports it as one rather than as a routine "nothing to protect".
+    """
+    position_after = _decimal(broker.position_qty(symbol))
+    for attempt in range(2, POSITION_SETTLE_ATTEMPTS + 1):
+        delta = (position_after - position_before if command.side == "buy"
+                 else position_before - position_after)
+        if delta > 0:
+            return position_after
+        logger.info(
+            "%s: entry filled but the position still reads %s (was %s); "
+            "re-reading %d/%d — the positions endpoint lags order status",
+            symbol, position_after, position_before, attempt,
+            POSITION_SETTLE_ATTEMPTS)
+        time.sleep(POSITION_SETTLE_PAUSE_SECONDS)
+        position_after = _decimal(broker.position_qty(symbol))
+    return position_after
+
+
 def _protection_kwargs(command, symbol, crypto, held_qty, event_id) -> dict:
     kwargs = {
         "symbol": symbol,
@@ -449,7 +479,22 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
     rate, which is the part that made total-position sizing attractive in the
     first place.
     """
-    position_after = _decimal(broker.position_qty(symbol))
+    # Read until it settles, not once.
+    #
+    # Alpaca's positions endpoint is eventually consistent with respect to
+    # order status: a fill confirmed by /v2/orders can be followed by a
+    # /v2/positions that has not caught up. A single read that lands in that
+    # window reports a delta of zero, and the gate below then returns before
+    # ANY protection — native OCO, the managed ladder, the fallback stop, and
+    # `_flatten` itself all sit under it. The entry is real and nothing rests
+    # at the broker.
+    #
+    # The asymmetry this fixes was backwards: PROTECTION_ATTEMPTS gave the
+    # protective ORDER two attempts, citing "a position not yet settled
+    # broker-side" as the reason — while the read that decides whether to
+    # protect at all got one, and returned above the retry loop. The retry
+    # could never help the case its own docstring named.
+    position_after = _settled_position(broker, symbol, command, position_before)
     # In the ENTRY's direction. A long entry makes the signed position more
     # positive; a short entry makes it more negative, so a plain subtraction
     # reads a real short as "the entry did not happen".
@@ -467,10 +512,26 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
                 if command.side == "buy"
                 else position_before - position_after)
     if held_qty <= 0:
-        logger.warning(
-            "%s position did not increase in the entry direction (%s -> %s); "
-            "nothing to protect", symbol, position_before, position_after)
-        return ExecutionResult(entry_id, entry_status=entry_status)
+        # A CONFIRMED fill and an unchanged position cannot both be true, and
+        # after re-reading it is no longer a propagation lag. Reported at ERROR
+        # with the status named, because the old WARNING plus a success-shaped
+        # result read as "nothing to do here" — and the actual state is "we do
+        # not know what we are holding".
+        #
+        # Most likely causes, in order: the entry was filled and closed by
+        # something else on this shared account inside the window; or the
+        # position endpoint is wrong. Neither is routine.
+        logger.error(
+            "%s: entry %s reports %s but the position is unchanged after %d "
+            "reads (%s -> %s). Nothing was protected and nothing was flattened "
+            "— this is an unexplained state, not an empty one",
+            symbol, entry_id, entry_status, POSITION_SETTLE_ATTEMPTS,
+            position_before, position_after)
+        store.update(event_id, "position_unexplained",
+                     f"entry {entry_status} but position {position_before} -> "
+                     f"{position_after}", broker_order_id=entry_id)
+        return ExecutionResult(entry_id, entry_status=entry_status,
+                               protection_status="position_unexplained")
 
     if command.exit_plan:
         # One plan name, best available mechanism for the asset class.
