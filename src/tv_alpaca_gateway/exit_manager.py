@@ -763,13 +763,33 @@ def reconcile_lot(stored: Lot, broker) -> Lot:
         if lot.rung_filled_qty.get(rung, Decimal("0")) >= lot.tranche_qty(rung):
             lot.filled_rungs.add(rung)
             lot.pending_rungs.discard(rung)
-            if rung == lot.plan.breakeven_after and lot.working_stop < lot.entry_price:
+            # Through `sign`, as `advance_to_runner` and `on_fill` already do.
+            # This was the one of the three that compared raw, so for a short —
+            # whose stop sits ABOVE entry — it never fired, and breakeven was
+            # silently skipped on any lot that had been through a restart.
+            if (rung == lot.plan.breakeven_after
+                    and lot.sign * (lot.working_stop - lot.entry_price) < 0):
                 lot.working_stop = lot.entry_price
 
     if len(lot.filled_rungs) >= len(lot.plan.tranches):
         lot.stage = "runner"
 
-    lot.remaining_qty = min(lot.remaining_qty, position)
+    # Measured IN THE LOT'S DIRECTION, not as a raw signed quantity and not as
+    # a magnitude.
+    #
+    # A short position reports negative, so `min(26, -26)` was -26 and the
+    # guard below read a healthy short as an empty account: every short lot was
+    # marked closed and its `stop_order_id` discarded, within one reconcile
+    # interval of opening. The position and its stop stayed at Alpaca with
+    # nothing in the gateway aware of them.
+    #
+    # abs() would fix the sign and hide something worse. A lot that is short
+    # while the ACCOUNT is long has not shrunk, it has been reversed — and must
+    # close, rather than carry on arming rungs against the wrong side of the
+    # market believing it still holds 26. Clamping to `position * sign` treats
+    # a reversal as zero, which is what it is for this lot.
+    held_in_direction = position * lot.sign
+    lot.remaining_qty = min(lot.remaining_qty, max(held_in_direction, Decimal("0")))
     if lot.remaining_qty <= 0:
         lot.stage = "closed"
         lot.stop_order_id, lot.reserved_qty = None, Decimal("0")
