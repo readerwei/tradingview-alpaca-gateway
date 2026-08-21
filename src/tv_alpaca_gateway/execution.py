@@ -490,6 +490,19 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
         logger.warning("exit plan %s could not be armed for %s; falling back "
                        "to a single protective stop", command.exit_plan, symbol)
 
+    return _protect_with_stop(command, symbol, crypto, entry_id, entry_status,
+                              event_id, broker, store, held_qty)
+
+
+def _protect_with_stop(command, symbol, crypto, entry_id, entry_status, event_id,
+                       broker, store, held_qty) -> ExecutionResult:
+    """Place the ordinary protective stop, retrying once, then flatten.
+
+    Extracted so every path that cannot build its intended exit lands here
+    rather than reimplementing the retry-then-flatten sequence. Two callers
+    reach it: the plain protective-stop route, and an OCO whose prices face the
+    wrong way for the direction being traded.
+    """
     kwargs = _protection_kwargs(command, symbol, crypto, held_qty, event_id)
     last_error: Exception | None = None
     for attempt in range(1, PROTECTION_ATTEMPTS + 1):
@@ -517,9 +530,51 @@ def _protect_or_flatten(command, symbol, crypto, entry_id, entry_status,
                     store, last_error, held_qty)
 
 
+def _oco_prices_face_the_right_way(command) -> bool:
+    """Does the take-profit sit on the profitable side of the stop?
+
+    An OCO's prices have a direction, and it inverts with the trade:
+
+        long   take_profit ABOVE   stop BELOW
+        short  take_profit BELOW   stop ABOVE
+
+    `_submit_oco_exit` has always flipped the order SIDE correctly and passed
+    the prices through untouched, so a short carrying long-shaped prices was
+    submitted, rejected by Alpaca, and routed to `_flatten` — which closed the
+    position. Safe, and unreadable: it presents as "my short closed instantly
+    and I do not know why", with a broker rejection string as the only clue.
+
+    Relational rather than measured against the market, deliberately. It needs
+    no price data, it cannot go stale between the check and the order, and it
+    catches the mistake that actually happens — prices written for the opposite
+    direction. Equality is refused too: a take-profit level equal to the stop
+    has no profitable side, and whatever was meant, it was not that.
+    """
+    if command.take_profit is None or command.stop_trigger is None:
+        return True                    # nothing to contradict
+    sign = 1 if command.side == "buy" else -1
+    return sign * (command.take_profit - command.stop_trigger) > 0
+
+
 def _submit_oco_exit(command, symbol, entry_id, entry_status, event_id, broker,
                      store, held_qty) -> ExecutionResult:
     """Submit one native Alpaca OCO exit for the delta filled by this entry."""
+    if not _oco_prices_face_the_right_way(command):
+        # Named here rather than left to Alpaca. Falling through places the
+        # ordinary protective stop, on the precedent already set for a ladder
+        # that cannot be armed: an exit plan that cannot be built is a reason
+        # to place the plain stop, not a reason to leave the position naked or
+        # to flatten a fill the user wanted.
+        logger.warning(
+            "%s OCO refused: a %s wants its take-profit %s the stop, and this "
+            "alert has take_profit=%s with stop_trigger=%s. Placing the "
+            "ordinary protective stop instead",
+            symbol, "short" if command.side == "sell" else "long",
+            "below" if command.side == "sell" else "above",
+            command.take_profit, command.stop_trigger)
+        return _protect_with_stop(command, symbol, assets.is_crypto(symbol),
+                                  entry_id, entry_status, event_id, broker,
+                                  store, held_qty)
     try:
         order = broker.submit_order(
             symbol=symbol, qty=held_qty,
